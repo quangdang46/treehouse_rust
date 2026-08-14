@@ -217,7 +217,7 @@ impl Pool {
     /// Whether the backing repo's git metadata is missing (Go
     /// `backingRepositoryMissing`): the worktree's `.git` file points to a
     /// gitdir that no longer exists.
-    fn backing_repository_missing(&self, path: &str) -> bool {
+    pub(crate) fn backing_repository_missing(&self, path: &str) -> bool {
         let git_file = Path::new(path).join(".git");
         let Ok(contents) = std::fs::read_to_string(&git_file) else {
             return false;
