@@ -43,6 +43,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Command::Status(args)) => cmd_status(&cli, args),
         Some(Command::Prune(args)) => cmd_prune(&cli, args),
         Some(Command::Destroy(args)) => cmd_destroy(&cli, args),
+        Some(Command::Gc(args)) => cmd_gc(&cli, args),
         Some(Command::Init) => cmd_init(),
         Some(Command::Update) => cmd_update(),
     }
@@ -64,7 +65,16 @@ fn cmd_get(cli: &Cli, args: &cli::GetArgs) -> Result<()> {
             .clone()
             .or_else(|| std::env::var("TREEHOUSE_LEASE_HOLDER").ok())
             .unwrap_or_default();
-        let lease = pool.acquire_lease(&holder)?;
+        // Parse --ttl (humantime); TREEHOUSE_LEASE_TTL env fallback.
+        let ttl_str = args
+            .ttl
+            .clone()
+            .or_else(|| std::env::var("TREEHOUSE_LEASE_TTL").ok());
+        let ttl = match ttl_str {
+            Some(s) => Some(chrono::Duration::from_std(humantime::parse_duration(&s)?)?),
+            None => None,
+        };
+        let lease = pool.acquire_lease_with_ttl(&holder, ttl)?;
         let result = treehouse_core::result::CommandResult::Get(
             treehouse_core::result::GetResult::Lease(lease),
         );
@@ -221,6 +231,52 @@ fn cmd_prune(cli: &Cli, args: &cli::PruneArgs) -> Result<()> {
     let mut out = stdout.lock();
     let mut err = stderr.lock();
     format::render(format::OutputFormat::Human, &result, &mut out, &mut err)?;
+    Ok(())
+}
+
+/// Reclaim stale, orphaned, and dead-owner worktrees (dry-run default).
+fn cmd_gc(cli: &Cli, args: &cli::GcArgs) -> Result<()> {
+    let _ = cli;
+    let ctx = cli::resolve_repo_ctx()?;
+    let pool = cli::open_pool(&ctx)?;
+    let opts = treehouse_core::gc::GcOptions {
+        dry_run: !args.yes,
+        prune_orphans: args.prune_orphans,
+    };
+    let result = pool.gc(&opts)?;
+
+    if result.candidates.is_empty() && result.skipped.is_empty() {
+        eprintln!("🌳 No stale worktrees to reclaim.");
+        return Ok(());
+    }
+    if opts.dry_run {
+        println!(
+            "🌳 Dry run: would reclaim {} worktree(s) and free {}.",
+            result.candidates.len(),
+            treehouse_core::prune::format_bytes(result.reclaimable_bytes)
+        );
+        println!("🌳 Re-run with --yes to reclaim these worktrees.");
+        for c in &result.candidates {
+            println!(
+                "  [{}] {} {}",
+                c.tag,
+                treehouse_core::prune::format_bytes(c.bytes),
+                c.path
+            );
+        }
+    } else {
+        println!(
+            "🌳 Reclaimed {} worktree(s) and freed {}.",
+            result.reclaimed.len(),
+            treehouse_core::prune::format_bytes(result.freed_bytes)
+        );
+    }
+    if !result.skipped.is_empty() {
+        eprintln!("🌳 Skipped {} worktree(s):", result.skipped.len());
+        for sk in &result.skipped {
+            eprintln!("  [{}] {} ({})", sk.category, sk.path, sk.reason);
+        }
+    }
     Ok(())
 }
 

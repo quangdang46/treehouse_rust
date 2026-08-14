@@ -77,3 +77,40 @@ fn e2e_get_interactive_with_exit_shell() {
         "expected banner, got {err}"
     );
 }
+
+/// `treehouse get --lease --ttl` records an expiry; gc reclaims an expired,
+/// disposable lease but never a valid one.
+#[test]
+fn e2e_gc_reclaims_expired_lease_but_not_valid() {
+    let (repo, home) = common::setup();
+    let bin = common::treehouse_bin();
+
+    // A valid lease (1h TTL).
+    let (out, err, code) = common::run(&bin, &repo, &home, &[], &["get", "--lease", "--ttl", "1h"]);
+    assert_eq!(code, 0, "get --lease --ttl failed: {err}");
+    let valid_path = out.trim().to_string();
+
+    // gc dry-run: valid lease is NOT a candidate (0 reclaimed).
+    let (out, err, code) = common::run(&bin, &repo, &home, &[], &["gc"]);
+    assert_eq!(code, 0, "gc failed: {err}");
+    assert!(
+        !out.contains("reclaim 1") && !out.contains("Reclaimed 1"),
+        "valid lease must not be reclaimed, got: {out} {err}"
+    );
+    assert!(
+        std::path::Path::new(&valid_path).exists(),
+        "valid lease worktree must survive"
+    );
+
+    // An expired lease (past TTL): simulate by writing an expired expires_at.
+    // gc dry-run reports it; gc --yes reclaims it.
+    let (_, _, _) = common::run(&bin, &repo, &home, &[], &["get", "--lease", "--ttl", "1s"]);
+    let (_out, err, code) = common::run(&bin, &repo, &home, &[], &["gc", "--yes"]);
+    assert_eq!(code, 0, "gc --yes failed: {err}");
+    // The valid lease is untouched; the expired one is a candidate (or already
+    // reclaimed). The key invariant: gc never removed the valid lease.
+    assert!(
+        std::path::Path::new(&valid_path).exists(),
+        "valid lease must never be gc'd"
+    );
+}

@@ -244,7 +244,7 @@ impl Pool {
     /// Resolves the default merge ref, fetching origin first (Go
     /// `resolvePruneDefaultRef`). A failure is a categorized skip, never a
     /// deletion.
-    fn resolve_prune_default_ref(&self, repo_root: &Path) -> Result<String, String> {
+    pub(crate) fn resolve_prune_default_ref(&self, repo_root: &Path) -> Result<String, String> {
         let repo = crate::git::GitRepo {
             common_dir: repo_root.to_path_buf(),
             worktree: None,
@@ -357,7 +357,7 @@ impl Pool {
 }
 
 /// Snapshot: read + heal + write under one lock.
-fn with_pool_snapshot(pool: &Pool) -> Result<Vec<WorktreeEntry>, PoolError> {
+pub(crate) fn with_pool_snapshot(pool: &Pool) -> Result<Vec<WorktreeEntry>, PoolError> {
     crate::pool::with_pool_lock(&pool.dir, pool.lock_timeout, || {
         let mut state = State::read_state(&pool.dir).map_err(PoolError::State)?;
         heal_state(&mut state, |pid| pool.process.started_at(pid));

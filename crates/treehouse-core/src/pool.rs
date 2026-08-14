@@ -56,6 +56,8 @@ pub struct AcquireOptions {
 #[derive(Debug, Clone)]
 pub struct LeaseAcquireOptions {
     pub holder: String,
+    /// Optional TTL (expires_at); None = permanent lease.
+    pub ttl: Option<chrono::Duration>,
 }
 
 /// A successfully acquired worktree.
@@ -209,11 +211,34 @@ impl Pool {
         })
     }
 
+    /// Non-interactive lease acquire (`get --lease`) with an optional TTL.
+    pub fn acquire_lease_with_ttl(
+        &self,
+        holder: &str,
+        ttl: Option<chrono::Duration>,
+    ) -> Result<LeaseInfo, PoolError> {
+        let acquired = self.get(&AcquireOptions {
+            lease: Some(LeaseAcquireOptions {
+                holder: holder.to_string(),
+                ttl,
+            }),
+            ..Default::default()
+        })?;
+        let lease = acquired.lease.as_ref();
+        Ok(LeaseInfo {
+            path: acquired.path.to_string_lossy().into_owned(),
+            lease_id: lease.map(|l| l.id.clone()).unwrap_or_default(),
+            lease_holder: holder.to_string(),
+            leased_at: lease.map(|l| l.acquired_at).unwrap_or(ZERO_TIME),
+        })
+    }
+
     /// Non-interactive lease acquire (`get --lease`), returning the identity.
     pub fn acquire_lease(&self, holder: &str) -> Result<LeaseInfo, PoolError> {
         let acquired = self.get(&AcquireOptions {
             lease: Some(LeaseAcquireOptions {
                 holder: holder.to_string(),
+                ttl: None,
             }),
             ..Default::default()
         })?;
@@ -473,12 +498,17 @@ fn mark_acquired_entry(
     process: &ProcessTable,
 ) -> Option<Lease> {
     if let Some(lease_opts) = &opts.lease {
-        let id = mark_acquired_lease(wt, &lease_opts.holder, chrono::Utc::now());
+        let now = chrono::Utc::now();
+        let id = mark_acquired_lease(wt, &lease_opts.holder, now);
+        let expires_at = lease_opts.ttl.map(|d| now + d);
+        if let Some(exp) = expires_at {
+            wt.expires_at = exp;
+        }
         Some(Lease {
             id,
             holder: lease_opts.holder.clone(),
-            acquired_at: wt.leased_at,
-            expires_at: None,
+            acquired_at: now,
+            expires_at,
         })
     } else {
         let pid = std::process::id() as i32;

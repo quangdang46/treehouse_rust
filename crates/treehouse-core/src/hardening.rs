@@ -102,6 +102,7 @@ mod tests {
                 branch: Some("main".to_string()),
                 lease: Some(crate::pool::LeaseAcquireOptions {
                     holder: "race".to_string(),
+                    ttl: None,
                 }),
             })
             .unwrap();

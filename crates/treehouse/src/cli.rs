@@ -54,6 +54,8 @@ pub enum Command {
     Prune(PruneArgs),
     /// Dry-run removal of worktrees.
     Destroy(DestroyArgs),
+    /// Reclaim stale, orphaned, and dead-owner worktrees (dry-run default).
+    Gc(GcArgs),
     /// Create a default treehouse.toml.
     Init,
     /// Update treehouse to the latest release.
@@ -109,6 +111,22 @@ pub struct StatusArgs {
 
 #[derive(Debug, Args)]
 pub struct PruneArgs {
+    /// Execute instead of dry-run.
+    #[arg(long)]
+    pub yes: bool,
+    /// Sweep every managed pool under the user-level root.
+    #[arg(long = "all", visible_alias = "global")]
+    pub all: bool,
+    /// Include backing-repository-missing orphans.
+    #[arg(long)]
+    pub prune_orphans: bool,
+    /// Show detailed skip diagnostics.
+    #[arg(long, short = 'v')]
+    pub verbose: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct GcArgs {
     /// Execute instead of dry-run.
     #[arg(long)]
     pub yes: bool,
