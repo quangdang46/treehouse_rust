@@ -27,3 +27,7 @@ thiserror = { workspace = true }
 chrono = { workspace = true }
 # The TOON encoder (toon_rust); optional behind the `toon` feature.
 tru = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+serde_json = { workspace = true }
