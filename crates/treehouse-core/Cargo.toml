@@ -1,0 +1,36 @@
+[package]
+name = "treehouse-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Pure library port of Treehouse: pool/state/lease/owner/process/git/hooks/config"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+fd-lock = { workspace = true }
+tempfile = { workspace = true }
+sysinfo = { workspace = true }
+toml = { workspace = true }
+owo-colors = { workspace = true }
+rand = { workspace = true }
+humantime = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31.3", features = ["signal", "process"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win32_System_Threading"] }
+
+# The `toon` feature gates the verified TOON encoder. The actual git dependency
+# (`toon = { git = ... , rev = <pinned> }`, enabled via `toon = ["dep:toon"]`) is
+# added by the toon-verify bead, which confirms package name / API / license / MSRV /
+# commit before pinning an immutable rev. Until then the feature is an empty flag:
+# `cargo build --workspace` succeeds with zero network access to the toon_rust repo.
+[features]
+default = []
+toon = []
