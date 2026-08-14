@@ -7,6 +7,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # The e2e tests spawn the treehouse binary; suppress its self-update checks.
+  TREEHOUSE_NO_UPDATE_CHECK: 1
 
 jobs:
   format-lint:
@@ -14,9 +16,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # rust-toolchain.toml pins stable + rustfmt/clippy.
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: fmt check
         run: cargo fmt --all -- --check
@@ -25,8 +26,8 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-  test-build:
-    name: test + build (${{ matrix.os }})
+  build:
+    name: build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -34,11 +35,29 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
-      # Pin to the workspace MSRV (1.88, edition 2024) so edition-2024
-      # features are available; stable toolchain matches rust-version.
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: build
+      - name: build workspace
         run: cargo build --workspace
-      - name: test
+      - name: build release binary
+        run: cargo build --release --bin treehouse
+
+  test:
+    name: test (${{ matrix.os }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Build the binary the e2e harness spawns BEFORE running tests.
+      - name: build treehouse binary
+        run: cargo build --bin treehouse
+      - name: test workspace
         run: cargo test --workspace
+      - name: test with hardening feature
+        run: cargo test -p treehouse-core --features hardening

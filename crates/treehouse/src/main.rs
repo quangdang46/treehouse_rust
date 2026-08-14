@@ -492,26 +492,59 @@ fn detach_and_return(_pool: &treehouse_core::pool::Pool, path: &Path, _force: bo
 }
 
 /// Acquire -> run an agent -> cleanup guaranteed on every exit.
-fn cmd_run(cli: &Cli, args: &cli::RunArgs) -> Result<()> {
+///
+/// The raw command is captured via clap's external_subcommand, so leading
+/// `--ttl`/`--lease-holder` are parsed manually before the actual command.
+fn cmd_run(cli: &Cli, args: &[String]) -> Result<()> {
     let _ = cli;
-    if args.command.is_empty() {
-        return Err(anyhow!("run requires a command after `--`"));
+    // external_subcommand captures the subcommand token + args; strip a
+    // leading "run" (the subcommand name) and any "--".
+    let mut args = args.to_vec();
+    if args.first().map(|a| a == "run").unwrap_or(false) {
+        args.remove(0);
+    }
+    if args.first().map(|a| a == "--").unwrap_or(false) {
+        args.remove(0);
+    }
+    // Parse leading --ttl / --lease-holder.
+    let mut ttl: Option<std::time::Duration> = None;
+    let mut holder: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--ttl" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(anyhow!("--ttl requires a value"));
+                }
+                ttl = Some(humantime::parse_duration(&args[i])?);
+                i += 1;
+            }
+            "--lease-holder" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(anyhow!("--lease-holder requires a value"));
+                }
+                holder = Some(args[i].clone());
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+    let command = &args[i..];
+    if command.is_empty() {
+        return Err(anyhow!("run requires a command"));
     }
     let ctx = cli::resolve_repo_ctx()?;
     let pool = cli::open_pool(&ctx)?;
 
-    let ttl = match &args.ttl {
-        Some(s) => humantime::parse_duration(s)?,
-        None => std::time::Duration::from_secs(24 * 3600),
-    };
-    let holder = args
-        .lease_holder
-        .clone()
+    let ttl = ttl.unwrap_or(std::time::Duration::from_secs(24 * 3600));
+    let holder = holder
         .or_else(|| std::env::var("TREEHOUSE_LEASE_HOLDER").ok())
         .unwrap_or_else(|| format!("run:{}", std::process::id()));
 
     let opts = treehouse_core::run::RunOptions {
-        command: args.command.iter().map(std::ffi::OsString::from).collect(),
+        command: command.iter().map(std::ffi::OsString::from).collect(),
         ttl,
         holder,
     };
