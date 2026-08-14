@@ -15,3 +15,4 @@ pub mod process;
 pub mod reservation;
 pub mod state;
 pub mod state_file;
+pub mod worktree;
