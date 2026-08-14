@@ -12,5 +12,6 @@ pub mod git;
 pub mod lease;
 pub mod lock;
 pub mod process;
+pub mod reservation;
 pub mod state;
 pub mod state_file;
