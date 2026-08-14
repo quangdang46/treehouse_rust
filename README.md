@@ -1,7 +1,7 @@
 # treehouse — Worktrees for coding agents
 
 <div align="center">
-  <img src="docs/assets/treehouse_illustration.webp" alt="treehouse — a reusable pool of isolated git worktrees for parallel AI coding agents">
+  <img src="treehouse_illustration.webp" alt="treehouse — a reusable pool of isolated git worktrees for parallel AI coding agents">
 </div>
 
 <div align="center">

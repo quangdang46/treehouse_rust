@@ -1,0 +1,6 @@
+# Temp / scratch
+.tmp/
+
+# Rust build artifacts
+/target/
+**/*.rs.bk
