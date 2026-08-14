@@ -21,3 +21,23 @@ pub mod reservation;
 pub mod state;
 pub mod state_file;
 pub mod worktree;
+
+#[cfg(all(test, feature = "toon"))]
+mod toon_smoke_tests {
+    use serde_json::json;
+
+    #[test]
+    fn toon_encoder_smoke() {
+        let value = json!({
+            "name": "Alice",
+            "age": 30,
+            "tags": ["rust", "toon"]
+        });
+        let encoded = toon::encode(value.clone(), None);
+        assert!(encoded.contains("name: Alice"), "got: {encoded}");
+        assert!(encoded.contains("tags[2]"), "got: {encoded}");
+        // Round-trips back to a JsonValue.
+        let decoded = toon::try_decode(&encoded, None).unwrap();
+        let _ = decoded;
+    }
+}

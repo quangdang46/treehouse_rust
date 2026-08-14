@@ -20,6 +20,10 @@ owo-colors = { workspace = true }
 rand = { workspace = true }
 humantime = { workspace = true }
 sha2 = { workspace = true }
+# The `tru` package (Dicklesworthstone/toon_rust, lib name `toon`) is the TOON
+# encoder, verified + pinned by the toon-verify bead. It is optional (the `toon`
+# feature) so a checkout without network access to toon_rust still compiles.
+tru = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", features = ["signal", "process"] }
@@ -27,11 +31,7 @@ nix = { version = "0.31.3", features = ["signal", "process"] }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win32_System_Threading"] }
 
-# The `toon` feature gates the verified TOON encoder. The actual git dependency
-# (`toon = { git = ... , rev = <pinned> }`, enabled via `toon = ["dep:toon"]`) is
-# added by the toon-verify bead, which confirms package name / API / license / MSRV /
-# commit before pinning an immutable rev. Until then the feature is an empty flag:
-# `cargo build --workspace` succeeds with zero network access to the toon_rust repo.
+# The `toon` feature enables the TOON encoder (git dependency, off by default).
 [features]
 default = []
-toon = []
+toon = ["dep:tru"]

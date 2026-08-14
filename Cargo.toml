@@ -23,3 +23,8 @@ owo-colors = { version = "4.3.0", features = ["supports-colors"] }
 rand = "0.9"
 humantime = "2.1.0"
 sha2 = "0.10"
+# TOON encoder (toon_rust). Package name is `tru` (v0.2.2), lib name `toon` —
+# imports use `use toon::...`. MSRV 1.88, edition 2024, license MIT +
+# OpenAI/Anthropic Rider (NOT plain MIT — see docs/rust-port-plan.md §3/§5.4).
+# Pinned to an immutable rev so a force-push on upstream can't break us.
+tru = { git = "https://github.com/Dicklesworthstone/toon_rust", rev = "cb256dcf73ab78c248a14f65840a3fa722ec8682" }
