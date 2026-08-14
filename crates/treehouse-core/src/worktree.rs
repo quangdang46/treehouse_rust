@@ -32,6 +32,20 @@ pub enum DestroyClass {
     Unverified,
 }
 
+impl std::fmt::Display for DestroyClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            DestroyClass::Disposable => "disposable",
+            DestroyClass::Leased => "leased",
+            DestroyClass::InUse => "in-use",
+            DestroyClass::Dirty => "dirty",
+            DestroyClass::Unmerged => "unmerged",
+            DestroyClass::Unverified => "unverified",
+        };
+        f.write_str(s)
+    }
+}
+
 /// A bitmask of [`DestroyClass`] values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ClassSet(u32);

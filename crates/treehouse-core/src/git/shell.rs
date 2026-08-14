@@ -261,6 +261,15 @@ impl GitBackend for ShellGitBackend {
         out.lines().any(|l| l.trim() == name)
     }
 
+    fn remote_url(&self, repo: &GitRepo, name: &str) -> Option<String> {
+        self.run_stdout(
+            Some(&repo.common_dir),
+            &["remote", "get-url", name],
+            GitErrorKind::Other,
+        )
+        .ok()
+    }
+
     fn fetch(&self, repo: &GitRepo) -> Result<(), GitError> {
         if !self.has_remote(repo, "origin") {
             return Ok(());

@@ -75,6 +75,9 @@ pub trait GitBackend: Send + Sync {
     /// Whether the repo has a remote named `name` (Go `HasRemote`).
     fn has_remote(&self, repo: &GitRepo, name: &str) -> bool;
 
+    /// The URL of remote `name` (Go `GetRemoteURL`); None if absent.
+    fn remote_url(&self, repo: &GitRepo, name: &str) -> Option<String>;
+
     /// `git fetch origin`; a no-op without origin. Must fail with
     /// `GitErrorKind::OriginUnreachable` on failure so prune can emit a
     /// category-tagged skip (NOT a deletion).

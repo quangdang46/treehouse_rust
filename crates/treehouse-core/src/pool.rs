@@ -127,6 +127,11 @@ impl Pool {
         &self.dir
     }
 
+    /// Whether a worktree is dirty (git status --porcelain --untracked-files=all).
+    pub fn git_is_dirty(&self, path: &Path) -> Result<bool, PoolError> {
+        Ok(self.git.is_dirty(path)?)
+    }
+
     /// Acquires a worktree from the pool (`get`).
     ///
     /// Short-lock protocol: branch+fetch outside the lock; reserve under lock;
