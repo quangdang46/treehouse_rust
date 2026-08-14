@@ -2488,12 +2488,14 @@ name = "treehouse"
 version = "3.0.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "owo-colors",
  "serde",
  "serde_json",
  "thiserror",
  "treehouse-core",
+ "tru",
 ]
 
 [[package]]

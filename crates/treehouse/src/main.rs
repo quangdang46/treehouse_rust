@@ -4,6 +4,7 @@
 //! renders each command's result. Business logic lives in `treehouse-core`.
 
 mod cli;
+mod format;
 
 use std::io::Write;
 use std::path::Path;
@@ -64,18 +65,19 @@ fn cmd_get(cli: &Cli, args: &cli::GetArgs) -> Result<()> {
             .or_else(|| std::env::var("TREEHOUSE_LEASE_HOLDER").ok())
             .unwrap_or_default();
         let lease = pool.acquire_lease(&holder)?;
-        match format {
-            OutputFormat::Human => {
-                println!("{}", lease.path);
-            }
-            OutputFormat::Json => {
-                println!("{}", serde_json::to_string(&lease)?);
-            }
-            OutputFormat::Toon => {
-                // TOON requires the toon dep; fall back to JSON for now.
-                println!("{}", serde_json::to_string(&lease)?);
-            }
-        }
+        let result = treehouse_core::result::CommandResult::Get(
+            treehouse_core::result::GetResult::Lease(lease),
+        );
+        let fmt = match format {
+            OutputFormat::Human => format::OutputFormat::Human,
+            OutputFormat::Json => format::OutputFormat::Json,
+            OutputFormat::Toon => format::OutputFormat::Toon,
+        };
+        let stdout = std::io::stdout();
+        let stderr = std::io::stderr();
+        let mut out = stdout.lock();
+        let mut err = stderr.lock();
+        format::render(fmt, &result, &mut out, &mut err)?;
         return Ok(());
     }
 
@@ -187,52 +189,17 @@ fn cmd_status(cli: &Cli, args: &cli::StatusArgs) -> Result<()> {
     let pool = cli::open_pool(&ctx)?;
     let statuses = pool.status()?;
 
-    if statuses.is_empty() {
-        eprintln!("🌳 No worktrees in pool.");
-        return Ok(());
-    }
-
-    match format {
-        OutputFormat::Human => {
-            // Table to stdout.
-            for s in &statuses {
-                let holder = if s.lease_holder.is_empty() {
-                    String::new()
-                } else {
-                    format!("  (held by {})", s.lease_holder)
-                };
-                println!("{:<4}  {:<11}  {}{}", s.name, s.status, s.path, holder);
-                for p in &s.processes {
-                    println!("{:19}{}", "", p);
-                }
-            }
-        }
-        OutputFormat::Json => {
-            let arr: Vec<serde_json::Value> = statuses
-                .iter()
-                .map(|s| {
-                    serde_json::json!({
-                        "name": s.name,
-                        "path": s.path,
-                        "status": s.status,
-                        "lease_id": s.lease_id,
-                        "lease_holder": s.lease_holder,
-                        "leased_at": if s.leased_at == treehouse_core::state::ZERO_TIME { serde_json::Value::Null } else { serde_json::Value::String(s.leased_at.to_rfc3339()) },
-                        "processes": s.processes.iter().map(|p| serde_json::json!({"pid": p.pid, "name": p.name})).collect::<Vec<_>>(),
-                    })
-                })
-                .collect();
-            println!("{}", serde_json::to_string(&arr)?);
-        }
-        OutputFormat::Toon => {
-            // TOON dep not wired yet; fall back to JSON.
-            let arr: Vec<serde_json::Value> = statuses
-                .iter()
-                .map(|s| serde_json::json!({ "name": s.name, "path": s.path, "status": s.status }))
-                .collect();
-            println!("{}", serde_json::to_string(&arr)?);
-        }
-    }
+    let result = treehouse_core::result::CommandResult::Status(statuses);
+    let fmt = match format {
+        OutputFormat::Human => format::OutputFormat::Human,
+        OutputFormat::Json => format::OutputFormat::Json,
+        OutputFormat::Toon => format::OutputFormat::Toon,
+    };
+    let stdout = std::io::stdout();
+    let stderr = std::io::stderr();
+    let mut out = stdout.lock();
+    let mut err = stderr.lock();
+    format::render(fmt, &result, &mut out, &mut err)?;
     Ok(())
 }
 
@@ -248,46 +215,15 @@ fn cmd_prune(cli: &Cli, args: &cli::PruneArgs) -> Result<()> {
     };
     let result = pool.prune(&opts)?;
 
-    if result.candidates.is_empty() && result.skipped.is_empty() {
-        eprintln!("🌳 No stale worktrees to prune.");
-        return Ok(());
-    }
-    if opts.dry_run {
-        println!(
-            "🌳 Dry run: would prune {} stale worktree(s) and reclaim {}.",
-            result.candidates.len(),
-            treehouse_core::prune::format_bytes(result.reclaimable_bytes)
-        );
-        println!("🌳 Re-run with --yes to delete these worktrees.");
-        for c in &result.candidates {
-            let tag = if c.orphaned { "[orphaned] " } else { "" };
-            println!(
-                "  {}{} {}",
-                tag,
-                treehouse_core::prune::format_bytes(c.bytes),
-                c.path
-            );
-        }
-    } else {
-        println!(
-            "🌳 Pruned {} stale worktree(s) and freed {}.",
-            result.pruned.len(),
-            treehouse_core::prune::format_bytes(result.freed_bytes)
-        );
-    }
-    if !result.skipped.is_empty() {
-        eprintln!(
-            "🌳 Skipped {} unsafe idle worktree(s):",
-            result.skipped.len()
-        );
-        for s in &result.skipped {
-            eprintln!("  [{}] {} ({})", s.category, s.path, s.reason);
-        }
-    }
+    let result = treehouse_core::result::CommandResult::Prune(result);
+    let stdout = std::io::stdout();
+    let stderr = std::io::stderr();
+    let mut out = stdout.lock();
+    let mut err = stderr.lock();
+    format::render(format::OutputFormat::Human, &result, &mut out, &mut err)?;
     Ok(())
 }
 
-/// Destroy worktrees (safe-by-default).
 fn cmd_destroy(cli: &Cli, args: &cli::DestroyArgs) -> Result<()> {
     let _ = cli;
     let ctx = cli::resolve_repo_ctx()?;
@@ -318,37 +254,21 @@ fn cmd_destroy(cli: &Cli, args: &cli::DestroyArgs) -> Result<()> {
     };
     let result = pool.destroy(&spec, &opts)?;
 
-    if opts.dry_run {
-        println!(
-            "🌳 Dry run: would destroy {} worktree(s) in {} and reclaim {}.",
-            result.planned.len(),
-            result.scope,
-            treehouse_core::prune::format_bytes(result.planned_bytes)
-        );
-        for t in &result.planned {
-            println!(
-                "  [{}] {} {}",
-                t.class,
-                treehouse_core::prune::format_bytes(t.bytes),
-                t.path
-            );
-        }
-    } else {
-        println!(
-            "🌳 Destroyed {} worktree(s) in {} and freed {}.",
-            result.destroyed.len(),
-            result.scope,
-            treehouse_core::prune::format_bytes(result.freed_bytes)
-        );
-    }
-    if !result.skipped.is_empty() {
-        for s in &result.skipped {
-            eprintln!("  [{}] {} ({})", s.detail, s.target.path, s.target.class);
-        }
-    }
+    let result = treehouse_core::result::CommandResult::Destroy(result);
+    let stdout = std::io::stdout();
+    let stderr = std::io::stderr();
+    let mut out = stdout.lock();
+    let mut err = stderr.lock();
+    format::render(format::OutputFormat::Human, &result, &mut out, &mut err)?;
+
     // Single-target executed with 0 destroyed + a skip -> exit 1.
-    if !opts.dry_run && !args.all && result.destroyed.is_empty() && !result.skipped.is_empty() {
-        let skip = &result.skipped[0];
+    if let treehouse_core::result::CommandResult::Destroy(r) = &result
+        && !opts.dry_run
+        && !args.all
+        && r.destroyed.is_empty()
+        && !r.skipped.is_empty()
+    {
+        let skip = &r.skipped[0];
         return Err(anyhow!(
             "did not destroy {} ({}); re-run with {}",
             skip.target.name,
@@ -359,7 +279,6 @@ fn cmd_destroy(cli: &Cli, args: &cli::DestroyArgs) -> Result<()> {
     Ok(())
 }
 
-/// Create a default treehouse.toml.
 fn cmd_init() -> Result<()> {
     let ctx = cli::resolve_repo_ctx()?;
     let path = ctx.repo_root.join("treehouse.toml");

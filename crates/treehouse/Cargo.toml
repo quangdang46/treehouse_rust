@@ -11,6 +11,11 @@ description = "Treehouse CLI — a pool of reusable git worktrees for coding age
 name = "treehouse"
 path = "src/main.rs"
 
+[features]
+default = []
+# Enable the TOON encoder (git dep, off by default so offline builds work).
+toon = ["treehouse-core/toon", "dep:tru"]
+
 [dependencies]
 treehouse-core = { path = "../treehouse-core" }
 clap = { version = "4.6.6", features = ["derive"] }
@@ -19,3 +24,6 @@ owo-colors = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+chrono = { workspace = true }
+# The TOON encoder (toon_rust); optional behind the `toon` feature.
+tru = { workspace = true, optional = true }

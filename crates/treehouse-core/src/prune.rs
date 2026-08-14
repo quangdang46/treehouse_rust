@@ -38,6 +38,7 @@ pub struct PruneSkipped {
 /// Dry-run candidates, removed worktrees, skipped worktrees, byte counts.
 #[derive(Debug, Clone, Default)]
 pub struct PruneResult {
+    pub dry_run: bool,
     pub candidates: Vec<PruneWorktree>,
     pub pruned: Vec<PruneWorktree>,
     pub skipped: Vec<PruneSkipped>,
@@ -89,7 +90,10 @@ impl Pool {
             .unwrap_or_else(|_| self.root.clone());
         let default_ref = self.resolve_prune_default_ref(&repo_root);
 
-        let mut result = PruneResult::default();
+        let mut result = PruneResult {
+            dry_run: opts.dry_run,
+            ..Default::default()
+        };
         let mut planned: Vec<(PruneWorktree, String)> = Vec::new(); // (worktree, context_ref)
 
         for wt in &entries {
