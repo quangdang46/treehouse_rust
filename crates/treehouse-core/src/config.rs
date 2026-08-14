@@ -46,6 +46,12 @@ impl Hooks {
 /// The default `max_trees` (Go `DefaultConfig`).
 pub const DEFAULT_MAX_TREES: u32 = 16;
 
+impl Default for TreehouseConfig {
+    fn default() -> Self {
+        Self::default_config()
+    }
+}
+
 impl TreehouseConfig {
     pub fn default_config() -> Self {
         TreehouseConfig {

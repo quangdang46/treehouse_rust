@@ -35,3 +35,5 @@ windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win
 [features]
 default = []
 toon = ["dep:tru"]
+# P1-A hardening race/concurrency tests (timing-sensitive).
+hardening = []

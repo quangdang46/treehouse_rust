@@ -282,17 +282,16 @@ impl Pool {
             .reset_worktree(Path::new(worktree_path), &branch)
             .map_err(PoolError::Git)?;
 
-        // LOCK #2: clear the owner reservation + lease, then write.
+        // LOCK #2: RE-VALIDATE the preconditions AND clear in ONE atomic lock.
+        // This is what makes release exactly-once (ABA-safe): a concurrent
+        // caller that passed LOCK #1 will find the lease already cleared here
+        // and fail its precondition, so only one release ever succeeds.
         with_pool_lock(&self.dir, self.lock_timeout, || {
             let mut state = State::read_state(&self.dir).map_err(PoolError::State)?;
-            for wt in &mut state.worktrees {
-                if wt.path == worktree_path {
-                    wt.owner_pid = 0;
-                    wt.owner_started_at = 0;
-                    crate::state::clear_lease(wt);
-                    break;
-                }
-            }
+            let wt = releasable_worktree(&mut state, worktree_path, preconditions)?;
+            wt.owner_pid = 0;
+            wt.owner_started_at = 0;
+            crate::state::clear_lease(wt);
             state_file::write_state(&self.dir, &state)
                 .map_err(|e| PoolError::Io("writing state".to_string(), e))?;
             Ok(())
