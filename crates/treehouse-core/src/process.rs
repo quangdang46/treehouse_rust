@@ -253,7 +253,7 @@ fn absolute_and_resolve(p: &Path) -> Option<PathBuf> {
 }
 
 /// Path of `cwd` relative to `base`, as a `PathBuf`, or `None` on failure.
-fn pathdiff_rel(base: &Path, cwd: &Path) -> Option<PathBuf> {
+pub(crate) fn pathdiff_rel(base: &Path, cwd: &Path) -> Option<PathBuf> {
     // std has no Rel in stable; implement the same semantics as Go's filepath.Rel
     // over components. For our purpose we only need "." vs a descendant, so a
     // component walk suffices.

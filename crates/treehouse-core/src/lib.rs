@@ -13,6 +13,7 @@ pub mod git;
 pub mod hooks;
 pub mod lease;
 pub mod lock;
+pub mod pool;
 pub mod process;
 pub mod reservation;
 pub mod state;
