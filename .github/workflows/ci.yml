@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  format-lint:
+    name: fmt + clippy (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt check
+        run: cargo fmt --all -- --check
+      # Clippy scoped to default features (the toon git dep is feature-gated so
+      # a checkout without network to toon_rust still lints cleanly).
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test-build:
+    name: test + build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      # Pin to the workspace MSRV (1.88, edition 2024) so edition-2024
+      # features are available; stable toolchain matches rust-version.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        run: cargo build --workspace
+      - name: test
+        run: cargo test --workspace
