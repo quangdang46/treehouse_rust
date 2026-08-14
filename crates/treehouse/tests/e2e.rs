@@ -145,3 +145,26 @@ fn e2e_run_cleans_up() {
     );
     assert_eq!(code, 1, "run -- false should exit 1, got {err}");
 }
+
+/// `treehouse doctor` reports a healthy pool (exit 0) and JSON output.
+#[test]
+fn e2e_doctor_healthy() {
+    let (repo, home) = common::setup();
+    let bin = common::treehouse_bin();
+    common::run(&bin, &repo, &home, &[], &["get", "--lease"]);
+
+    let (out, err, code) = common::run(&bin, &repo, &home, &[], &["doctor"]);
+    assert_eq!(code, 0, "doctor on healthy pool should exit 0, got {err}");
+    assert!(
+        out.contains("Doctor:") || out.contains("healthy"),
+        "got {out}"
+    );
+
+    let (out, err, code) = common::run(&bin, &repo, &home, &[], &["doctor", "--format", "json"]);
+    assert_eq!(code, 0, "doctor --json failed: {err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    assert!(
+        v.get("healthy").is_some(),
+        "expected healthy field, got {out}"
+    );
+}

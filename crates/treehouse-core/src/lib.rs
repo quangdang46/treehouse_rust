@@ -10,6 +10,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod config;
 pub mod destroy;
+pub mod doctor;
 pub mod gc;
 pub mod git;
 pub mod hardening;

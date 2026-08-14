@@ -45,6 +45,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Command::Destroy(args)) => cmd_destroy(&cli, args),
         Some(Command::Gc(args)) => cmd_gc(&cli, args),
         Some(Command::Run(args)) => cmd_run(&cli, args),
+        Some(Command::Doctor(args)) => cmd_doctor(&cli, args),
         Some(Command::Init) => cmd_init(),
         Some(Command::Update) => cmd_update(),
     }
@@ -464,6 +465,48 @@ fn cmd_run(cli: &Cli, args: &cli::RunArgs) -> Result<()> {
     }
     if let Some(sig) = result.child_signal {
         std::process::exit(128 + sig);
+    }
+    Ok(())
+}
+
+/// Read-only health report.
+fn cmd_doctor(cli: &Cli, args: &cli::DoctorArgs) -> Result<()> {
+    let ctx = cli::resolve_repo_ctx()?;
+    let pool = cli::open_pool(&ctx)?;
+    let report = treehouse_core::doctor::run_doctor(&pool)?;
+
+    // JSON/TOON to stdout; human to stdout with markers.
+    match cli.format {
+        OutputFormat::Json | OutputFormat::Toon => {
+            let json = treehouse_core::doctor::report_json(&report);
+            println!("{}", serde_json::to_string(&json)?);
+        }
+        OutputFormat::Human => {
+            println!("🌳 treehouse doctor");
+            for c in &report.checks {
+                let marker = match c.status {
+                    treehouse_core::doctor::Severity::Ok => "✓",
+                    treehouse_core::doctor::Severity::Warn => "⚠",
+                    treehouse_core::doctor::Severity::Error => "✗",
+                };
+                println!("  {marker} {}: {}", c.name, c.detail);
+            }
+            println!(
+                "Doctor: {} error(s), {} warning(s)",
+                report.error_count(),
+                report.warn_count()
+            );
+        }
+    }
+
+    // Exit code: 1 if any Error, or if --strict and any Warn.
+    let failed = if args.strict {
+        !report.strict_healthy
+    } else {
+        !report.healthy
+    };
+    if failed {
+        std::process::exit(1);
     }
     Ok(())
 }

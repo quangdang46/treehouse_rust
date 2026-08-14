@@ -58,6 +58,8 @@ pub enum Command {
     Gc(GcArgs),
     /// Acquire -> run an agent -> cleanup guaranteed on every exit.
     Run(RunArgs),
+    /// Read-only health report.
+    Doctor(DoctorArgs),
     /// Create a default treehouse.toml.
     Init,
     /// Update treehouse to the latest release.
@@ -125,6 +127,13 @@ pub struct PruneArgs {
     /// Show detailed skip diagnostics.
     #[arg(long, short = 'v')]
     pub verbose: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct DoctorArgs {
+    /// Treat any warning as a failure.
+    #[arg(long)]
+    pub strict: bool,
 }
 
 #[derive(Debug, Args)]
