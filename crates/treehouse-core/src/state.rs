@@ -569,4 +569,26 @@ mod tests {
             assert_eq!(wt.lease_holder, RECOVERED_LEASE_HOLDER);
         }
     }
+
+    #[test]
+    fn recovered_entries_are_permanent_leases_without_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("1/myrepo");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: ../../fake.git\n").unwrap();
+        std::fs::write(State::state_file_path(dir.path()), b"").unwrap();
+
+        let s = State::read_state(dir.path()).unwrap();
+        let e = &s.worktrees[0];
+        // Deliberately conservative: no lease_id (so --if-lease-id can't match),
+        // no expires_at (so gc can never auto-reclaim a recovered entry).
+        assert!(e.leased);
+        assert_eq!(e.lease_holder, RECOVERED_LEASE_HOLDER);
+        assert_eq!(e.lease_id, "");
+        assert_eq!(e.expires_at, ZERO_TIME);
+        assert!(
+            !e.is_stale_lease(chrono::Utc::now()),
+            "recovered entries must never auto-expire"
+        );
+    }
 }
