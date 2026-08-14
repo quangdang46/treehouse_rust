@@ -8,6 +8,7 @@
 /// Library version, kept in sync with the workspace `version` field.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub mod lease;
 pub mod lock;
 pub mod state;
 pub mod state_file;
