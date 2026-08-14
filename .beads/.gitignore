@@ -1,0 +1,9 @@
+beads.db
+beads.db-*
+*.db
+*.db-*
+.sync.lock
+.write.lock
+last-touched
+.br_history/
+*.meta.json
