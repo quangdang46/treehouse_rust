@@ -116,34 +116,35 @@ fn e2e_gc_reclaims_expired_lease_but_not_valid() {
 }
 
 /// `treehouse run -- <cmd>` acquires a worktree, runs the command, and cleans up.
+///
+/// Uses a cross-platform exit helper: `sh -c exit N` on unix,
+/// `cmd /c exit N` on Windows.
 #[test]
 fn e2e_run_cleans_up() {
     let (repo, home) = common::setup();
     let bin = common::treehouse_bin();
 
-    // run -- true exits 0 and returns the worktree.
-    let (out, err, code) = common::run(
-        &bin,
-        &repo,
-        &home,
-        &[],
-        &["run", "--", "cmd", "/c", "exit", "0"],
-    );
-    assert_eq!(code, 0, "run -- true should exit 0, got {err}");
+    // exit 0: worktree returned, no leak.
+    let cmd0: &[&str] = if cfg!(windows) {
+        &["run", "--", "cmd", "/c", "exit", "0"]
+    } else {
+        &["run", "--", "sh", "-c", "exit 0"]
+    };
+    let (out, err, code) = common::run(&bin, &repo, &home, &[], cmd0);
+    assert_eq!(code, 0, "run exit-0 should exit 0, got {err}");
     assert!(
         out.is_empty() || !out.contains("error"),
         "unexpected stdout {out}"
     );
 
-    // run -- false exits 1.
-    let (_, err, code) = common::run(
-        &bin,
-        &repo,
-        &home,
-        &[],
-        &["run", "--", "cmd", "/c", "exit", "1"],
-    );
-    assert_eq!(code, 1, "run -- false should exit 1, got {err}");
+    // exit 1: child exit code is propagated.
+    let cmd1: &[&str] = if cfg!(windows) {
+        &["run", "--", "cmd", "/c", "exit", "1"]
+    } else {
+        &["run", "--", "sh", "-c", "exit 1"]
+    };
+    let (_, err, code) = common::run(&bin, &repo, &home, &[], cmd1);
+    assert_eq!(code, 1, "run exit-1 should exit 1, got {err}");
 }
 
 /// `treehouse doctor` reports a healthy pool (exit 0) and JSON output.

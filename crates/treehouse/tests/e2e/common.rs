@@ -98,9 +98,12 @@ fn build_env(home: &Path) -> Vec<(String, String)> {
 /// (a dropped TempDir would delete the repo on return).
 pub fn setup() -> (PathBuf, PathBuf) {
     let base = Box::leak(Box::new(tempfile::tempdir().unwrap()));
-    // tempfile's path is already absolute; use it directly (canonicalize adds a
-    // \\?\ verbatim prefix on Windows that git can't mkdir).
     let base = base.path().to_path_buf();
+    // Resolve symlinks on unix so paths match what git rev-parse returns
+    // (macOS /tmp -> /private/tmp). On Windows, canonicalize returns a \\?\
+    // verbatim prefix that git can't mkdir, so keep the raw path there.
+    #[cfg(not(windows))]
+    let base = std::fs::canonicalize(&base).unwrap_or(base);
     let home = base.join("home");
     std::fs::create_dir_all(&home).unwrap();
     let bare = base.join("remote.git");
