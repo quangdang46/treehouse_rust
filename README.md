@@ -9,7 +9,7 @@
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)
 ![Rust](https://img.shields.io/badge/Rust-stable-orange.svg)
 ![License](https://img.shields.io/badge/License-MIT-blue.svg)
-![Release](https://img.shields.io/github/v/release/<owner>/<repo>?include_prereleases)
+![Release](https://img.shields.io/github/v/release/quangdang46/treehouse_rust?include_prereleases)
 
 </div>
 
@@ -20,7 +20,7 @@ treehouse is a Rust reimplementation of [kunchenguid/treehouse](https://github.c
 <div align="center">
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/<owner>/<repo>/main/install.sh?$(date +%s)" | sh
+curl -fsSL "https://raw.githubusercontent.com/quangdang46/treehouse_rust/main/install.sh?$(date +%s)" | sh
 ```
 
 </div>
