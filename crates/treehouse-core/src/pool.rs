@@ -90,10 +90,10 @@ pub struct WorktreeStatus {
 pub struct Pool {
     pub root: PathBuf,
     pub dir: PathBuf,
-    git: Arc<dyn GitBackend>,
-    process: Arc<ProcessTable>,
-    config: TreehouseConfig,
-    lock_timeout: std::time::Duration,
+    pub(crate) git: Arc<dyn GitBackend>,
+    pub(crate) process: Arc<ProcessTable>,
+    pub(crate) config: TreehouseConfig,
+    pub(crate) lock_timeout: std::time::Duration,
 }
 
 impl Pool {
@@ -362,7 +362,7 @@ impl Pool {
 
 /// Runs `f` under the pool state lock, flattening the double-`Result` that
 /// `with_state_lock` returns (outer lock error, inner callback error).
-fn with_pool_lock<T>(
+pub(crate) fn with_pool_lock<T>(
     dir: &Path,
     timeout: std::time::Duration,
     f: impl FnOnce() -> Result<T, PoolError>,
