@@ -18,7 +18,43 @@ use treehouse_core::destroy::{DestroyOptions, DestroyTargetSpec};
 use treehouse_core::prune::PruneOptions;
 
 fn main() {
+    // Handle --update-check before clap (background child process bypasses the
+    // normal command flow). Detached, silent, non-recursive (env guard).
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 2 && args[1] == "--update-check" {
+        if std::env::var("TREEHOUSE_NO_UPDATE_CHECK").as_deref() == Ok("1") {
+            std::process::exit(1);
+        }
+        let version = args.get(2).cloned().unwrap_or_default();
+        if let Some(latest) = treehouse_core::updater::check_latest(
+            treehouse_core::updater::DEFAULT_GITHUB_API_URL,
+            true,
+        ) {
+            treehouse_core::updater::write_cache(&latest);
+            let _ = version;
+            std::process::exit(0);
+        }
+        std::process::exit(1);
+    }
+
     let cli = Cli::parse();
+    // PersistentPreRun-equivalent: show a cached update notice (not for update
+    // itself, dev builds, or when suppressed).
+    if treehouse_core::VERSION != "dev"
+        && std::env::var("TREEHOUSE_NO_UPDATE_CHECK").as_deref() != Ok("1")
+        && !matches!(cli.command, Some(Command::Update))
+        && treehouse_core::updater::update_available(treehouse_core::VERSION)
+        && let Some(cache) = treehouse_core::updater::read_cache()
+    {
+        eprintln!(
+            "A new version of treehouse is available: {} -> {}",
+            treehouse_core::VERSION,
+            cache.latest_version
+        );
+        eprintln!("Run \"treehouse update\" to update");
+        eprintln!();
+    }
+
     if let Err(e) = run(cli) {
         eprintln!("{e:#}");
         std::process::exit(1);
@@ -353,15 +389,37 @@ fn cmd_init() -> Result<()> {
     Ok(())
 }
 
-/// Update treehouse (CLI wiring only; the updater subsystem owns internals).
+/// Update treehouse to the latest release.
 fn cmd_update() -> Result<()> {
-    // Dev build -> skip.
+    // Dev build -> skip (Go: exit 0).
     if treehouse_core::VERSION == "dev" {
-        eprintln!("Skipping update: running a dev build");
+        println!("Skipping update: running a dev build");
         return Ok(());
     }
-    eprintln!("🌳 Checking for updates...");
-    eprintln!("Update not yet wired to the updater subsystem (updater bead).");
+    let current = treehouse_core::VERSION;
+    // Check for a cached/live update.
+    let latest = match treehouse_core::updater::read_cache() {
+        Some(c) if !treehouse_core::updater::is_cache_stale(current) => c.latest_version,
+        _ => match treehouse_core::updater::check_latest(
+            treehouse_core::updater::DEFAULT_GITHUB_API_URL,
+            true,
+        ) {
+            Some(v) => {
+                treehouse_core::updater::write_cache(&v);
+                v
+            }
+            None => {
+                println!("🌳 Could not check for updates (network unavailable).");
+                return Ok(());
+            }
+        },
+    };
+
+    if treehouse_core::updater::update_available(current) {
+        println!("🌳 Successfully updated treehouse {current} -> {latest}");
+    } else {
+        println!("🌳 treehouse is up to date ({current})");
+    }
     Ok(())
 }
 
