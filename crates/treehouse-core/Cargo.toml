@@ -19,6 +19,7 @@ toml = { workspace = true }
 owo-colors = { workspace = true }
 rand = { workspace = true }
 humantime = { workspace = true }
+sha2 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", features = ["signal", "process"] }
