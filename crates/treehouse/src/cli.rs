@@ -56,6 +56,8 @@ pub enum Command {
     Destroy(DestroyArgs),
     /// Reclaim stale, orphaned, and dead-owner worktrees (dry-run default).
     Gc(GcArgs),
+    /// Acquire -> run an agent -> cleanup guaranteed on every exit.
+    Run(RunArgs),
     /// Create a default treehouse.toml.
     Init,
     /// Update treehouse to the latest release.
@@ -123,6 +125,19 @@ pub struct PruneArgs {
     /// Show detailed skip diagnostics.
     #[arg(long, short = 'v')]
     pub verbose: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct RunArgs {
+    /// The lease TTL (e.g. 30m, 1h).
+    #[arg(long)]
+    pub ttl: Option<String>,
+    /// The lease holder label.
+    #[arg(long)]
+    pub lease_holder: Option<String>,
+    /// The command + args to run (after `--`).
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub command: Vec<String>,
 }
 
 #[derive(Debug, Args)]

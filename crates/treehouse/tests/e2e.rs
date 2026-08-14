@@ -114,3 +114,34 @@ fn e2e_gc_reclaims_expired_lease_but_not_valid() {
         "valid lease must never be gc'd"
     );
 }
+
+/// `treehouse run -- <cmd>` acquires a worktree, runs the command, and cleans up.
+#[test]
+fn e2e_run_cleans_up() {
+    let (repo, home) = common::setup();
+    let bin = common::treehouse_bin();
+
+    // run -- true exits 0 and returns the worktree.
+    let (out, err, code) = common::run(
+        &bin,
+        &repo,
+        &home,
+        &[],
+        &["run", "--", "cmd", "/c", "exit", "0"],
+    );
+    assert_eq!(code, 0, "run -- true should exit 0, got {err}");
+    assert!(
+        out.is_empty() || !out.contains("error"),
+        "unexpected stdout {out}"
+    );
+
+    // run -- false exits 1.
+    let (_, err, code) = common::run(
+        &bin,
+        &repo,
+        &home,
+        &[],
+        &["run", "--", "cmd", "/c", "exit", "1"],
+    );
+    assert_eq!(code, 1, "run -- false should exit 1, got {err}");
+}

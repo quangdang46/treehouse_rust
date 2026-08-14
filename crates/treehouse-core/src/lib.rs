@@ -21,6 +21,7 @@ pub mod process;
 pub mod prune;
 pub mod reservation;
 pub mod result;
+pub mod run;
 pub mod state;
 pub mod state_file;
 pub mod worktree;

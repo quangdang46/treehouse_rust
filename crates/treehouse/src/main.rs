@@ -44,6 +44,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Command::Prune(args)) => cmd_prune(&cli, args),
         Some(Command::Destroy(args)) => cmd_destroy(&cli, args),
         Some(Command::Gc(args)) => cmd_gc(&cli, args),
+        Some(Command::Run(args)) => cmd_run(&cli, args),
         Some(Command::Init) => cmd_init(),
         Some(Command::Update) => cmd_update(),
     }
@@ -428,5 +429,41 @@ fn confirm(prompt: &str) -> Result<bool> {
 /// Detach + return on a nonzero shell exit.
 fn detach_and_return(_pool: &treehouse_core::pool::Pool, path: &Path, _force: bool) -> Result<()> {
     let _ = path;
+    Ok(())
+}
+
+/// Acquire -> run an agent -> cleanup guaranteed on every exit.
+fn cmd_run(cli: &Cli, args: &cli::RunArgs) -> Result<()> {
+    let _ = cli;
+    if args.command.is_empty() {
+        return Err(anyhow!("run requires a command after `--`"));
+    }
+    let ctx = cli::resolve_repo_ctx()?;
+    let pool = cli::open_pool(&ctx)?;
+
+    let ttl = match &args.ttl {
+        Some(s) => humantime::parse_duration(s)?,
+        None => std::time::Duration::from_secs(24 * 3600),
+    };
+    let holder = args
+        .lease_holder
+        .clone()
+        .or_else(|| std::env::var("TREEHOUSE_LEASE_HOLDER").ok())
+        .unwrap_or_else(|| format!("run:{}", std::process::id()));
+
+    let opts = treehouse_core::run::RunOptions {
+        command: args.command.iter().map(std::ffi::OsString::from).collect(),
+        ttl,
+        holder,
+    };
+    let result = treehouse_core::run::run(&pool, &opts)?;
+
+    // Exit with the child's code (or 128+signum on unix signal).
+    if let Some(code) = result.child_exit_code {
+        std::process::exit(code);
+    }
+    if let Some(sig) = result.child_signal {
+        std::process::exit(128 + sig);
+    }
     Ok(())
 }
