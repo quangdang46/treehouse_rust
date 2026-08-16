@@ -66,11 +66,14 @@ if [ "$UNINSTALL" -eq 1 ]; then
 fi
 
 # === Platform detection ===
+# Returns `<os>_<arch>` where os matches the RELEASE ASSET suffix (release.yml):
+# linux / macos / windows. (`uname` calls it "darwin", but the release assets
+# are published under `macos-*`, so we normalize here.)
 detect_platform() {
     local os arch
     case "$(uname -s)" in
         Linux*)  os="linux" ;;
-        Darwin*) os="darwin" ;;
+        Darwin*) os="macos" ;;
         MINGW*|MSYS*|CYGWIN*) os="windows" ;;
         *) die "Unsupported OS: $(uname -s)" ;;
     esac
