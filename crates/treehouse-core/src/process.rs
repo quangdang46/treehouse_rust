@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use sysinfo::{Pid, ProcessesToUpdate, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
 /// A process found running inside a worktree. Display is `name (pid)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,9 +41,21 @@ pub struct ProcessTable {
 
 impl ProcessTable {
     pub fn new() -> Self {
-        // Refresh everything (cwd, parent, start time, name) for all PIDs.
-        let mut system = System::new();
-        system.refresh_processes(ProcessesToUpdate::All, true);
+        // Refresh EVERYTHING (cwd, parent, start time, name) for all PIDs.
+        //
+        // `refresh_processes(All, true)` does NOT populate `cwd` on macOS for
+        // other users' processes (it returns `None`, silently making in-use
+        // detection blind). `refresh_processes_specifics` with
+        // `ProcessRefreshKind::everything()` fetches cwd too — the Go version
+        // uses gopsutil which reads cwd for every process.
+        let mut system = System::new_with_specifics(
+            RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
+        );
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::everything(),
+        );
         Self {
             system: Mutex::new(system),
         }
@@ -52,7 +64,11 @@ impl ProcessTable {
     /// Re-enumerates the process table.
     pub fn refresh(&self) {
         let mut system = self.system.lock().unwrap();
-        system.refresh_processes(ProcessesToUpdate::All, true);
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::everything(),
+        );
     }
 
     /// Returns every process whose cwd is the worktree root or a descendant,
