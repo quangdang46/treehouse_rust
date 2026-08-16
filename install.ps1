@@ -139,8 +139,8 @@ function Main {
             Main; return
         }
 
-        # Checksum sidecar (optional).
-        $checksumUrl = "$url.sha256"
+        # Checksum sidecar (optional) is named `<archive-base>.sha256` (no `.zip`).
+        $checksumUrl = "$url.sha256" -replace '\.zip$', ''
         try {
             Invoke-WebRequest -Uri $checksumUrl -OutFile "$zipPath.sha256" -TimeoutSec 30
             $expected = (Get-Content "$zipPath.sha256" -First 1).Split()[0]

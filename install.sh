@@ -188,7 +188,10 @@ main() {
         local url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${archive}"
 
         if download_file "$url" "$TMP/$archive"; then
-            verify_checksum "$TMP/$archive" "${url}.sha256"
+            # The release sidecar is named `<archive-base>.sha256` (no `.tar.gz`/
+            # `.zip` suffix), so derive the checksum URL from the archive name.
+            local checksum_url="${url%.${ext}}.sha256"
+            verify_checksum "$TMP/$archive" "$checksum_url"
             case "$archive" in
                 *.tar.gz) tar -xzf "$TMP/$archive" -C "$TMP" ;;
                 *.zip)    unzip -qo "$TMP/$archive" -d "$TMP" ;;
