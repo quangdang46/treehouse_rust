@@ -7,7 +7,7 @@ mod cli;
 mod format;
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
@@ -254,6 +254,9 @@ fn cmd_status(cli: &Cli, args: &cli::StatusArgs) -> Result<()> {
 /// Prune stale idle worktrees.
 fn cmd_prune(cli: &Cli, args: &cli::PruneArgs) -> Result<()> {
     let _ = cli;
+    if args.all {
+        return cmd_prune_all(args);
+    }
     let ctx = cli::resolve_repo_ctx()?;
     let pool = cli::open_pool(&ctx)?;
     let opts = PruneOptions {
@@ -263,6 +266,41 @@ fn cmd_prune(cli: &Cli, args: &cli::PruneArgs) -> Result<()> {
     };
     let result = pool.prune(&opts)?;
 
+    render_prune(result)?;
+    Ok(())
+}
+
+/// `prune --all`: sweep every managed pool under the user-level root.
+fn cmd_prune_all(args: &cli::PruneArgs) -> Result<()> {
+    let user = treehouse_core::config::TreehouseConfig::load_global()?;
+    let opts = PruneOptions {
+        dry_run: !args.yes,
+        prune_orphans: args.prune_orphans,
+        ..Default::default()
+    };
+    let mut results: Vec<(PathBuf, _)> = Vec::new();
+    let ctx_factory =
+        |dir: &PathBuf| -> Result<treehouse_core::pool::Pool, treehouse_core::pool::PoolError> {
+            treehouse_core::pool::Pool::open_at(
+                dir,
+                &treehouse_core::pool::OpenOptions {
+                    config: user.clone(),
+                    ..Default::default()
+                },
+            )
+        };
+    treehouse_core::discovery::sweep_pools(&user, ctx_factory, |pool| {
+        let result = pool.prune(&opts)?;
+        results.push((pool.pool_dir().to_path_buf(), result));
+        Ok(())
+    })?;
+    let merged = treehouse_core::discovery::merge_prune_results(results);
+    render_prune(merged)?;
+    Ok(())
+}
+
+/// Renders a prune result (human) to stdout/stderr.
+fn render_prune(result: treehouse_core::prune::PruneResult) -> Result<()> {
     let result = treehouse_core::result::CommandResult::Prune(result);
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
@@ -275,6 +313,9 @@ fn cmd_prune(cli: &Cli, args: &cli::PruneArgs) -> Result<()> {
 /// Reclaim stale, orphaned, and dead-owner worktrees (dry-run default).
 fn cmd_gc(cli: &Cli, args: &cli::GcArgs) -> Result<()> {
     let _ = cli;
+    if args.all {
+        return cmd_gc_all(args);
+    }
     let ctx = cli::resolve_repo_ctx()?;
     let pool = cli::open_pool(&ctx)?;
     let opts = treehouse_core::gc::GcOptions {
@@ -283,6 +324,49 @@ fn cmd_gc(cli: &Cli, args: &cli::GcArgs) -> Result<()> {
     };
     let result = pool.gc(&opts)?;
 
+    render_gc(&opts, &result)?;
+    Ok(())
+}
+
+/// `gc --all`: sweep every managed pool under the user-level root.
+fn cmd_gc_all(args: &cli::GcArgs) -> Result<()> {
+    let user = treehouse_core::config::TreehouseConfig::load_global()?;
+    let opts = treehouse_core::gc::GcOptions {
+        dry_run: !args.yes,
+        prune_orphans: args.prune_orphans,
+    };
+    let mut results: Vec<(PathBuf, _)> = Vec::new();
+    let ctx_factory =
+        |dir: &PathBuf| -> Result<treehouse_core::pool::Pool, treehouse_core::pool::PoolError> {
+            treehouse_core::pool::Pool::open_at(
+                dir,
+                &treehouse_core::pool::OpenOptions {
+                    config: user.clone(),
+                    ..Default::default()
+                },
+            )
+        };
+    treehouse_core::discovery::sweep_pools(&user, ctx_factory, |pool| {
+        let result = pool.gc(&opts)?;
+        results.push((pool.pool_dir().to_path_buf(), result));
+        Ok(())
+    })?;
+    let merged = treehouse_core::discovery::merge_gc_results(results);
+
+    // Sweep banner first (aggregate per-pool skips already streamed).
+    if opts.dry_run && merged.candidates.is_empty() && merged.skipped.is_empty() {
+        eprintln!("🌳 No stale worktrees to reclaim.");
+        return Ok(());
+    }
+    render_gc(&opts, &merged)?;
+    Ok(())
+}
+
+/// Renders a gc result (human) to stdout/stderr.
+fn render_gc(
+    opts: &treehouse_core::gc::GcOptions,
+    result: &treehouse_core::gc::GcResult,
+) -> Result<()> {
     if result.candidates.is_empty() && result.skipped.is_empty() {
         eprintln!("🌳 No stale worktrees to reclaim.");
         return Ok(());
@@ -323,18 +407,19 @@ fn cmd_destroy(cli: &Cli, args: &cli::DestroyArgs) -> Result<()> {
     let ctx = cli::resolve_repo_ctx()?;
     let pool = cli::open_pool(&ctx)?;
 
-    // --all requires a pool path; no path and no --all is an error.
-    if args.all && args.path.is_none() {
-        return Err(anyhow!("--all requires a pool path"));
-    }
-    if !args.all && args.path.is_none() {
-        return Err(anyhow!("destroy requires a worktree path or --all"));
-    }
-    if args.all && args.include_leased {
-        return Err(anyhow!("--include-leased cannot be combined with --all"));
+    // --all on its own sweeps the whole pool; with a pool path it sweeps that
+    // named pool (Go `<pool> --all` and `--all` from the repo).
+    let all = args.all;
+    let pool_dir = pool.pool_dir();
+    let path_is_pool = args
+        .path
+        .as_deref()
+        .is_some_and(|p| p == "." || p.ends_with(".treehouse") || pool_dir.as_os_str() == p);
+    if all && args.path.is_some() && !path_is_pool {
+        return Err(anyhow!("--all takes a pool path, not a worktree path"));
     }
 
-    let spec = if args.all {
+    let spec = if all {
         DestroyTargetSpec::All
     } else {
         DestroyTargetSpec::Single(args.path.clone().unwrap())
@@ -358,7 +443,7 @@ fn cmd_destroy(cli: &Cli, args: &cli::DestroyArgs) -> Result<()> {
     // Single-target executed with 0 destroyed + a skip -> exit 1.
     if let treehouse_core::result::CommandResult::Destroy(r) = &result
         && !opts.dry_run
-        && !args.all
+        && !all
         && r.destroyed.is_empty()
         && !r.skipped.is_empty()
     {
@@ -527,6 +612,12 @@ fn cmd_run(cli: &Cli, args: &[String]) -> Result<()> {
                 }
                 holder = Some(args[i].clone());
                 i += 1;
+            }
+            "--" => {
+                // The separator ends the flag section; the rest is the
+                // command verbatim (this also handles `run --ttl 2m -- cmd`).
+                i += 1;
+                break;
             }
             _ => break,
         }

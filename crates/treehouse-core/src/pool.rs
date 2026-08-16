@@ -124,6 +124,29 @@ impl Pool {
         })
     }
 
+    /// Opens a pool at an already-known pool directory (used by `--all`
+    /// sweeps that discover pool dirs; the backing repo root is the pool
+    /// dir's parent).
+    pub fn open_at(pool_dir: &Path, opts: &OpenOptions) -> Result<Self, PoolError> {
+        std::fs::create_dir_all(pool_dir)
+            .map_err(|e| PoolError::Io(format!("creating pool dir {}", pool_dir.display()), e))?;
+
+        let git = crate::git::ShellGitBackend::discover().map_err(PoolError::Git)?;
+        let process = ProcessTable::new();
+
+        Ok(Pool {
+            root: pool_dir
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| pool_dir.to_path_buf()),
+            dir: pool_dir.to_path_buf(),
+            git: Arc::new(git),
+            process: Arc::new(process),
+            config: opts.config.clone(),
+            lock_timeout: opts.lock_timeout,
+        })
+    }
+
     /// The pool directory.
     pub fn pool_dir(&self) -> &Path {
         &self.dir

@@ -1,0 +1,110 @@
+name: Release
+
+# Trigger on version tags: vX.Y.Z (release-curl convention).
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-22.04
+            suffix: linux-x86_64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-22.04
+            suffix: linux-aarch64
+          - target: x86_64-apple-darwin
+            os: macos-14
+            suffix: macos-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-14
+            suffix: macos-aarch64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            suffix: windows-x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cross toolchain (Linux musl)
+        if: startsWith(matrix.target, 'aarch64-unknown-linux-musl')
+        run: rustup target add aarch64-unknown-linux-musl
+      - name: Build binary
+        run: |
+          if [[ "${{ matrix.os }}" == "ubuntu-22.04" && "${{ matrix.target }}" == "x86_64-unknown-linux-musl" ]]; then
+            cargo build --release --target x86_64-unknown-linux-musl --bin treehouse
+            BIN=target/x86_64-unknown-linux-musl/release/treehouse
+          elif [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
+            cargo build --release --target aarch64-unknown-linux-musl --bin treehouse
+            BIN=target/aarch64-unknown-linux-musl/release/treehouse
+          else
+            cargo build --release --bin treehouse
+            if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+              BIN=target/release/treehouse.exe
+            else
+              BIN=target/release/treehouse
+            fi
+          fi
+          echo "BIN=$BIN" >> "$GITHUB_ENV"
+      - name: Package
+        shell: bash
+        run: |
+          NAME="treehouse-${{ matrix.suffix }}"
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            7z a "$NAME.zip" "$BIN"
+          else
+            tar -czf "$NAME.tar.gz" -C "$(dirname "$BIN")" "$(basename "$BIN")"
+          fi
+          sha256sum "$NAME".* 2>/dev/null || shasum -a 256 "$NAME".* > "$NAME.sha256"
+          # Always name checksum as <archive>.sha256
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            ls -la "$NAME.zip" "$NAME.sha256"
+          else
+            ls -la "$NAME.tar.gz" "$NAME.sha256"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: treehouse-${{ matrix.suffix }}
+          path: |
+            treehouse-${{ matrix.suffix }}.tar.gz
+            treehouse-${{ matrix.suffix }}.sha256
+            treehouse-${{ matrix.suffix }}.zip
+            treehouse-${{ matrix.suffix }}.sha256
+
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Create GitHub Release (auto notes)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NAME="treehouse-$(git describe --tags --abbrev=0)"
+          cd release-artifacts
+          FILES=""
+          for d in treehouse-linux-x86_64 treehouse-linux-aarch64 treehouse-macos-x86_64 treehouse-macos-aarch64 treehouse-windows-x86_64; do
+            if [ -f "$d.tar.gz" ]; then FILES="$FILES $d.tar.gz $d.sha256"; fi
+            if [ -f "$d.zip" ];     then FILES="$FILES $d.zip $d.sha256"; fi
+          done
+          gh release create "$NAME" $FILES --generate-notes --title "$NAME"
+          echo "released $NAME with:$FILES"
