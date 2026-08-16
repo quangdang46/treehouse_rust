@@ -3,9 +3,9 @@
   treehouse installer for Windows (PowerShell).
 
 .DESCRIPTION
-  Installs the treehouse binary (single binary from the GitHub release) and
-  optionally auto-configures MCP servers + lifecycle hooks for the major AI
-  coding tools. This is the Windows companion to install.sh.
+  Installs the treehouse binary (single binary from the GitHub release),
+  verifies its SHA256 checksum, and optionally builds from source. This is
+  the Windows companion to install.sh.
 
 .EXAMPLE
   irm https://raw.githubusercontent.com/quangdang46/treehouse_rust/main/install.ps1 | iex
@@ -27,12 +27,6 @@
 
 .PARAMETER Uninstall
   Remove the binary and PATH entries.
-
-.PARAMETER NoMcp
-  Skip auto-configuration of MCP server entries across providers.
-
-.PARAMETER NoHooks
-  Skip auto-configuration of lifecycle hooks.
 #>
 param(
     [string]$Dest = "$env:USERPROFILE\.local\bin",
@@ -43,9 +37,7 @@ param(
     [switch]$EasyMode,
     [switch]$Verify,
     [switch]$FromSource,
-    [switch]$Uninstall,
-    [switch]$NoMcp,
-    [switch]$NoHooks
+    [switch]$Uninstall
 )
 
 $ErrorActionPreference = "Stop"
@@ -82,7 +74,7 @@ function Resolve-Version {
     Log-Info "Resolving latest version..."
     $apiUrl = "https://api.github.com/repos/$Owner/$Repo/releases/latest"
     try {
-        $release = Invoke-RestMethod -Uri $apiUrl -Headers @{"Accept"="application/vnd.github.v3+json"}} -TimeoutSec 30
+        $release = Invoke-RestMethod -Uri $apiUrl -Headers @{"Accept"="application/vnd.github.v3+json"} -TimeoutSec 30
         return $release.tag_name
     } catch {
         # Fallback: resolve the redirect URL.
