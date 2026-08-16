@@ -14,7 +14,7 @@
   Install destination directory (default: $HOME\.local\bin).
 
 .PARAMETER Version
-  Pin a specific version tag (e.g. v3.0.0). Defaults to latest.
+  Pin a specific version tag (e.g. v0.1.0). Defaults to latest.
 
 .PARAMETER EasyMode
   Prepend the destination to the user PATH automatically.
