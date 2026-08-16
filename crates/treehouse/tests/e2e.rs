@@ -192,12 +192,15 @@ fn e2e_gc_never_evicts_live_process_after_ttl_expiry() {
         .current_dir(&path)
         .spawn()
         .expect("spawn sleep in worktree");
+    // Note: `timeout.exe` errors when stdin is redirected (which `common::run`
+    // does), so use `powershell Start-Sleep` — it inherits cwd and is robust
+    // under redirected stdin.
     #[cfg(windows)]
-    let mut child = std::process::Command::new("cmd")
-        .args(["/c", "timeout", "/t", "5"])
+    let mut child = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 5"])
         .current_dir(&path)
         .spawn()
-        .expect("spawn timeout in worktree");
+        .expect("spawn powershell in worktree");
 
     // Wait for the TTL to expire, then gc dry-run: the live worktree must be
     // reported as [in use], never as a reclaimable candidate.
