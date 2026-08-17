@@ -9,6 +9,8 @@
 
 use std::path::PathBuf;
 
+use crate::env::TreehouseEnv;
+
 /// The default GitHub API URL for the latest release. Overridable in tests.
 pub const DEFAULT_GITHUB_API_URL: &str =
     "https://api.github.com/repos/quangdang46/treehouse_rust/releases/latest";
@@ -167,6 +169,74 @@ pub fn update_available(current: &str) -> bool {
     }
 }
 
+// ─── _with_env variants ────────────────────────────────────────────────────────
+
+/// The cache file path using the injected environment.
+pub fn cache_path_with_env(env: &dyn TreehouseEnv) -> Option<PathBuf> {
+    env.update_cache_path()
+}
+
+/// Whether the cache is stale using the injected environment.
+pub fn is_cache_stale_with_env(current: &str, env: &dyn TreehouseEnv) -> bool {
+    let Some(cache) = read_cache_with_env(env) else {
+        return true;
+    };
+    // Older than TTL.
+    if let Ok(checked) = chrono::DateTime::parse_from_rfc3339(&cache.checked_at) {
+        let age = chrono::Utc::now().signed_duration_since(checked.with_timezone(&chrono::Utc));
+        if age > chrono::Duration::from_std(CACHE_TTL).unwrap_or(chrono::Duration::days(1)) {
+            return true;
+        }
+    }
+    // Cached latest not newer than current -> stale.
+    match (
+        Version::parse(&cache.latest_version),
+        Version::parse(current),
+    ) {
+        (Some(latest), Some(cur)) => latest > cur,
+        _ => true,
+    }
+}
+
+/// Reads the update-check cache using the injected environment.
+pub fn read_cache_with_env(env: &dyn TreehouseEnv) -> Option<UpdateCheckCache> {
+    let path = env.update_cache_path()?;
+    let data = env.read_bytes(&path).ok()?;
+    serde_json::from_slice(&data).ok()
+}
+
+/// Writes the update-check cache using the injected environment.
+pub fn write_cache_with_env(env: &dyn TreehouseEnv, latest: &str) {
+    let Some(path) = env.update_cache_path() else {
+        return;
+    };
+    let cache = UpdateCheckCache {
+        checked_at: chrono::Utc::now().to_rfc3339(),
+        latest_version: latest.to_string(),
+    };
+    if let Some(dir) = path.parent() {
+        let _ = env.ensure_dir(dir);
+    }
+    let _ = env.write_file(
+        &path,
+        serde_json::to_string(&cache).unwrap_or_default().as_bytes(),
+    );
+}
+
+/// Whether an update is available using the injected environment.
+pub fn update_available_with_env(current: &str, env: &dyn TreehouseEnv) -> bool {
+    let Some(cache) = read_cache_with_env(env) else {
+        return false;
+    };
+    match (
+        Version::parse(&cache.latest_version),
+        Version::parse(current),
+    ) {
+        (Some(latest), Some(cur)) => latest > cur,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +273,45 @@ mod tests {
         assert!(check_latest("http://insecure.example", true).is_none());
         // Non-enforcing path reaches curl (network-dependent; just confirm no panic).
         let _ = check_latest("http://insecure.example", false);
+    }
+
+    // ─── _with_env tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn cache_path_with_env_returns_env_path() {
+        let env = crate::env::InMemoryEnv::new(std::path::PathBuf::from("/test"));
+        assert_eq!(
+            cache_path_with_env(&env),
+            Some(std::path::PathBuf::from("/test/cache/update-check.json"))
+        );
+    }
+
+    #[test]
+    fn write_read_cache_roundtrip_with_env() {
+        let env = crate::env::InMemoryEnv::new(std::path::PathBuf::from("/test"));
+        write_cache_with_env(&env, "2.0.0");
+        let cache = read_cache_with_env(&env).unwrap();
+        assert_eq!(cache.latest_version, "2.0.0");
+    }
+
+    #[test]
+    fn read_cache_with_env_missing_returns_none() {
+        let env = crate::env::InMemoryEnv::new(std::path::PathBuf::from("/test"));
+        assert!(read_cache_with_env(&env).is_none());
+    }
+
+    #[test]
+    fn is_cache_stale_with_env_missing_returns_true() {
+        let env = crate::env::InMemoryEnv::new(std::path::PathBuf::from("/test"));
+        assert!(is_cache_stale_with_env("1.0.0", &env));
+    }
+
+    #[test]
+    fn update_available_with_env_checks_cache() {
+        let env = crate::env::InMemoryEnv::new(std::path::PathBuf::from("/test"));
+        assert!(!update_available_with_env("1.0.0", &env)); // no cache
+        write_cache_with_env(&env, "2.0.0");
+        assert!(update_available_with_env("1.0.0", &env)); // 2.0.0 > 1.0.0
+        assert!(!update_available_with_env("3.0.0", &env)); // 2.0.0 < 3.0.0
     }
 }
