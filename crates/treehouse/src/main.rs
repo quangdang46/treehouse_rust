@@ -61,6 +61,16 @@ fn main() {
     }
 }
 
+/// Open a pool, respecting --env-path if provided.
+fn open_pool_for_cli(cli: &Cli) -> Result<treehouse_core::pool::Pool> {
+    let ctx = cli::resolve_repo_ctx()?;
+    if let Some(ref env_path) = cli.env_path {
+        Ok(cli::open_pool_with_env_path(&ctx, env_path)?)
+    } else {
+        Ok(cli::open_pool(&ctx)?)
+    }
+}
+
 fn run(cli: Cli) -> Result<()> {
     // --update-check is intercepted before clap in main (handled above).
     match &cli.command {
@@ -93,8 +103,7 @@ fn cmd_get(cli: &Cli, args: &cli::GetArgs) -> Result<()> {
     let format = resolve_format(cli, args.json, args.lease)?;
     let _ = format;
 
-    let ctx = cli::resolve_repo_ctx()?;
-    let pool = cli::open_pool(&ctx)?;
+    let pool = open_pool_for_cli(cli)?;
 
     if args.lease {
         // Lease mode: path-only on stdout, or JSON/TOON object.
@@ -168,8 +177,7 @@ fn cmd_get(cli: &Cli, args: &cli::GetArgs) -> Result<()> {
 /// Attach to an existing worktree by name (pool state untouched).
 fn cmd_enter(cli: &Cli, args: &cli::EnterArgs) -> Result<()> {
     let _ = cli;
-    let ctx = cli::resolve_repo_ctx()?;
-    let pool = cli::open_pool(&ctx)?;
+    let pool = open_pool_for_cli(cli)?;
     let statuses = pool.status()?;
     let found = statuses.iter().find(|s| s.name == args.name);
     let Some(found) = found else {
@@ -199,8 +207,7 @@ fn cmd_enter(cli: &Cli, args: &cli::EnterArgs) -> Result<()> {
 /// Release a lease / return a worktree.
 fn cmd_return(cli: &Cli, args: &cli::ReturnArgs) -> Result<()> {
     let _ = cli;
-    let ctx = cli::resolve_repo_ctx()?;
-    let pool = cli::open_pool(&ctx)?;
+    let pool = open_pool_for_cli(cli)?;
 
     let path = args
         .path
@@ -233,8 +240,7 @@ fn cmd_return(cli: &Cli, args: &cli::ReturnArgs) -> Result<()> {
 /// Show pool status.
 fn cmd_status(cli: &Cli, args: &cli::StatusArgs) -> Result<()> {
     let format = resolve_format(cli, args.json, true)?;
-    let ctx = cli::resolve_repo_ctx()?;
-    let pool = cli::open_pool(&ctx)?;
+    let pool = open_pool_for_cli(cli)?;
     let statuses = pool.status()?;
 
     let result = treehouse_core::result::CommandResult::Status(statuses);
@@ -257,8 +263,7 @@ fn cmd_prune(cli: &Cli, args: &cli::PruneArgs) -> Result<()> {
     if args.all {
         return cmd_prune_all(args);
     }
-    let ctx = cli::resolve_repo_ctx()?;
-    let pool = cli::open_pool(&ctx)?;
+    let pool = open_pool_for_cli(cli)?;
     let opts = PruneOptions {
         dry_run: !args.yes,
         prune_orphans: args.prune_orphans,
@@ -316,8 +321,7 @@ fn cmd_gc(cli: &Cli, args: &cli::GcArgs) -> Result<()> {
     if args.all {
         return cmd_gc_all(args);
     }
-    let ctx = cli::resolve_repo_ctx()?;
-    let pool = cli::open_pool(&ctx)?;
+    let pool = open_pool_for_cli(cli)?;
     let opts = treehouse_core::gc::GcOptions {
         dry_run: !args.yes,
         prune_orphans: args.prune_orphans,
@@ -404,8 +408,7 @@ fn render_gc(
 
 fn cmd_destroy(cli: &Cli, args: &cli::DestroyArgs) -> Result<()> {
     let _ = cli;
-    let ctx = cli::resolve_repo_ctx()?;
-    let pool = cli::open_pool(&ctx)?;
+    let pool = open_pool_for_cli(cli)?;
 
     // --all on its own sweeps the whole pool; with a pool path it sweeps that
     // named pool (Go `<pool> --all` and `--all` from the repo).
@@ -626,8 +629,7 @@ fn cmd_run(cli: &Cli, args: &[String]) -> Result<()> {
     if command.is_empty() {
         return Err(anyhow!("run requires a command"));
     }
-    let ctx = cli::resolve_repo_ctx()?;
-    let pool = cli::open_pool(&ctx)?;
+    let pool = open_pool_for_cli(cli)?;
 
     let ttl = ttl.unwrap_or(std::time::Duration::from_secs(24 * 3600));
     let holder = holder
@@ -653,8 +655,7 @@ fn cmd_run(cli: &Cli, args: &[String]) -> Result<()> {
 
 /// Read-only health report.
 fn cmd_doctor(cli: &Cli, args: &cli::DoctorArgs) -> Result<()> {
-    let ctx = cli::resolve_repo_ctx()?;
-    let pool = cli::open_pool(&ctx)?;
+    let pool = open_pool_for_cli(cli)?;
     let report = treehouse_core::doctor::run_doctor(&pool)?;
 
     // JSON/TOON to stdout; human to stdout with markers.

@@ -27,6 +27,10 @@ pub struct Cli {
     #[arg(long, value_enum, global = true, default_value_t = OutputFormat::Human)]
     pub format: OutputFormat,
 
+    /// Custom pool root directory (overrides treehouse.toml root and default ~/.treehouse).
+    #[arg(long = "env-path", value_name = "DIR", global = true)]
+    pub env_path: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -211,5 +215,77 @@ pub fn open_pool(ctx: &RepoCtx) -> anyhow::Result<treehouse_core::pool::Pool> {
         &ctx.repo_root,
         ctx.remote_url.as_deref(),
         &opts,
+    )?)
+}
+
+/// Opens a pool with a custom env path.
+pub fn open_pool_with_env_path(
+    ctx: &RepoCtx,
+    env_path: &std::path::Path,
+) -> anyhow::Result<treehouse_core::pool::Pool> {
+    use std::sync::Arc;
+    use treehouse_core::env::DefaultEnv;
+
+    struct CliEnv {
+        pool_root: std::path::PathBuf,
+    }
+
+    impl treehouse_core::env::TreehouseEnv for CliEnv {
+        fn pool_root(&self) -> Option<std::path::PathBuf> {
+            Some(self.pool_root.clone())
+        }
+        fn update_cache_path(&self) -> Option<std::path::PathBuf> {
+            DefaultEnv.update_cache_path()
+        }
+        fn user_config_path(&self) -> Option<std::path::PathBuf> {
+            DefaultEnv.user_config_path()
+        }
+        fn read_file(&self, path: &std::path::Path) -> std::io::Result<String> {
+            DefaultEnv.read_file(path)
+        }
+        fn read_bytes(&self, path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+            DefaultEnv.read_bytes(path)
+        }
+        fn write_file(&self, path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+            DefaultEnv.write_file(path, data)
+        }
+        fn ensure_dir(&self, path: &std::path::Path) -> std::io::Result<()> {
+            DefaultEnv.ensure_dir(path)
+        }
+        fn path_exists(&self, path: &std::path::Path) -> bool {
+            DefaultEnv.path_exists(path)
+        }
+        fn list_dir(&self, path: &std::path::Path) -> std::io::Result<Vec<std::path::PathBuf>> {
+            DefaultEnv.list_dir(path)
+        }
+        fn file_meta(
+            &self,
+            path: &std::path::Path,
+        ) -> std::io::Result<treehouse_core::env::FileMeta> {
+            DefaultEnv.file_meta(path)
+        }
+        fn env_var(&self, name: &str) -> Option<String> {
+            DefaultEnv.env_var(name)
+        }
+        fn env_var_os(&self, name: &str) -> Option<std::path::PathBuf> {
+            DefaultEnv.env_var_os(name)
+        }
+        fn cwd(&self) -> Option<std::path::PathBuf> {
+            DefaultEnv.cwd()
+        }
+    }
+
+    let env = CliEnv {
+        pool_root: env_path.to_path_buf(),
+    };
+    let opts = treehouse_core::pool::OpenOptions {
+        config: ctx.config.clone(),
+        ..Default::default()
+    };
+    Ok(treehouse_core::pool::Pool::open_with_env(
+        &ctx.repo_root,
+        ctx.remote_url.as_deref(),
+        &opts,
+        Arc::new(env),
     )?)
 }
