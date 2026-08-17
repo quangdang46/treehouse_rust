@@ -15,6 +15,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::config::{self, ConfigError, TreehouseConfig};
+use crate::env::TreehouseEnv;
 
 /// A discovered pool dir plus the pool name (`<repoName>-<6hex>`).
 #[derive(Debug, Clone, PartialEq)]
@@ -37,6 +38,72 @@ pub struct DiscoverResult {
 /// `$HOME/.treehouse`).
 pub fn user_pool_root() -> Option<PathBuf> {
     config::home_dir().map(|h| h.join(".treehouse"))
+}
+
+// ─── _with_env variants ────────────────────────────────────────────────────────
+
+/// Resolves the pool root using the injected environment.
+pub fn user_pool_root_with_env(env: &dyn TreehouseEnv) -> Option<PathBuf> {
+    env.pool_root()
+}
+
+/// Resolves the pool root container using config + injected environment.
+///
+/// Same logic as [`user_pool_root_with_config`] but reads paths from `env`.
+pub fn user_pool_root_with_config_and_env(
+    user: &TreehouseConfig,
+    env: &dyn TreehouseEnv,
+) -> Option<PathBuf> {
+    let root = user.root.as_deref().unwrap_or("");
+    if root.is_empty() {
+        return env.pool_root();
+    }
+    let expanded = config::expand_env(root);
+    let expanded = PathBuf::from(&expanded);
+    if !expanded.is_absolute() {
+        // A relative root is repo-scoped; it has no meaning user-wide.
+        return None;
+    }
+    Some(expanded.join(".treehouse"))
+}
+
+/// Enumerates managed pools using the injected environment.
+pub fn discover_pools_with_env(root: &std::path::Path, env: &dyn TreehouseEnv) -> DiscoverResult {
+    let mut result = DiscoverResult::default();
+    let Ok(dirs) = env.list_dir(root) else {
+        return result; // No pools at all — empty result, not an error.
+    };
+    let mut dirs: Vec<PathBuf> = dirs.into_iter().collect();
+    dirs.sort();
+
+    for dir in dirs {
+        let state_path = crate::state::State::state_file_path(&dir);
+        if !env.path_exists(&state_path) {
+            result
+                .skipped
+                .insert(dir.clone(), "no treehouse-state.json".to_string());
+            continue;
+        }
+        if env.read_file(&state_path).is_err() {
+            result
+                .skipped
+                .insert(dir.clone(), "cannot read state".to_string());
+            continue;
+        }
+        // A parse check guarantees a real managed pool
+        if crate::state::State::read_state(&dir).is_err() {
+            result
+                .skipped
+                .insert(dir.clone(), "state file does not parse".to_string());
+            continue;
+        }
+        let name = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        result.pools.push(DiscoveredPool { dir, name });
+    }
+    result
 }
 
 /// Resolves the container that holds per-repo pools under the user config's
@@ -200,6 +267,7 @@ pub fn merge_gc_results(results: Vec<(PathBuf, crate::gc::GcResult)>) -> crate::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::sync::{Mutex, OnceLock};
 
     fn env_lock() -> &'static Mutex<()> {
@@ -224,5 +292,66 @@ mod tests {
         assert_eq!(result.pools.len(), 1, "only the state-file dir is a pool");
         assert_eq!(result.pools[0].name, "myrepo-abc123");
         assert!(result.skipped.contains_key(&decoy));
+    }
+
+    // ─── _with_env tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn user_pool_root_with_env_returns_env_root() {
+        let env = crate::env::InMemoryEnv::new(PathBuf::from("/custom/pools"));
+        assert_eq!(
+            user_pool_root_with_env(&env),
+            Some(PathBuf::from("/custom/pools"))
+        );
+    }
+
+    #[test]
+    fn user_pool_root_with_config_and_env_empty_root() {
+        let env = crate::env::InMemoryEnv::new(PathBuf::from("/custom/pools"));
+        let config = TreehouseConfig::default_config();
+        assert_eq!(
+            user_pool_root_with_config_and_env(&config, &env),
+            Some(PathBuf::from("/custom/pools"))
+        );
+    }
+
+    #[test]
+    fn user_pool_root_with_config_and_env_absolute_root() {
+        let env = crate::env::InMemoryEnv::new(PathBuf::from("/custom"));
+        let config = TreehouseConfig {
+            root: Some("/abs/root".to_string()),
+            ..TreehouseConfig::default_config()
+        };
+        assert_eq!(
+            user_pool_root_with_config_and_env(&config, &env),
+            Some(PathBuf::from("/abs/root/.treehouse"))
+        );
+    }
+
+    #[test]
+    fn discover_pools_with_env_finds_state_files() {
+        let env = crate::env::InMemoryEnv::new(PathBuf::from("/pools"));
+        // Seed a pool with state file
+        let pool_dir = PathBuf::from("/pools/myrepo-abc123");
+        let state = crate::state::State::default();
+        env.seed_file(
+            &crate::state::State::state_file_path(&pool_dir),
+            &serde_json::to_vec(&state).unwrap(),
+        );
+
+        let result = discover_pools_with_env(&PathBuf::from("/pools"), &env);
+        assert_eq!(result.pools.len(), 1);
+        assert_eq!(result.pools[0].name, "myrepo-abc123");
+    }
+
+    #[test]
+    fn discover_pools_with_env_skips_non_pools() {
+        let env = crate::env::InMemoryEnv::new(PathBuf::from("/pools"));
+        // Seed a dir without state file
+        env.seed_file(Path::new("/pools/not-a-pool/random.txt"), b"hello");
+
+        let result = discover_pools_with_env(&PathBuf::from("/pools"), &env);
+        assert!(result.pools.is_empty());
+        assert!(!result.skipped.is_empty());
     }
 }

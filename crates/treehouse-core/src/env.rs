@@ -196,12 +196,21 @@ impl InMemoryEnv {
         self
     }
 
-    /// Seed a file for testing.
+    /// Seed a file for testing. Also registers parent directories.
     pub fn seed_file(&self, path: &Path, content: &[u8]) {
         self.files
             .write()
             .unwrap()
             .insert(path.to_path_buf(), content.to_vec());
+        // Register all parent directories up to pool_root
+        let mut current = path.parent();
+        while let Some(p) = current {
+            if p == self.pool_root || !p.starts_with(&self.pool_root) {
+                break;
+            }
+            self.dirs.write().unwrap().insert(p.to_path_buf(), true);
+            current = p.parent();
+        }
     }
 }
 
@@ -259,16 +268,31 @@ impl TreehouseEnv for InMemoryEnv {
     }
 
     fn list_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
-        // Delegate to real fs for simplicity — tests seed files via seed_file()
-        // and the real read_dir will find them on disk if needed.
-        // For pure in-memory testing, use the files HashMap directly.
         let prefix = path.to_path_buf();
-        let files = self.files.read().unwrap();
-        let entries: Vec<PathBuf> = files
-            .keys()
-            .filter(|p| p.parent() == Some(&prefix))
-            .cloned()
-            .collect();
+        let mut entries = Vec::new();
+
+        // Collect registered directories whose parent is `path`
+        {
+            let dirs = self.dirs.read().unwrap();
+            for p in dirs.keys() {
+                if p.parent() == Some(&prefix) && p != &prefix {
+                    entries.push(p.clone());
+                }
+            }
+        }
+
+        // Collect files whose parent is `path`
+        {
+            let files = self.files.read().unwrap();
+            for p in files.keys() {
+                if p.parent() == Some(&prefix) {
+                    entries.push(p.clone());
+                }
+            }
+        }
+
+        entries.sort();
+        entries.dedup();
         Ok(entries)
     }
 
