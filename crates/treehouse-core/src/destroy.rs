@@ -540,6 +540,7 @@ mod tests {
             process: std::sync::Arc::new(crate::process::ProcessTable::new()),
             config: crate::config::TreehouseConfig::default_config(),
             lock_timeout: std::time::Duration::from_secs(2),
+            env: std::sync::Arc::new(crate::env::DefaultEnv),
         };
         assert!(pool.backing_repository_missing(&wt.to_string_lossy()));
 

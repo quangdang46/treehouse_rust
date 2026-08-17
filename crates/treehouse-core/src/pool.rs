@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::config::{TreehouseConfig, resolve_pool_dir};
+use crate::env::{DefaultEnv, TreehouseEnv};
 use crate::git::{GitBackend, GitRepo};
 use crate::hooks;
 use crate::lease::{Lease, LeaseInfo, mark_acquired_lease};
@@ -96,6 +97,7 @@ pub struct Pool {
     pub(crate) process: Arc<ProcessTable>,
     pub(crate) config: TreehouseConfig,
     pub(crate) lock_timeout: std::time::Duration,
+    pub(crate) env: Arc<dyn TreehouseEnv>,
 }
 
 impl Pool {
@@ -106,9 +108,19 @@ impl Pool {
         remote_url: Option<&str>,
         opts: &OpenOptions,
     ) -> Result<Self, PoolError> {
+        Self::open_with_env(repo_root, remote_url, opts, Arc::new(DefaultEnv))
+    }
+
+    /// Opens a pool using the injected environment.
+    pub fn open_with_env(
+        repo_root: &Path,
+        remote_url: Option<&str>,
+        opts: &OpenOptions,
+        env: Arc<dyn TreehouseEnv>,
+    ) -> Result<Self, PoolError> {
         let dir = resolve_pool_dir(repo_root, opts.config.root.as_deref(), remote_url)
             .map_err(PoolError::Config)?;
-        std::fs::create_dir_all(&dir)
+        env.ensure_dir(&dir)
             .map_err(|e| PoolError::Io(format!("creating pool dir {}", dir.display()), e))?;
 
         let git = crate::git::ShellGitBackend::discover().map_err(PoolError::Git)?;
@@ -121,6 +133,7 @@ impl Pool {
             process: Arc::new(process),
             config: opts.config.clone(),
             lock_timeout: opts.lock_timeout,
+            env,
         })
     }
 
@@ -128,7 +141,16 @@ impl Pool {
     /// sweeps that discover pool dirs; the backing repo root is the pool
     /// dir's parent).
     pub fn open_at(pool_dir: &Path, opts: &OpenOptions) -> Result<Self, PoolError> {
-        std::fs::create_dir_all(pool_dir)
+        Self::open_at_with_env(pool_dir, opts, Arc::new(DefaultEnv))
+    }
+
+    /// Opens a pool at an already-known pool directory using the injected environment.
+    pub fn open_at_with_env(
+        pool_dir: &Path,
+        opts: &OpenOptions,
+        env: Arc<dyn TreehouseEnv>,
+    ) -> Result<Self, PoolError> {
+        env.ensure_dir(pool_dir)
             .map_err(|e| PoolError::Io(format!("creating pool dir {}", pool_dir.display()), e))?;
 
         let git = crate::git::ShellGitBackend::discover().map_err(PoolError::Git)?;
@@ -144,12 +166,18 @@ impl Pool {
             process: Arc::new(process),
             config: opts.config.clone(),
             lock_timeout: opts.lock_timeout,
+            env,
         })
     }
 
     /// The pool directory.
     pub fn pool_dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// The injected environment.
+    pub fn env(&self) -> &dyn TreehouseEnv {
+        &*self.env
     }
 
     /// Whether a worktree is dirty (git status --porcelain --untracked-files=all).
