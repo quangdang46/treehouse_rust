@@ -12,6 +12,7 @@ pub mod config;
 pub mod destroy;
 pub mod discovery;
 pub mod doctor;
+pub mod env;
 pub mod gc;
 pub mod git;
 pub mod hardening;
