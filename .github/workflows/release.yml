@@ -146,5 +146,11 @@ jobs:
             exit 1
           fi
           echo "Attaching:$FILES"
-          gh release create "$TAG" $FILES --generate-notes --title "$TAG"
+          # Check if release already exists (e.g. from manual creation)
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — uploading assets..."
+            gh release upload "$TAG" $FILES --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" $FILES --repo "$GITHUB_REPOSITORY" --generate-notes --title "$TAG"
+          fi
           echo "Released $TAG"
