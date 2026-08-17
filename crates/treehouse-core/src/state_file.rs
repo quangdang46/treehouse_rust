@@ -13,6 +13,8 @@
 use std::io::Write;
 use std::path::Path;
 
+use crate::env::TreehouseEnv;
+
 /// Atomically writes `data` to `path` with the same durability contract as
 /// Go's `atomicWriteFile`:
 ///
@@ -89,6 +91,24 @@ pub fn write_state(pool_dir: &Path, state: &crate::state::State) -> std::io::Res
     let mut bytes = json.into_bytes();
     bytes.push(b'\n');
     atomic_write_file(&path, &bytes, 0o644)
+}
+
+/// Write the pool state file using the injected environment.
+///
+/// Note: atomic write guarantee is relaxed — consumer controls via their
+/// `write_file` implementation. For `DefaultEnv`, this still uses atomic
+/// write. For `InMemoryEnv`, this uses HashMap insert.
+pub fn write_state_with_env(
+    pool_dir: &Path,
+    state: &crate::state::State,
+    env: &dyn TreehouseEnv,
+) -> std::io::Result<()> {
+    let path = crate::state::State::state_file_path(pool_dir);
+    let json = serde_json::to_string_pretty(state)
+        .map_err(|e| std::io::Error::other(format!("serializing state: {e}")))?;
+    let mut bytes = json.into_bytes();
+    bytes.push(b'\n');
+    env.write_file(&path, &bytes)
 }
 
 #[cfg(test)]
@@ -180,5 +200,22 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o644);
         }
+    }
+
+    // ─── _with_env tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn write_state_with_env_roundtrip() {
+        let env = crate::env::InMemoryEnv::new(std::path::PathBuf::from("/test"));
+        let pool_dir = std::path::PathBuf::from("/test/pool");
+        let state = sample_state();
+
+        write_state_with_env(&pool_dir, &state, &env).unwrap();
+
+        // Read back via env
+        let path = crate::state::State::state_file_path(&pool_dir);
+        let data = env.read_bytes(&path).unwrap();
+        let loaded: crate::state::State = serde_json::from_slice(&data).unwrap();
+        assert_eq!(state, loaded);
     }
 }

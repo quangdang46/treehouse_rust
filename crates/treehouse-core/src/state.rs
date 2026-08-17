@@ -165,6 +165,23 @@ impl State {
             Err(parse_err) => recover_corrupt_state(pool_dir, path, parse_err),
         }
     }
+
+    /// Reads pool state using the injected environment.
+    pub fn read_state_with_env(
+        pool_dir: &Path,
+        env: &dyn crate::env::TreehouseEnv,
+    ) -> Result<State, StateError> {
+        let path = Self::state_file_path(pool_dir);
+        let data = match env.read_bytes(&path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(State::default()),
+            Err(e) => return Err(StateError::Read(path, e)),
+        };
+        match serde_json::from_slice(&data) {
+            Ok(s) => Ok(s),
+            Err(parse_err) => recover_corrupt_state(pool_dir, path, parse_err),
+        }
+    }
 }
 
 /// Marker placed on entries reconstructed by [`recover_corrupt_state`] so
@@ -590,5 +607,54 @@ mod tests {
             !e.is_stale_lease(chrono::Utc::now()),
             "recovered entries must never auto-expire"
         );
+    }
+
+    // ─── _with_env tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn read_state_with_env_missing_returns_empty() {
+        let env = crate::env::InMemoryEnv::new(std::path::PathBuf::from("/test"));
+        let state =
+            State::read_state_with_env(&std::path::PathBuf::from("/test/empty"), &env).unwrap();
+        assert!(state.worktrees.is_empty());
+    }
+
+    #[test]
+    fn read_state_with_env_valid_state() {
+        let env = crate::env::InMemoryEnv::new(std::path::PathBuf::from("/test"));
+        let pool_dir = std::path::PathBuf::from("/test/pool");
+        let state = State {
+            worktrees: vec![WorktreeEntry {
+                name: "1".into(),
+                path: "/test/pool/1/repo".into(),
+                created_at: dt("2026-07-20T12:00:00Z"),
+                ..Default::default()
+            }],
+        };
+        // Seed state file via env
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        env.seed_file(&State::state_file_path(&pool_dir), json.as_bytes());
+
+        let loaded = State::read_state_with_env(&pool_dir, &env).unwrap();
+        assert_eq!(state, loaded);
+    }
+
+    #[test]
+    fn read_state_with_env_corrupt_triggers_recovery() {
+        // Recovery uses std::fs::read_dir internally, so we need real dirs.
+        // Use DefaultEnv with a tempdir for this test.
+        let dir = tempfile::tempdir().unwrap();
+        let pool_dir = dir.path();
+        // Seed corrupt state file
+        std::fs::write(State::state_file_path(pool_dir), b"corrupt").unwrap();
+        // Seed a worktree dir for recovery
+        let wt = pool_dir.join("1/myrepo");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), b"gitdir: ../../fake.git\n").unwrap();
+
+        let env = crate::env::DefaultEnv;
+        let state = State::read_state_with_env(pool_dir, &env).unwrap();
+        assert_eq!(state.worktrees.len(), 1);
+        assert!(state.worktrees[0].leased); // recovered entries are leased
     }
 }
