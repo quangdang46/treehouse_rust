@@ -317,14 +317,26 @@ mod tests {
 
     #[test]
     fn user_pool_root_with_config_and_env_absolute_root() {
+        // Use a platform-absolute path (e.g. /abs on Unix, C:\abs on Windows)
+        let abs_root = if cfg!(windows) {
+            "C:\\abs\\root".to_string()
+        } else {
+            "/abs/root".to_string()
+        };
+        let expected = if cfg!(windows) {
+            PathBuf::from("C:\\abs\\root\\.treehouse")
+        } else {
+            PathBuf::from("/abs/root/.treehouse")
+        };
+
         let env = crate::env::InMemoryEnv::new(PathBuf::from("/custom"));
         let config = TreehouseConfig {
-            root: Some("/abs/root".to_string()),
+            root: Some(abs_root),
             ..TreehouseConfig::default_config()
         };
         assert_eq!(
             user_pool_root_with_config_and_env(&config, &env),
-            Some(PathBuf::from("/abs/root/.treehouse"))
+            Some(expected)
         );
     }
 
