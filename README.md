@@ -325,6 +325,57 @@ Hooks run sequentially in the worktree directory via the OS shell (`/bin/sh -c` 
 
 ---
 
+## 📚 Library Usage
+
+treehouse-core can be embedded as a library with **zero dot-folders, zero config files, zero env vars**. The `TreehouseEnv` trait abstracts all filesystem side-effects.
+
+### Quick start (DefaultEnv — identical to CLI)
+
+```rust
+use treehouse_core::TreehouseCore;
+use std::path::Path;
+
+let core = TreehouseCore::open(Path::new("."))?;
+```
+
+### Custom environment
+
+```rust
+use treehouse_core::TreehouseCore;
+use treehouse_core::config::TreehouseConfig;
+use treehouse_core::env::TreehouseEnv;
+use std::path::{Path, PathBuf};
+
+struct MyEnv { base: PathBuf }
+
+impl TreehouseEnv for MyEnv {
+    fn pool_root(&self) -> Option<PathBuf> {
+        Some(self.base.join("pools"))
+    }
+    // ... implement other methods
+}
+
+let env = MyEnv { base: PathBuf::from("/tmp/my-app") };
+let config = TreehouseConfig { max_trees: 4, ..Default::default() };
+let core = TreehouseCore::with_env(env, config);
+
+// Zero .treehouse directory created!
+```
+
+### Zero-filesystem testing
+
+```rust
+use treehouse_core::TreehouseCore;
+use treehouse_core::env::InMemoryEnv;
+use std::path::PathBuf;
+
+let core = TreehouseCore::for_test(PathBuf::from("/test/pools"));
+```
+
+See `crates/treehouse-core/examples/` for runnable examples.
+
+---
+
 ## Architecture
 
 treehouse is a **no-daemon CLI** — every operation is an inline command; state is a small on-disk file guarded by a file lock.

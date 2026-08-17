@@ -37,3 +37,11 @@ default = []
 toon = ["dep:tru"]
 # P1-A hardening race/concurrency tests (timing-sensitive).
 hardening = []
+
+[[example]]
+name = "custom_env"
+path = "examples/custom_env.rs"
+
+[[example]]
+name = "in_memory_env"
+path = "examples/in_memory_env.rs"
