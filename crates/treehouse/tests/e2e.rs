@@ -169,3 +169,62 @@ fn e2e_doctor_healthy() {
         "expected healthy field, got {out}"
     );
 }
+
+/// A live process in a worktree must never be gc'd, even after the lease
+/// TTL expires ("a live agent is never evicted"). Regression for the macOS
+/// sysinfo cwd bug where in-use detection was blind (gc would delete a
+/// running agent's worktree).
+#[test]
+fn e2e_gc_never_evicts_live_process_after_ttl_expiry() {
+    let (repo, home) = common::setup();
+    let bin = common::treehouse_bin();
+
+    // Acquire a short-TTL lease.
+    let (out, err, code) = common::run(&bin, &repo, &home, &[], &["get", "--lease", "--ttl", "2s"]);
+    assert_eq!(code, 0, "get --lease --ttl failed: {err}");
+    let path = out.trim().to_string();
+    assert!(!path.is_empty(), "expected a worktree path");
+
+    // Spawn a live child whose cwd is the worktree (simulates a running agent).
+    #[cfg(unix)]
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", "sleep 5"])
+        .current_dir(&path)
+        .spawn()
+        .expect("spawn sleep in worktree");
+    // Note: `timeout.exe` errors when stdin is redirected (which `common::run`
+    // does), so use `powershell Start-Sleep` — it inherits cwd and is robust
+    // under redirected stdin.
+    #[cfg(windows)]
+    let mut child = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 5"])
+        .current_dir(&path)
+        .spawn()
+        .expect("spawn powershell in worktree");
+
+    // Wait for the TTL to expire, then gc dry-run: the live worktree must be
+    // reported as [in use], never as a reclaimable candidate.
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    let (out, err, code) = common::run(&bin, &repo, &home, &[], &["gc"]);
+    assert_eq!(code, 0, "gc failed: {err}");
+    // Skip diagnostics ("[in use] ...") go to stderr.
+    assert!(
+        err.contains("in use"),
+        "live worktree must be reported in use, got: {out} {err}"
+    );
+    assert!(
+        !out.contains("reclaim 1") && !out.contains("Reclaimed 1"),
+        "gc must not reclaim a live worktree, got: {out} {err}"
+    );
+
+    // Wait for the child to exit, then gc dry-run should see a stale lease
+    // candidate (the process is gone).
+    let _ = child.wait();
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let (out, _err, code) = common::run(&bin, &repo, &home, &[], &["gc"]);
+    assert_eq!(code, 0, "gc after child exit failed: {_err}");
+    assert!(
+        out.contains("reclaim 1") || out.contains("stale lease"),
+        "after the process exits, gc should reclaim the stale lease, got: {out}"
+    );
+}

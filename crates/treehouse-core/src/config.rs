@@ -179,7 +179,7 @@ pub fn resolve_pool_root(repo_root: &Path, root: Option<&str>) -> Result<PathBuf
 }
 
 /// Expands `$VAR` / `${VAR}` in a string (Go `os.ExpandEnv`).
-fn expand_env(s: &str) -> String {
+pub fn expand_env(s: &str) -> String {
     let mut out = String::new();
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
@@ -218,7 +218,7 @@ fn expand_env(s: &str) -> String {
     out
 }
 
-fn home_dir() -> Option<PathBuf> {
+pub fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
@@ -331,9 +331,18 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("treehouse.toml"), "max_trees = 2\n").unwrap();
+        // Point HOME at an empty fake home so a real user config can never
+        // leak in (tests must not depend on the machine's HOME).
+        let fake_home = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
         // No user config => load_global returns defaults, ignoring repo.
         let cfg = TreehouseConfig::load_global().unwrap();
         assert_eq!(cfg.max_trees, 16);
+        unsafe {
+            std::env::remove_var("HOME");
+        }
     }
 
     #[test]

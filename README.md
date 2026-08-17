@@ -20,7 +20,13 @@ treehouse is a Rust reimplementation of [kunchenguid/treehouse](https://github.c
 <div align="center">
 
 ```bash
+# macOS / Linux
 curl -fsSL "https://raw.githubusercontent.com/quangdang46/treehouse_rust/main/install.sh?$(date +%s)" | sh
+```
+
+```powershell
+# Windows PowerShell
+irm "https://raw.githubusercontent.com/quangdang46/treehouse_rust/main/install.ps1" | iex
 ```
 
 </div>
@@ -121,8 +127,12 @@ exit               # worktree is reset and returned to the pool
 
 ```bash
 # 1. Install
-cargo install --path crates/treehouse          # from source
-# or: curl -fsSL "…/install.sh" | sh            # release installer (once published)
+# macOS / Linux
+curl -fsSL "https://raw.githubusercontent.com/quangdang46/treehouse_rust/main/install.sh" | sh
+# Windows PowerShell
+irm "https://raw.githubusercontent.com/quangdang46/treehouse_rust/main/install.ps1" | iex
+# or from source / via cargo (any platform)
+cargo install --git https://github.com/quangdang46/treehouse_rust --tag v0.1.0 treehouse
 
 # 2. From inside a repo, get a worktree and a subshell
 cd myproject

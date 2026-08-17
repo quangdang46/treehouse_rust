@@ -136,18 +136,24 @@ mod tests {
         let dir2 = dir.path().to_path_buf();
         let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
 
-        // Thread A takes the lock and holds it for a while.
+        // Thread A takes the lock and holds it for a while. A signals (via the
+        // channel) only AFTER it has acquired the lock, so the test is
+        // deterministic: we never race A's startup time against a fixed sleep.
+        let (tx, rx) = std::sync::mpsc::channel();
         let h2 = held.clone();
         let a = std::thread::spawn(move || {
             let _ = with_state_lock(&dir2, Duration::from_secs(5), || {
+                let _ = tx.send(());
                 thread::sleep(Duration::from_millis(300));
                 Ok::<(), String>(())
             });
             h2.store(false, std::sync::atomic::Ordering::SeqCst);
         });
 
+        // Wait until A provably holds the lock.
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
         // Short timeout: B should time out, not block forever.
-        thread::sleep(Duration::from_millis(30));
         let start = Instant::now();
         let result =
             with_state_lock::<(), String>(dir.path(), Duration::from_millis(100), || Ok(()));
