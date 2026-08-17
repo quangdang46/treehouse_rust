@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::env::TreehouseEnv;
+
 /// Repo-safe + user config settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TreehouseConfig {
@@ -224,6 +226,125 @@ pub fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+// ─── _with_env variants ────────────────────────────────────────────────────────
+
+/// Resolves the pool directory using the injected environment.
+///
+/// Same logic as [`resolve_pool_dir`] but reads paths from `env` instead of
+/// hardcoded `$HOME/.treehouse`.
+pub fn resolve_pool_dir_with_env(
+    repo_root: &Path,
+    root: Option<&str>,
+    remote_url: Option<&str>,
+    env: &dyn TreehouseEnv,
+) -> Result<PathBuf, ConfigError> {
+    let hash_input = remote_url
+        .filter(|u| !u.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| repo_root.to_string_lossy().into_owned());
+    let repo_name = repo_root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "repo".to_string());
+    let short_hash = crate::git::short_hash(&hash_input);
+    let pool_name = format!("{repo_name}-{short_hash}");
+
+    let pool_root = resolve_pool_root_with_env(repo_root, root, env)?;
+    Ok(pool_root.join(pool_name))
+}
+
+/// Resolves the pool root directory using the injected environment.
+///
+/// Same logic as [`resolve_pool_root`] but reads paths from `env` instead of
+/// hardcoded `$HOME/.treehouse`.
+pub fn resolve_pool_root_with_env(
+    repo_root: &Path,
+    root: Option<&str>,
+    env: &dyn TreehouseEnv,
+) -> Result<PathBuf, ConfigError> {
+    let root = root.unwrap_or("");
+    if root.is_empty() {
+        let pool = env.pool_root().ok_or_else(|| {
+            ConfigError::Invalid(
+                "pool root not found".into(),
+                "env.pool_root() returned None".into(),
+            )
+        })?;
+        return Ok(pool);
+    }
+
+    let expanded = expand_env(root);
+    let expanded = PathBuf::from(&expanded);
+    if !expanded.is_absolute() {
+        if repo_root.as_os_str().is_empty() {
+            return Err(ConfigError::Invalid(
+                format!("relative treehouse root {root:?} requires a repository"),
+                String::new(),
+            ));
+        }
+        return Ok(repo_root.join(expanded).join(".treehouse"));
+    }
+    Ok(expanded.join(".treehouse"))
+}
+
+/// Resolves the user config path using the injected environment.
+pub fn user_config_path_with_env(env: &dyn TreehouseEnv) -> Option<PathBuf> {
+    env.user_config_path()
+}
+
+/// Loads the user-level config using the injected environment.
+fn load_user_with_env(env: &dyn TreehouseEnv) -> Result<(TreehouseConfig, bool), ConfigError> {
+    let cfg = TreehouseConfig::default_config();
+    let Some(user_path) = env.user_config_path() else {
+        return Ok((cfg, false));
+    };
+    if !env.path_exists(&user_path) {
+        return Ok((cfg, false));
+    }
+    let text = env
+        .read_file(&user_path)
+        .map_err(|e| ConfigError::Io(user_path.display().to_string(), e))?;
+    let decoded: TreehouseConfig = toml::from_str(&text)
+        .map_err(|e| ConfigError::Toml(user_path.display().to_string(), e.to_string()))?;
+    Ok((decoded, true))
+}
+
+impl TreehouseConfig {
+    /// Loads repo + user config using the injected environment.
+    ///
+    /// Same merge rules as [`TreehouseConfig::load`] but reads from `env`.
+    pub fn load_with_env(repo_root: &Path, env: &dyn TreehouseEnv) -> Result<Self, ConfigError> {
+        let mut cfg = Self::default_config();
+
+        let repo_path = repo_root.join("treehouse.toml");
+        let has_repo_config = env.path_exists(&repo_path);
+        if has_repo_config {
+            let text = env
+                .read_file(&repo_path)
+                .map_err(|e| ConfigError::Io(repo_path.display().to_string(), e))?;
+            let decoded: TreehouseConfig = toml::from_str(&text)
+                .map_err(|e| ConfigError::Toml(repo_path.display().to_string(), e.to_string()))?;
+            cfg.max_trees = decoded.max_trees;
+            cfg.root = decoded.root;
+            cfg.lease_ttl_secs = decoded.lease_ttl_secs;
+            // Repo hooks are ignored for safety.
+            cfg.hooks = Hooks::default();
+        }
+
+        let (user_cfg, has_user_config) = load_user_with_env(env)?;
+        if has_user_config {
+            if !has_repo_config {
+                cfg = user_cfg;
+            } else {
+                // Repo wins repo-safe settings; user provides hooks only.
+                cfg.hooks = user_cfg.hooks;
+            }
+        }
+
+        Ok(cfg)
+    }
+}
+
 /// Errors from config loading.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -423,5 +544,87 @@ mod tests {
         let cfg = TreehouseConfig::load(dir.path()).unwrap();
         assert_eq!(cfg.max_trees, 8);
         assert_eq!(cfg.lease_ttl_secs, Some(3600));
+    }
+
+    // ─── _with_env tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_pool_root_with_env_empty_root() {
+        let env = crate::env::InMemoryEnv::new(PathBuf::from("/custom/pools"));
+        let root = resolve_pool_root_with_env(Path::new("/work/repo"), None, &env).unwrap();
+        assert_eq!(root, PathBuf::from("/custom/pools"));
+    }
+
+    #[test]
+    fn resolve_pool_root_with_env_absolute_root() {
+        let env = crate::env::InMemoryEnv::new(PathBuf::from("/custom"));
+        let root =
+            resolve_pool_root_with_env(Path::new("/work/repo"), Some("/abs/root"), &env).unwrap();
+        assert_eq!(root, PathBuf::from("/abs/root/.treehouse"));
+    }
+
+    #[test]
+    fn resolve_pool_root_with_env_relative_root() {
+        let env = crate::env::InMemoryEnv::new(PathBuf::from("/custom"));
+        let repo = Path::new("/work/myrepo");
+        let root = resolve_pool_root_with_env(repo, Some("worktrees"), &env).unwrap();
+        assert_eq!(root, Path::new("/work/myrepo/worktrees/.treehouse"));
+    }
+
+    #[test]
+    fn resolve_pool_dir_with_env_uses_env_root() {
+        let env = crate::env::InMemoryEnv::new(PathBuf::from("/custom/pools"));
+        let hash = crate::git::short_hash("https://github.com/x/y.git");
+        let pool = resolve_pool_dir_with_env(
+            Path::new("/work/myrepo"),
+            None,
+            Some("https://github.com/x/y.git"),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(
+            pool,
+            PathBuf::from("/custom/pools").join(format!("myrepo-{hash}"))
+        );
+    }
+
+    #[test]
+    fn user_config_path_with_env_delegates_to_env() {
+        let env = crate::env::InMemoryEnv::new(PathBuf::from("/test"));
+        let path = user_config_path_with_env(&env).unwrap();
+        assert_eq!(path, PathBuf::from("/test/config/config.toml"));
+    }
+
+    #[test]
+    fn load_with_env_reads_repo_config() {
+        let env = crate::env::InMemoryEnv::new(PathBuf::from("/test"));
+        env.seed_file(Path::new("/test/repo/treehouse.toml"), b"max_trees = 8\n");
+        let cfg = TreehouseConfig::load_with_env(Path::new("/test/repo"), &env).unwrap();
+        assert_eq!(cfg.max_trees, 8);
+    }
+
+    #[test]
+    fn load_with_env_merge_rules() {
+        let env = crate::env::InMemoryEnv::new(PathBuf::from("/test"));
+        // Seed repo config
+        env.seed_file(Path::new("/test/repo/treehouse.toml"), b"max_trees = 4\n");
+        // Seed user config with hooks (must include max_trees for TOML parse)
+        env.seed_file(
+            Path::new("/test/config/config.toml"),
+            b"max_trees = 99\n[hooks]\npost_create = [\"./setup.sh\"]\n",
+        );
+        let cfg = TreehouseConfig::load_with_env(Path::new("/test/repo"), &env).unwrap();
+        // Repo wins max_trees
+        assert_eq!(cfg.max_trees, 4);
+        // User provides hooks
+        assert_eq!(cfg.hooks.post_create, ["./setup.sh"]);
+    }
+
+    #[test]
+    fn load_with_env_defaults_without_config() {
+        let env = crate::env::InMemoryEnv::new(PathBuf::from("/test"));
+        let cfg = TreehouseConfig::load_with_env(Path::new("/test/empty"), &env).unwrap();
+        assert_eq!(cfg.max_trees, 16); // default
+        assert!(cfg.hooks.is_empty());
     }
 }
