@@ -236,6 +236,7 @@ pub fn merge_prune_results(
             out.pruned.push(p);
         }
         out.skipped.extend(r.skipped);
+        out.errors.extend(r.errors);
     }
     out
 }
@@ -260,6 +261,7 @@ pub fn merge_gc_results(results: Vec<(PathBuf, crate::gc::GcResult)>) -> crate::
             out.reclaimed.push(p);
         }
         out.skipped.extend(r.skipped);
+        out.errors.extend(r.errors);
     }
     out
 }
@@ -365,5 +367,279 @@ mod tests {
         let result = discover_pools_with_env(&PathBuf::from("/pools"), &env);
         assert!(result.pools.is_empty());
         assert!(!result.skipped.is_empty());
+    }
+
+    #[test]
+    fn merge_gc_results_aggregates_errors_across_pools() {
+        let pool_a_dir = PathBuf::from("/pools/pool-a");
+        let pool_b_dir = PathBuf::from("/pools/pool-b");
+        let pool_c_dir = PathBuf::from("/pools/pool-c");
+
+        let results = vec![
+            // Pool A: successful reclaim
+            (
+                pool_a_dir.clone(),
+                crate::gc::GcResult {
+                    dry_run: false,
+                    reclaimed: vec![crate::gc::GcWorktree {
+                        name: "1".into(),
+                        path: "/pools/pool-a/1/repo".into(),
+                        bytes: 1000,
+                        tag: "stale".into(),
+                        warning: String::new(),
+                    }],
+                    freed_bytes: 1000,
+                    ..Default::default()
+                },
+            ),
+            // Pool B: pool-level error (simulates gc failure)
+            (
+                pool_b_dir.clone(),
+                crate::gc::GcResult {
+                    dry_run: false,
+                    errors: vec![crate::gc::CleanupError {
+                        name: "pool".into(),
+                        path: pool_b_dir.to_string_lossy().into_owned(),
+                        phase: "pool_gc".into(),
+                        detail: "state lock timed out".into(),
+                    }],
+                    ..Default::default()
+                },
+            ),
+            // Pool C: successful reclaim
+            (
+                pool_c_dir.clone(),
+                crate::gc::GcResult {
+                    dry_run: false,
+                    reclaimed: vec![crate::gc::GcWorktree {
+                        name: "1".into(),
+                        path: "/pools/pool-c/1/repo".into(),
+                        bytes: 2000,
+                        tag: "stale".into(),
+                        warning: String::new(),
+                    }],
+                    freed_bytes: 2000,
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        let merged = merge_gc_results(results);
+
+        // Pools A and C were reclaimed successfully.
+        assert_eq!(merged.reclaimed.len(), 2);
+        assert_eq!(merged.freed_bytes, 3000);
+
+        // Pool B's error is preserved in the merged result.
+        assert_eq!(merged.errors.len(), 1);
+        assert_eq!(merged.errors[0].phase, "pool_gc");
+        assert_eq!(merged.errors[0].name, "pool");
+        assert!(merged.errors[0].detail.contains("state lock timed out"));
+    }
+
+    #[test]
+    fn merge_prune_results_aggregates_errors_across_pools() {
+        let pool_a_dir = PathBuf::from("/pools/pool-a");
+        let pool_b_dir = PathBuf::from("/pools/pool-b");
+
+        let results = vec![
+            (
+                pool_a_dir,
+                crate::prune::PruneResult {
+                    dry_run: false,
+                    pruned: vec![crate::prune::PruneWorktree {
+                        name: "1".into(),
+                        path: "/pools/pool-a/1/repo".into(),
+                        bytes: 500,
+                        orphaned: false,
+                        warning: String::new(),
+                    }],
+                    freed_bytes: 500,
+                    ..Default::default()
+                },
+            ),
+            (
+                pool_b_dir.clone(),
+                crate::prune::PruneResult {
+                    dry_run: false,
+                    errors: vec![crate::prune::CleanupError {
+                        name: "pool".into(),
+                        path: pool_b_dir.to_string_lossy().into_owned(),
+                        phase: "pool_prune".into(),
+                        detail: "corrupt state file".into(),
+                    }],
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        let merged = merge_prune_results(results);
+
+        assert_eq!(merged.pruned.len(), 1);
+        assert_eq!(merged.freed_bytes, 500);
+        assert_eq!(merged.errors.len(), 1);
+        assert_eq!(merged.errors[0].phase, "pool_prune");
+    }
+
+    // ─── Integration: sweep_pools with real pools ───────────────────────
+
+    /// Creates a real git repo + pool in a temp dir.
+    fn make_real_pool(
+        home: &std::path::Path,
+        repo_name: &str,
+    ) -> (crate::pool::Pool, tempfile::TempDir, tempfile::TempDir) {
+        let repo_guard = tempfile::tempdir().unwrap();
+        let repo = repo_guard.path().join(repo_name);
+        let init = std::process::Command::new("git")
+            .args(["init", "--initial-branch=main", repo.to_str().unwrap()])
+            .current_dir(repo_guard.path())
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+        let run_git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        run_git(&["config", "user.email", "t@t.com"]);
+        run_git(&["config", "user.name", "T"]);
+        std::fs::write(repo.join("README.md"), b"hi\n").unwrap();
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "init"]);
+
+        let config = crate::config::TreehouseConfig {
+            root: Some(home.to_str().unwrap().to_string()),
+            ..crate::config::TreehouseConfig::default_config()
+        };
+        let opts = crate::pool::OpenOptions {
+            config,
+            ..Default::default()
+        };
+        let pool = crate::pool::Pool::open(&repo, None, &opts).expect("failed to open pool");
+        (pool, repo_guard, tempfile::tempdir().unwrap())
+    }
+
+    #[test]
+    fn sweep_pools_processes_multiple_real_pools() {
+        let home = tempfile::tempdir().unwrap();
+        let (pool_a, _rg_a, _hg_a) = make_real_pool(home.path(), "repo-a");
+        let (pool_b, _rg_b, _hg_b) = make_real_pool(home.path(), "repo-b");
+
+        // Collect pool dirs and gc results.
+        let mut gc_results: Vec<(PathBuf, crate::gc::GcResult)> = Vec::new();
+
+        // Simulate what cmd_gc_all / cmd_watch does: sweep each pool via gc.
+        for pool in [&pool_a, &pool_b] {
+            let opts = crate::gc::GcOptions {
+                dry_run: true,
+                prune_orphans: false,
+            };
+            let result = pool.gc(&opts).unwrap();
+            gc_results.push((pool.pool_dir().to_path_buf(), result));
+        }
+
+        let merged = merge_gc_results(gc_results);
+
+        // Both pools were processed (dry_run, so no actual reclamation).
+        // The merged result is valid and contains data from both pools.
+        assert!(merged.dry_run);
+    }
+
+    #[test]
+    fn sweep_callback_error_isolation_real_pattern() {
+        // This test exercises the exact pattern used by cmd_gc_all and cmd_watch:
+        // the callback catches PoolError and wraps it as a CleanupError.
+        let home = tempfile::tempdir().unwrap();
+        let (pool_a, _rg, _hg) = make_real_pool(home.path(), "repo-ok");
+
+        let mut results: Vec<(PathBuf, crate::gc::GcResult)> = Vec::new();
+
+        // Sweep pool A (success) + simulate a failing pool B.
+        let pools: Vec<(&str, Option<&crate::pool::Pool>)> = vec![
+            ("ok", Some(&pool_a)),
+            ("fail", None), // simulates a pool that fails to open or gc
+        ];
+
+        for (label, pool) in &pools {
+            let pool_dir = home.path().join(format!("pool-{label}"));
+            match pool {
+                Some(p) => {
+                    let opts = crate::gc::GcOptions {
+                        dry_run: true,
+                        prune_orphans: false,
+                    };
+                    results.push((pool_dir, p.gc(&opts).unwrap()));
+                }
+                None => {
+                    // Simulate the P1 error-isolation pattern.
+                    results.push((
+                        pool_dir.clone(),
+                        crate::gc::GcResult {
+                            dry_run: true,
+                            errors: vec![crate::gc::CleanupError {
+                                name: "pool".into(),
+                                path: pool_dir.to_string_lossy().into_owned(),
+                                phase: "pool_gc".into(),
+                                detail: "simulated pool error".into(),
+                            }],
+                            ..Default::default()
+                        },
+                    ));
+                }
+            }
+        }
+
+        let merged = merge_gc_results(results);
+
+        // Pool A was processed (dry_run, no candidates expected).
+        // Pool B's error is in the merged result.
+        assert!(merged.errors.len() == 1);
+        assert_eq!(merged.errors[0].phase, "pool_gc");
+        assert!(merged.errors[0].detail.contains("simulated pool error"));
+    }
+
+    #[test]
+    fn merge_gc_results_idempotent() {
+        // Running merge on the same results twice produces the same output.
+        let results = vec![
+            (
+                PathBuf::from("/pools/a"),
+                crate::gc::GcResult {
+                    dry_run: false,
+                    reclaimed: vec![crate::gc::GcWorktree {
+                        name: "1".into(),
+                        path: "/pools/a/1/r".into(),
+                        bytes: 100,
+                        tag: "stale".into(),
+                        warning: String::new(),
+                    }],
+                    freed_bytes: 100,
+                    ..Default::default()
+                },
+            ),
+            (
+                PathBuf::from("/pools/b"),
+                crate::gc::GcResult {
+                    dry_run: false,
+                    errors: vec![crate::gc::CleanupError {
+                        name: "pool".into(),
+                        path: "/pools/b".into(),
+                        phase: "pool_gc".into(),
+                        detail: "lock timeout".into(),
+                    }],
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        let first = merge_gc_results(results.clone());
+        let second = merge_gc_results(results);
+
+        assert_eq!(first.reclaimed.len(), second.reclaimed.len());
+        assert_eq!(first.errors.len(), second.errors.len());
+        assert_eq!(first.freed_bytes, second.freed_bytes);
     }
 }

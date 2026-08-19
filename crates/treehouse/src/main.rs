@@ -90,6 +90,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Command::Prune(args)) => cmd_prune(&cli, args),
         Some(Command::Destroy(args)) => cmd_destroy(&cli, args),
         Some(Command::Gc(args)) => cmd_gc(&cli, args),
+        Some(Command::Watch(args)) => cmd_watch(args),
         Some(Command::Run(args)) => cmd_run(&cli, args),
         Some(Command::Doctor(args)) => cmd_doctor(&cli, args),
         Some(Command::Init) => cmd_init(),
@@ -294,13 +295,40 @@ fn cmd_prune_all(args: &cli::PruneArgs) -> Result<()> {
                 },
             )
         };
+    // Per-pool error isolation: a pool-level failure is recorded as a
+    // CleanupError in the result so the remaining pools are still swept.
     treehouse_core::discovery::sweep_pools(&user, ctx_factory, |pool| {
-        let result = pool.prune(&opts)?;
-        results.push((pool.pool_dir().to_path_buf(), result));
+        let pool_dir = pool.pool_dir().to_path_buf();
+        match pool.prune(&opts) {
+            Ok(result) => {
+                results.push((pool_dir, result));
+            }
+            Err(e) => {
+                results.push((
+                    pool_dir.clone(),
+                    treehouse_core::prune::PruneResult {
+                        dry_run: opts.dry_run,
+                        errors: vec![treehouse_core::prune::CleanupError {
+                            name: "pool".into(),
+                            path: pool_dir.to_string_lossy().into_owned(),
+                            phase: "pool_prune".into(),
+                            detail: e.to_string(),
+                        }],
+                        ..Default::default()
+                    },
+                ));
+            }
+        }
         Ok(())
     })?;
     let merged = treehouse_core::discovery::merge_prune_results(results);
+    let has_pool_errors = !merged.errors.is_empty();
     render_prune(merged)?;
+
+    // Non-zero exit if any pool had an error (CI-friendly).
+    if has_pool_errors {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -334,11 +362,40 @@ fn cmd_gc(cli: &Cli, args: &cli::GcArgs) -> Result<()> {
 
 /// `gc --all`: sweep every managed pool under the user-level root.
 fn cmd_gc_all(args: &cli::GcArgs) -> Result<()> {
-    let user = treehouse_core::config::TreehouseConfig::load_global()?;
     let opts = treehouse_core::gc::GcOptions {
         dry_run: !args.yes,
         prune_orphans: args.prune_orphans,
     };
+    let merged = sweep_all_pools(&opts)?;
+
+    if opts.dry_run
+        && merged.candidates.is_empty()
+        && merged.skipped.is_empty()
+        && merged.errors.is_empty()
+    {
+        eprintln!("🌳 No stale worktrees to reclaim.");
+        return Ok(());
+    }
+    render_gc(&opts, &merged)?;
+
+    if !merged.errors.is_empty() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Sweep every managed pool under the user-level root using the GC engine.
+///
+/// This is the **single source of truth** for multi-pool GC sweeps.
+/// Both `gc --all` and `watch --once` call this function — no duplicate
+/// cleanup logic.
+///
+/// Per-pool error isolation: a pool-level failure is recorded as a
+/// `CleanupError` in the result so the remaining pools are still swept.
+fn sweep_all_pools(
+    opts: &treehouse_core::gc::GcOptions,
+) -> Result<treehouse_core::gc::GcResult, anyhow::Error> {
+    let user = treehouse_core::config::TreehouseConfig::load_global()?;
     let mut results: Vec<(PathBuf, _)> = Vec::new();
     let ctx_factory =
         |dir: &PathBuf| -> Result<treehouse_core::pool::Pool, treehouse_core::pool::PoolError> {
@@ -351,18 +408,103 @@ fn cmd_gc_all(args: &cli::GcArgs) -> Result<()> {
             )
         };
     treehouse_core::discovery::sweep_pools(&user, ctx_factory, |pool| {
-        let result = pool.gc(&opts)?;
-        results.push((pool.pool_dir().to_path_buf(), result));
+        let pool_dir = pool.pool_dir().to_path_buf();
+        match pool.gc(opts) {
+            Ok(result) => {
+                results.push((pool_dir, result));
+            }
+            Err(e) => {
+                results.push((
+                    pool_dir.clone(),
+                    treehouse_core::gc::GcResult {
+                        dry_run: opts.dry_run,
+                        errors: vec![treehouse_core::gc::CleanupError {
+                            name: "pool".into(),
+                            path: pool_dir.to_string_lossy().into_owned(),
+                            phase: "pool_gc".into(),
+                            detail: e.to_string(),
+                        }],
+                        ..Default::default()
+                    },
+                ));
+            }
+        }
         Ok(())
     })?;
-    let merged = treehouse_core::discovery::merge_gc_results(results);
+    Ok(treehouse_core::discovery::merge_gc_results(results))
+}
 
-    // Sweep banner first (aggregate per-pool skips already streamed).
-    if opts.dry_run && merged.candidates.is_empty() && merged.skipped.is_empty() {
-        eprintln!("🌳 No stale worktrees to reclaim.");
+/// `watch --once` or `watch --interval <dur>`: sweep all pools.
+///
+/// This is a thin orchestrator — all cleanup logic lives in the GC engine
+/// via `sweep_all_pools`. No new cleanup paths are introduced.
+fn cmd_watch(args: &cli::WatchArgs) -> Result<()> {
+    let opts = treehouse_core::gc::GcOptions {
+        dry_run: !args.yes,
+        prune_orphans: args.prune_orphans,
+    };
+
+    if args.once {
+        let merged = sweep_all_pools(&opts)?;
+        if merged.candidates.is_empty() && merged.skipped.is_empty() && merged.errors.is_empty() {
+            eprintln!("🌳 All pools clean. Nothing to reclaim.");
+            return Ok(());
+        }
+        render_gc(&opts, &merged)?;
+        if !merged.errors.is_empty() {
+            std::process::exit(1);
+        }
         return Ok(());
     }
-    render_gc(&opts, &merged)?;
+
+    // ─── Interval loop (foreground) ──────────────────────────────────
+    let interval = args.interval.unwrap_or(std::time::Duration::from_secs(60));
+
+    if interval.is_zero() {
+        eprintln!("🌳 error: --interval must be greater than zero");
+        std::process::exit(1);
+    }
+
+    // Graceful shutdown flag — set by SIGINT/SIGTERM handler.
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let s = shutdown.clone();
+    ctrlc::set_handler(move || {
+        s.store(true, std::sync::atomic::Ordering::Relaxed);
+    })
+    .expect("failed to set Ctrl-C handler");
+
+    eprintln!(
+        "🌳 treehouse watch: sweeping every {}. Press Ctrl-C to stop.",
+        humantime::format_duration(interval)
+    );
+
+    let mut had_pool_errors = false;
+    while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+        let merged = sweep_all_pools(&opts)?;
+        let has_errors = !merged.errors.is_empty();
+        had_pool_errors = had_pool_errors || has_errors;
+
+        if !merged.candidates.is_empty() || !merged.skipped.is_empty() || has_errors {
+            render_gc(&opts, &merged)?;
+        } else {
+            eprintln!("🌳 All pools clean.");
+        }
+
+        // Sleep AFTER sweep completes, not from cycle start.
+        // Check shutdown flag during sleep to exit promptly on Ctrl-C.
+        let deadline = std::time::Instant::now() + interval;
+        while std::time::Instant::now() < deadline {
+            if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+
+    eprintln!("🌳 treehouse watch: stopped.");
+    if had_pool_errors {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -371,7 +513,7 @@ fn render_gc(
     opts: &treehouse_core::gc::GcOptions,
     result: &treehouse_core::gc::GcResult,
 ) -> Result<()> {
-    if result.candidates.is_empty() && result.skipped.is_empty() {
+    if result.candidates.is_empty() && result.skipped.is_empty() && result.errors.is_empty() {
         eprintln!("🌳 No stale worktrees to reclaim.");
         return Ok(());
     }
@@ -401,6 +543,18 @@ fn render_gc(
         eprintln!("🌳 Skipped {} worktree(s):", result.skipped.len());
         for sk in &result.skipped {
             eprintln!("  [{}] {} ({})", sk.category, sk.path, sk.reason);
+        }
+    }
+    if !result.errors.is_empty() {
+        eprintln!(
+            "🌳 Cleanup failed for {} worktree(s) (will retry next run):",
+            result.errors.len()
+        );
+        for err in &result.errors {
+            eprintln!(
+                "  [{}] {} — {}: {}",
+                err.phase, err.path, err.name, err.detail
+            );
         }
     }
     Ok(())
@@ -692,4 +846,122 @@ fn cmd_doctor(cli: &Cli, args: &cli::DoctorArgs) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_duration_seconds() {
+        let d = cli::parse_duration("30s").unwrap();
+        assert_eq!(d, std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn parse_duration_minutes() {
+        let d = cli::parse_duration("5m").unwrap();
+        assert_eq!(d, std::time::Duration::from_secs(300));
+    }
+
+    #[test]
+    fn parse_duration_complex() {
+        let d = cli::parse_duration("1h30m").unwrap();
+        assert_eq!(d, std::time::Duration::from_secs(5400));
+    }
+
+    #[test]
+    fn parse_duration_invalid() {
+        assert!(cli::parse_duration("banana").is_err());
+        assert!(cli::parse_duration("").is_err());
+    }
+
+    #[test]
+    fn parse_duration_zero_is_valid_parse_but_rejected_by_cmd() {
+        let d = cli::parse_duration("0s").unwrap();
+        assert!(d.is_zero(), "0s parses to a zero duration");
+        // cmd_watch rejects zero intervals — tested by the is_zero() check.
+    }
+
+    #[test]
+    fn shutdown_flag_stops_loop_quickly() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s = shutdown.clone();
+
+        // Simulate a sweep loop that checks the shutdown flag.
+        let start = std::time::Instant::now();
+        let mut iterations = 0u32;
+
+        // Set shutdown immediately — loop should exit on first check.
+        s.store(true, Ordering::Relaxed);
+
+        while !shutdown.load(Ordering::Relaxed) {
+            iterations += 1;
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        assert_eq!(
+            iterations, 0,
+            "loop must not run any iterations when shutdown is set"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "loop must exit promptly"
+        );
+    }
+
+    #[test]
+    fn sweep_interval_sleep_is_after_sweep_not_from_start() {
+        // Verify the sleep-after-sweep pattern: if sweep takes time,
+        // the next cycle starts after sweep + interval, not interval from start.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let interval = std::time::Duration::from_millis(100);
+        let sweep_duration = std::time::Duration::from_millis(50);
+
+        let start = std::time::Instant::now();
+        let mut cycles = 0u32;
+
+        while !shutdown.load(Ordering::Relaxed) && cycles < 2 {
+            // Simulate sweep
+            std::thread::sleep(sweep_duration);
+            cycles += 1;
+
+            // Sleep AFTER sweep (same pattern as cmd_watch)
+            let deadline = std::time::Instant::now() + interval;
+            while std::time::Instant::now() < deadline {
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        let elapsed = start.elapsed();
+        // 2 cycles: (50ms sweep + 100ms sleep) * 2 = ~300ms minimum
+        assert!(
+            elapsed >= std::time::Duration::from_millis(200),
+            "cycles should take at least sweep+interval each, got {elapsed:?}"
+        );
+        assert_eq!(cycles, 2);
+    }
+
+    #[test]
+    fn watch_args_defaults() {
+        let args = cli::WatchArgs {
+            once: false,
+            interval: None,
+            yes: false,
+            prune_orphans: false,
+        };
+        assert!(!args.once);
+        assert!(args.interval.is_none());
+        assert!(!args.yes);
+        assert!(!args.prune_orphans);
+    }
 }

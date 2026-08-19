@@ -146,6 +146,8 @@ pub struct PruneResultJson {
     pub candidates: u32,
     pub pruned: u32,
     pub skipped: u32,
+    /// Worktrees whose physical cleanup failed (state retained for retry).
+    pub errors: u32,
     pub reclaimable_bytes: u64,
     pub freed_bytes: u64,
 }
@@ -166,6 +168,7 @@ impl PruneResultJson {
             candidates: r.candidates.len() as u32,
             pruned: r.pruned.len() as u32,
             skipped: r.skipped.len() as u32,
+            errors: r.errors.len() as u32,
             reclaimable_bytes: r.reclaimable_bytes,
             freed_bytes: r.freed_bytes,
         }

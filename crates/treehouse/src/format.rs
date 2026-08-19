@@ -73,7 +73,7 @@ fn render_human(
             }
         }
         CommandResult::Prune(r) => {
-            if r.candidates.is_empty() && r.skipped.is_empty() {
+            if r.candidates.is_empty() && r.skipped.is_empty() && r.errors.is_empty() {
                 writeln!(err, "🌳 No stale worktrees to prune.")?;
                 return Ok(());
             }
@@ -109,6 +109,16 @@ fn render_human(
                 )?;
                 for s in &r.skipped {
                     writeln!(err, "  [{}] {} ({})", s.category, s.path, s.reason)?;
+                }
+            }
+            if !r.errors.is_empty() {
+                writeln!(
+                    err,
+                    "🌳 Cleanup failed for {} worktree(s) (will retry next run):",
+                    r.errors.len()
+                )?;
+                for e in &r.errors {
+                    writeln!(err, "  [{}] {} — {}: {}", e.phase, e.path, e.name, e.detail)?;
                 }
             }
         }

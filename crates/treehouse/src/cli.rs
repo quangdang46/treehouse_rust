@@ -65,6 +65,8 @@ pub enum Command {
     Run(Vec<String>),
     /// Read-only health report.
     Doctor(DoctorArgs),
+    /// Sweep all pools (scheduled cleanup entrypoint).
+    Watch(WatchArgs),
     /// Create a default treehouse.toml.
     Init,
     /// Update treehouse to the latest release.
@@ -139,6 +141,28 @@ pub struct DoctorArgs {
     /// Treat any warning as a failure.
     #[arg(long)]
     pub strict: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct WatchArgs {
+    /// Run a single sweep and exit (no background loop).
+    #[arg(long)]
+    pub once: bool,
+    /// Sweep interval for the foreground loop (e.g. 30s, 5m). Default: 60s.
+    /// Ignored when --once is set.
+    #[arg(long, value_parser = parse_duration)]
+    pub interval: Option<std::time::Duration>,
+    /// Execute instead of dry-run.
+    #[arg(long)]
+    pub yes: bool,
+    /// Include backing-repository-missing orphans.
+    #[arg(long)]
+    pub prune_orphans: bool,
+}
+
+/// Parse a human-readable duration string (e.g. "30s", "5m", "1h30m").
+pub(crate) fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
+    humantime::parse_duration(s).map_err(|e| format!("invalid duration '{s}': {e}"))
 }
 
 #[derive(Debug, Args)]
