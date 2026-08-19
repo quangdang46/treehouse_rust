@@ -6,7 +6,7 @@ Treehouse stays a foreground CLI — the OS manages lifecycle, restart, and supe
 ## Prerequisites
 
 ```bash
-treehouse --version    # v0.2.0+ (P0–P3: GC hardening, watch --interval)
+treehouse --version    # v0.1.2+ (GC hardening, watch --once/--interval)
 treehouse doctor       # verify pools are healthy before scheduling
 ```
 

@@ -132,7 +132,7 @@ curl -fsSL "https://raw.githubusercontent.com/quangdang46/treehouse_rust/main/in
 # Windows PowerShell
 irm "https://raw.githubusercontent.com/quangdang46/treehouse_rust/main/install.ps1" | iex
 # or from source / via cargo (any platform)
-cargo install --git https://github.com/quangdang46/treehouse_rust --tag v0.1.0 treehouse
+cargo install --git https://github.com/quangdang46/treehouse_rust --tag v0.1.2 treehouse
 
 # 2. From inside a repo, get a worktree and a subshell
 cd myproject
@@ -170,6 +170,7 @@ exit
 | `treehouse prune` | Dry-run removal of stale idle worktrees |
 | `treehouse gc` | Reclaim stale, orphaned, and dead-owner worktrees (dry-run default) |
 | `treehouse destroy <path>` | Dry-run removal of one worktree (`--yes` to execute) |
+| `treehouse watch` | Sweep all pools on a schedule — `--once` for cron/systemd, `--interval` for foreground loop |
 | `treehouse doctor` | Read-only health report |
 | `treehouse run -- <cmd…>` | Acquire → run an agent → cleanup guaranteed on every exit |
 | `treehouse init` | Create a default `treehouse.toml` |
@@ -217,12 +218,41 @@ exit
 | `--include-in-use` | Also remove worktrees with a running process (terminated first) |
 | `--include-leased` | Also remove a leased worktree — single named path only, never `--all` |
 
+### Global flag
+
+| Flag | Description |
+|------|-------------|
+| `--env-path <DIR>` | Custom pool root (overrides `treehouse.toml` root and `~/.treehouse`); available on every command |
+
 ### `doctor`
 
 | Flag | Description |
 |------|-------------|
 | `--format human|json|toon` | Output format (default `human`) |
 | `--strict` | Treat any warning as a failure |
+
+### `watch` — auto-clean sweeper
+
+Sweeps every pool under `~/.treehouse` — designed to run from your OS scheduler (systemd, launchd, Task Scheduler, or cron). See [docs/watch-deployment.md](docs/watch-deployment.md) for full setup recipes.
+
+| Flag | Description |
+|------|-------------|
+| `--once` | Run a single sweep and exit (cron/systemd one-shot) |
+| `--interval <dur>` | Sweep interval for the foreground loop (e.g. `30s`, `5m`, `1h`). Default: `60s`. Ignored when `--once` is set |
+| `--yes` | Execute instead of dry-run |
+| `--prune-orphans` | Include backing-repository-missing orphans |
+| `--env-path <DIR>` | Custom pool root (overrides `treehouse.toml` root and `~/.treehouse`) |
+
+```bash
+# One-shot — ideal for cron / systemd timer
+treehouse watch --once --yes
+
+# Foreground loop — runs forever, sweeps every 30s
+treehouse watch --interval 30s --yes
+
+# Dry-run first (default)
+treehouse watch --once
+```
 
 ### `run`
 
