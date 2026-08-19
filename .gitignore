@@ -4,3 +4,6 @@
 # Rust build artifacts
 /target/
 **/*.rs.bk
+
+# bv (beads viewer) local config and caches
+.bv/
