@@ -73,11 +73,23 @@ jobs:
           case "${{ matrix.suffix }}" in
             windows-*) BIN_NAME="treehouse.exe" ;;
           esac
+          # `toon` is a FEATURE-gated encoder, and without it `--format toon`
+          # silently falls back to serde_json — a shipped binary that prints JSON
+          # for a flag the README documents as TOON. The feature is off by
+          # default so an offline checkout still compiles, which means every
+          # build that ships has to ask for it explicitly.
+          #
+          # NOTE: `tru` is a git dependency (pinned rev, Cargo.toml
+          # workspace.dependencies). Under `cross` the fetch happens INSIDE the
+          # container, so this job needs the container to reach github.com. That
+          # is also why ci.yml needs its own `--features toon` job — this is the
+          # only place the encoder is compiled today, and finding out it is
+          # broken by pushing a tag is far too late.
           if [[ "${{ matrix.use_cross }}" == "true" ]]; then
-            cross build --release --target "${{ matrix.target }}" --bin treehouse
+            cross build --release --target "${{ matrix.target }}" --bin treehouse --features toon
             BIN="target/${{ matrix.target }}/release/${BIN_NAME}"
           else
-            cargo build --release --bin treehouse
+            cargo build --release --bin treehouse --features toon
             BIN="target/release/${BIN_NAME}"
           fi
           echo "BIN=$BIN" >> "$GITHUB_ENV"

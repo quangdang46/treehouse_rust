@@ -13,6 +13,7 @@ pub mod destroy;
 pub mod discovery;
 pub mod doctor;
 pub mod env;
+pub mod fileclone;
 pub mod gc;
 pub mod git;
 pub mod hardening;
@@ -28,6 +29,7 @@ pub mod run;
 pub mod state;
 pub mod state_file;
 pub mod updater;
+pub mod vcs;
 pub mod worktree;
 
 // ─── TreehouseCore wrapper ─────────────────────────────────────────────────────

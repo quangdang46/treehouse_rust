@@ -4,7 +4,7 @@
 //! formatter. The Go CLI contract (plan Appendix B) is reproduced: exit codes,
 //! stdout/stderr routing, and human message strings (byte-exact where Go-tested).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use treehouse_core::git::GitBackend;
@@ -76,7 +76,15 @@ pub enum Command {
     Update,
 }
 
-#[derive(Debug, Args)]
+/// Acquisition options for `treehouse get`.
+///
+/// `Default` is derived so a bare `treehouse` (no subcommand) can be expressed
+/// as `GetArgs::default()`. A hand-written literal here would have to be
+/// updated every time a flag is added, and the compiler would NOT catch the
+/// omission at the point where it matters — a new flag would simply be absent
+/// from the default `get`, which is the same silent drop that once cost
+/// `get --lease` its `AcquireOptions`.
+#[derive(Debug, Args, Default)]
 pub struct GetArgs {
     /// Durably lease instead of opening a subshell; path-only on stdout.
     #[arg(long)]
@@ -112,6 +120,16 @@ pub struct GetArgs {
     /// Defaults to $TREEHOUSE_WORKTREE_PATH.
     #[arg(long, value_name = "TEMPLATE")]
     pub worktree_path: Option<String>,
+    /// Replace the committed `.worktreeinclude` with this file for THIS
+    /// acquisition (Go `IncludeManifest`). An empty file seeds nothing; it
+    /// does NOT fall back to the committed manifest.
+    #[arg(long, value_name = "FILE")]
+    pub include_file: Option<String>,
+    /// Share tracked file data in fresh Git slots on macOS/APFS: `off` or
+    /// `fresh`. Overrides $TREEHOUSE_APFS_SHARING. Never fails an acquisition
+    /// — a slot that cannot be shared keeps its plain copy.
+    #[arg(long, value_name = "MODE")]
+    pub apfs_sharing: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -273,6 +291,11 @@ impl GetArgs {
     /// worktree is cut FROM, `branch` is the branch that gets CREATED. Merging
     /// them here would silently turn `--base main -b main` into a request to
     /// create the branch the worktree is already on.
+    ///
+    /// `--include-file` and `--apfs-sharing` are resolved HERE rather than in
+    /// `main.rs` for the same reason `--base` is: this is the one place both
+    /// acquisition modes read, so a new option cannot reach `get` while being
+    /// silently dropped by `get --lease`.
     pub fn acquire_options(&self) -> anyhow::Result<treehouse_core::pool::AcquireOptions> {
         // `--branch` must name something: an empty value would otherwise read
         // as "no branch requested" and the flag would be a silent no-op.
@@ -295,10 +318,56 @@ impl GetArgs {
             new_branch: self.branch.clone(),
             unique_leaf,
             worktree_path,
+            include_manifest: self.read_include_manifest()?,
+            apfs_sharing: self.resolve_apfs_sharing()?,
             ..Default::default()
         })
     }
+
+    /// The `--include-file` manifest bytes, read ONCE and before acquisition
+    /// can reset the checkout holding it.
+    ///
+    /// Go reads it in `getRunE` for the same reason (cmd/get.go:120-127): the
+    /// file usually lives in the repository being cut from, and an acquisition
+    /// may reset or move that checkout. Reading it lazily, after the pool has
+    /// already started rewriting worktrees, turns a race into a truncated
+    /// manifest.
+    ///
+    /// `Some(vec![])` is a valid, meaningful value — "replace the committed
+    /// `.worktreeinclude` with nothing" — and must reach the core as an empty
+    /// manifest rather than as `None`, which would select the committed one.
+    fn read_include_manifest(&self) -> anyhow::Result<Option<Vec<u8>>> {
+        let Some(path) = self.include_file.as_deref() else {
+            return Ok(None);
+        };
+        let bytes = std::fs::read(path)
+            .map_err(|e| anyhow::anyhow!("failed to read include file {path:?}: {e}"))?;
+        Ok(Some(bytes))
+    }
+
+    /// Resolves `--apfs-sharing` through `flag > env > off` (Go
+    /// `config.ResolveAPFSSharing`, config.go:77-95).
+    ///
+    /// The config tier is absent for the same reason it is absent for
+    /// `unique_leaf`: `TreehouseConfig` is not this crate's type. The chain
+    /// therefore stops at the environment, and a `apfs_sharing = "fresh"` in
+    /// `treehouse.toml` is picked up by the core rather than here.
+    fn resolve_apfs_sharing(&self) -> anyhow::Result<bool> {
+        let value = self
+            .apfs_sharing
+            .clone()
+            .or_else(|| non_empty_env(APFS_SHARING_VAR));
+        match value.as_deref().map(str::trim) {
+            None | Some("") | Some("off") => Ok(false),
+            Some("fresh") => Ok(true),
+            Some(other) => anyhow::bail!("invalid apfs_sharing {other:?}: use off or fresh"),
+        }
+    }
 }
+
+/// Env var that opts into APFS sharing without the flag (Go
+/// `config.APFSSharingEnvVar`, config.go:75).
+pub const APFS_SHARING_VAR: &str = "TREEHOUSE_APFS_SHARING";
 
 /// Reads an env var that only reads as a boolean when it parses (Go
 /// `strconv.ParseBool`, config.go:135). An unparseable value is treated as
@@ -366,6 +435,124 @@ pub fn open_pool_with_root(
         ctx.remote_url.as_deref(),
         &opts,
     )?)
+}
+
+// ─── Backend selection ───────────────────────────────────────────────────────
+
+/// The environment variable that selects the VCS backend (Go `vcsOverride`,
+/// vcs.go:196-207 — the highest-precedence tier).
+pub const TREEHOUSE_VCS_VAR: &str = "TREEHOUSE_VCS";
+
+/// Whether `value` names a backend this port knows, matching Go's
+/// `normalizeVCSName` (vcs.go:219-224).
+///
+/// An unrecognised value normalises to "nothing", which leaves the repository
+/// on git — deliberately not an error, because Go treats a typo in this
+/// variable as "no override" and a repository that selects jj through the
+/// config tiers must not be dragged onto git by a stray `TREEHOUSE_VCS=jjj`.
+fn normalize_vcs(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "git" => Some("git"),
+        "jj" => Some("jj"),
+        _ => None,
+    }
+}
+
+/// Refuses `--branch` against the jj backend (Go `cmd/get.go:148-150`).
+///
+/// `--branch` CREATES a branch. Inside a jj workspace the branch is not a git
+/// ref at all, so carrying the flag through would either fail somewhere deep
+/// in acquisition or — worse — report success for an operation that never
+/// happened. Go refuses up front, and so does this.
+///
+/// The refusal is driven by the backend the repository **selects**, not by the
+/// mere presence of a `.jj` directory. Go's `backendFor` (vcs.go:157-166)
+/// deliberately falls back to git for a jj-marked tree that was never opted in,
+/// so a git repository that merely sits next to a `.jj` directory keeps
+/// `--branch`; refusing there would break a working invocation.
+///
+/// Only the `TREEHOUSE_VCS` tier is consulted. Go's two lower tiers — `vcs` in
+/// `treehouse.toml` and in `~/.config/treehouse/config.toml` — need a `vcs`
+/// field on `TreehouseConfig`, which this port does not have; until it does, a
+/// repository that opts into jj through config rather than the environment is
+/// not caught here. That gap is inert while the jj backend itself is
+/// unimplemented, because a `.jj` path leads to "no backend is registered for
+/// \"jj\"" rather than to a misbehaving acquisition — but it must be closed
+/// before the jj backend ships.
+pub fn require_git_backend_for_branch(
+    repo_root: &Path,
+    branch: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(branch) = branch.filter(|b| !b.is_empty()) else {
+        return Ok(());
+    };
+    let override_name = normalize_vcs(&std::env::var(TREEHOUSE_VCS_VAR).unwrap_or_default());
+    if override_name != Some(treehouse_core::vcs::BACKEND_JJ) {
+        return Ok(());
+    }
+    // The backend the repository SELECTS (Go `BackendNameFor`, vcs.go:669) —
+    // not the slot flavour, and not the mere presence of a `.jj` directory.
+    // `configured_backend_name` is the seam's port of exactly that function, so
+    // the two questions stay apart the way Go keeps them apart: in a colocated
+    // repository `.git` wins here while [`worktree_backend_name`] would answer
+    // for the slot, and jj colocates with git by design (`jj git init`), so the
+    // colocated layout is the NORMAL one.
+    //
+    // A marker that cannot be READ is propagated as an error, not reported as
+    // "git". This port separates "no marker" from "unreadable marker" precisely
+    // so a damaged checkout is never quietly classified; collapsing the two
+    // here would let `--branch {branch}` proceed in a repository whose backend
+    // could not be identified, which is the exact case the check exists for.
+    let selected = treehouse_core::vcs::configured_backend_name(repo_root, override_name)
+        .map_err(|e| anyhow::anyhow!("resolving the vcs backend for {}: {e}", repo_root.display()))?;
+
+    // Selection is not the same question as readability, and this gate must not
+    // collapse them. `configured_backend_name` answers "which backend would
+    // CREATE a worktree here", and it follows Go's `findMarkerRoot`, which
+    // stats with `os.Stat` and therefore counts a marker it cannot read as
+    // ABSENT — right for selection, where the alternative is inventing a
+    // backend. It is wrong for a REFUSAL: a `.jj` pointing at a deleted
+    // workspace reads as "no jj here", and `--branch` would walk straight into
+    // the checkout this check exists to protect.
+    jj_marker_readable(repo_root)?;
+
+    if selected == treehouse_core::vcs::BACKEND_JJ {
+        anyhow::bail!(
+            "--branch is only supported by the git backend \
+             (cannot create {branch:?} in a jj workspace)"
+        );
+    }
+    Ok(())
+}
+
+/// Fails when `path` holds a `.jj` marker that exists but cannot be READ.
+///
+/// This is a guard on a REFUSAL, not a backend selector — deciding WHICH
+/// backend a repository uses is [`treehouse_core::vcs::configured_backend_name`]
+/// alone, and duplicating that here is what this function exists to avoid. What
+/// it adds is only the distinction the seam draws for slot flavour
+/// ([`treehouse_core::vcs::worktree_backend_name`], which reports an unreadable
+/// marker as an error) but which the selection path deliberately does not: an
+/// unreadable marker is a damaged checkout, never evidence of absence.
+///
+/// The check is scoped to `.jj` specifically because that is the marker this
+/// refusal is about. Asking [`treehouse_core::vcs::worktree_backend_name`]
+/// instead would be useless here — it answers on `.git` first and returns
+/// without ever looking at `.jj`, so in a COLOCATED repository (the normal jj
+/// layout, `jj git init`) a damaged `.jj` would sail straight through.
+fn jj_marker_readable(path: &Path) -> anyhow::Result<()> {
+    let marker = path.join(".jj");
+    // `symlink_metadata` does not follow, so a DANGLING symlink counts as
+    // present — its unresolvable target is damage to report, not absence.
+    match std::fs::symlink_metadata(&marker) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => anyhow::bail!("reading .jj marker in {}: {e}", path.display()),
+    }
+    std::fs::metadata(&marker).map_err(|e| {
+        anyhow::anyhow!("resolving .jj marker in {}: {e}", path.display())
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -460,5 +647,301 @@ mod tests {
         assert!(!o.unique_leaf);
         assert!(!o.skip_fetch);
         assert!(o.worktree_path.is_none());
+    }
+
+    // ─── seeding and sharing flags ───────────────────────────────────────────
+
+    /// `--include-file` must reach the core as BYTES, and an empty file must
+    /// reach it as `Some([])` — not as `None`.
+    ///
+    /// `None` means "use the committed `.worktreeinclude`". Collapsing an empty
+    /// file into it would make `--include-file /dev/null` seed MORE than the
+    /// caller asked to exclude, which is the opposite of what the flag says.
+    #[test]
+    fn an_empty_include_file_is_a_selection_of_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("m.txt");
+        std::fs::write(&manifest, b"*.env\n").unwrap();
+        let empty = dir.path().join("empty.txt");
+        std::fs::write(&empty, b"").unwrap();
+
+        let a = parse_get(&[
+            "treehouse",
+            "get",
+            "--include-file",
+            manifest.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            a.acquire_options().unwrap().include_manifest,
+            Some(b"*.env\n".to_vec())
+        );
+
+        let a = parse_get(&[
+            "treehouse",
+            "get",
+            "--include-file",
+            empty.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            a.acquire_options().unwrap().include_manifest,
+            Some(Vec::new()),
+            "an empty manifest selects nothing; it must not fall back to the committed one"
+        );
+    }
+
+    /// No flag means "use the committed manifest", which is a DIFFERENT value
+    /// from an empty manifest and must stay distinguishable all the way down.
+    #[test]
+    fn no_include_file_leaves_the_manifest_unset() {
+        assert_eq!(
+            parse_get(&["treehouse", "get"]).acquire_options().unwrap().include_manifest,
+            None
+        );
+    }
+
+    /// The manifest is read during option building, so an unreadable path fails
+    /// before acquisition can reset the checkout holding it.
+    #[test]
+    fn an_unreadable_include_file_is_an_error_not_a_silent_empty_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = parse_get(&[
+            "treehouse",
+            "get",
+            "--include-file",
+            dir.path().join("nope.txt").to_str().unwrap(),
+        ]);
+        let err = a.acquire_options().expect_err("a missing manifest must fail");
+        assert!(
+            err.to_string().contains("failed to read include file"),
+            "got: {err}"
+        );
+    }
+
+    /// `off`/`fresh` are the only accepted values, and only `fresh` opts in.
+    /// Anything else is a typo the user needs told about, not a silent default.
+    #[test]
+    fn apfs_sharing_takes_only_off_or_fresh() {
+        let a = parse_get(&["treehouse", "get", "--apfs-sharing", "fresh"]);
+        assert!(a.acquire_options().unwrap().apfs_sharing);
+
+        let a = parse_get(&["treehouse", "get", "--apfs-sharing", "off"]);
+        assert!(!a.acquire_options().unwrap().apfs_sharing);
+
+        let a = parse_get(&["treehouse", "get", "--apfs-sharing", "sometimes"]);
+        let err = a.acquire_options().expect_err("a bogus mode must be refused");
+        assert!(
+            err.to_string().contains("use off or fresh"),
+            "got: {err}"
+        );
+
+        assert!(
+            !parse_get(&["treehouse", "get"])
+                .acquire_options()
+                .unwrap()
+                .apfs_sharing,
+            "sharing must be off unless someone asked for it"
+        );
+    }
+
+    /// Both new flags must survive into the lease path. `cmd_get` builds one
+    /// `AcquireOptions` through this one method for both modes, so a flag
+    /// resolved here cannot reach `get` while being dropped by `get --lease`.
+    /// The lease/TTL pair is attached by `cmd_get` afterwards, which is why this
+    /// asserts on the fields this method owns.
+    #[test]
+    fn the_seeding_and_sharing_flags_reach_the_lease_acquisition() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("m.txt");
+        std::fs::write(&manifest, b"*.env\n").unwrap();
+
+        let a = parse_get(&[
+            "treehouse",
+            "get",
+            "--lease",
+            "--lease-holder",
+            "ci",
+            "--include-file",
+            manifest.to_str().unwrap(),
+            "--apfs-sharing",
+            "fresh",
+        ]);
+        let o = a.acquire_options().expect("options must build");
+        assert!(a.lease, "the mode under test is the lease path");
+        assert_eq!(o.include_manifest, Some(b"*.env\n".to_vec()));
+        assert!(o.apfs_sharing);
+    }
+
+    // ─── M-020: `--branch` against the jj backend ───────────────────────────
+
+    /// A directory that looks like a jj workspace to the marker reader.
+    fn jj_workspace() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".jj")).unwrap();
+        dir
+    }
+
+    /// A jj workspace in its NORMAL shape: a `.jj` directory COLOCATED with a
+    /// git repository, which is what `jj git init` produces.
+    ///
+    /// This is the case a naive marker read gets wrong. `worktree_backend_name`
+    /// is git-first, so it answers `git` here and never looks at `.jj` — a
+    /// jj-only directory passes trivially and hides the bug. Every colocated
+    /// assertion below exists because that distinction was found by running the
+    /// real binary, not by reading the code.
+    fn colocated_jj_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::create_dir(dir.path().join(".jj")).unwrap();
+        dir
+    }
+
+    /// The case that actually broke: a real, colocated jj workspace with the
+    /// opt-in set must refuse. Reading the slot flavour instead of the selected
+    /// backend reports `git` for this layout and lets the flag through.
+    #[test]
+    fn branch_is_refused_in_a_colocated_jj_workspace() {
+        let dir = colocated_jj_repo();
+        let _env = VcsEnv::set("jj");
+        let err = require_git_backend_for_branch(dir.path(), Some("feat/x"))
+            .expect_err("a colocated jj workspace is still a jj workspace");
+        assert!(
+            err.to_string().contains("only supported by the git backend"),
+            "got: {err}"
+        );
+    }
+
+    /// The refusal itself, with the opt-in present in the environment.
+    ///
+    /// `TREEHOUSE_VCS` is process-global, and cargo runs every test in this
+    /// binary as a THREAD in one process — so setting it is not a private act.
+    /// Two tests that each set it raced, and the loser's assertion was decided
+    /// by the winner's value: `a_jj_marker_alone_does_not_refuse_branch` set it
+    /// to `""` and intermittently observed a `jj` another test had just set,
+    /// failing an assertion that is true. The guard alone cannot fix that,
+    /// because restoring a prior value is no help when another thread is
+    /// reading it at that instant.
+    ///
+    /// The lock is what makes the guard sufficient: every test that TOUCHES the
+    /// variable holds it for its whole body, so the set and the call it governs
+    /// are one atomic region against every other such test. Poisoning is
+    /// ignored deliberately — a panic inside one of these should report that one
+    /// failure, not cascade into "VCS env lock poisoned" across the rest.
+    static VCS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct VcsEnv {
+        prior: Option<String>,
+        // Held for the guard's lifetime; released on drop.
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl VcsEnv {
+        fn set(value: &str) -> VcsEnv {
+            let lock = VCS_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let prior = std::env::var(TREEHOUSE_VCS_VAR).ok();
+            // SAFETY: the lock makes this the only thread reading or writing the
+            // variable for as long as the guard lives.
+            unsafe { std::env::set_var(TREEHOUSE_VCS_VAR, value) };
+            VcsEnv {
+                prior,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for VcsEnv {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(v) => unsafe { std::env::set_var(TREEHOUSE_VCS_VAR, v) },
+                None => unsafe { std::env::remove_var(TREEHOUSE_VCS_VAR) },
+            }
+        }
+    }
+
+    #[test]
+    fn branch_is_refused_in_a_jj_workspace_that_selected_jj() {
+        let dir = jj_workspace();
+        let _env = VcsEnv::set("jj");
+        let err = require_git_backend_for_branch(dir.path(), Some("feat/x"))
+            .expect_err("a git branch cannot be created in a jj workspace");
+        assert!(
+            err.to_string().contains("only supported by the git backend"),
+            "got: {err}"
+        );
+    }
+
+    /// The opt-in matters: a `.jj` directory alone never selects jj, so a git
+    /// repository that merely sits beside one keeps `--branch`. Refusing here
+    /// would break an invocation that works today.
+    #[test]
+    fn a_jj_marker_alone_does_not_refuse_branch() {
+        let dir = jj_workspace();
+        let _env = VcsEnv::set("");
+        assert!(require_git_backend_for_branch(dir.path(), Some("feat/x")).is_ok());
+    }
+
+    /// jj selected, but the tree is a git repository. The opt-in without a
+    /// marker falls back to git (Go vcs.go:150-154), so `--branch` stands.
+    #[test]
+    fn jj_selected_without_a_jj_marker_still_allows_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = VcsEnv::set("jj");
+        assert!(require_git_backend_for_branch(dir.path(), Some("feat/x")).is_ok());
+    }
+
+    /// With no `--branch` there is nothing to refuse, whatever the backend.
+    #[test]
+    fn no_branch_means_no_refusal() {
+        let dir = jj_workspace();
+        let _env = VcsEnv::set("jj");
+        for branch in [None, Some("")] {
+            assert!(require_git_backend_for_branch(dir.path(), branch).is_ok());
+        }
+    }
+
+    /// A damaged marker must surface as an error, never as "not jj". The seam
+    /// separates unreadable from absent so a broken checkout is not silently
+    /// classified, and the refusal must not undo that.
+    #[test]
+    fn an_unreadable_jj_marker_is_an_error_not_a_yes() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("gone");
+        let link = dir.path().join(".jj");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&target, &link).unwrap();
+
+        let _env = VcsEnv::set("jj");
+        let err = require_git_backend_for_branch(dir.path(), Some("feat/x"))
+            .expect_err("an unreadable marker must not read as 'not jj'");
+        assert!(
+            err.to_string().contains(".jj marker"),
+            "got: {err}"
+        );
+    }
+
+    /// The backend name normaliser is Go's: only `git` and `jj` mean anything,
+    /// and a typo is silence rather than a fallback that could drag a jj
+    /// repository onto git.
+    #[test]
+    fn an_unknown_vcs_value_normalises_to_nothing() {
+        assert_eq!(normalize_vcs("git"), Some("git"));
+        assert_eq!(normalize_vcs("JJ"), Some("jj"));
+        assert_eq!(normalize_vcs(" jj "), Some("jj"));
+        for bogus in ["", "jjj", "git2", "j"] {
+            assert_eq!(normalize_vcs(bogus), None, "{bogus:?} must be unknown");
+        }
     }
 }

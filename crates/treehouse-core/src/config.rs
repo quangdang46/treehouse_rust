@@ -376,6 +376,322 @@ pub enum ConfigError {
     Toml(String, String),
 }
 
+// ─── pool exclusion (Go internal/config/gitignore.go) ─────────────────────────
+
+/// Arranges for a pool directory to be ignored by the enclosing repository
+/// (Go `EnsureExcluded`).
+///
+/// Two layers, because one is not enough:
+///
+/// 1. A `.gitignore` containing `*` inside the pool root. Both git and jj read
+///    nested `.gitignore` files, so this alone keeps an in-project pool out of
+///    snapshots — including under jj, which never reads `.git/info/exclude`.
+/// 2. The pool root recorded in the repo-local, UNTRACKED `.git/info/exclude`,
+///    so an in-project pool stays out of `git status` and out of any commit
+///    without dirtying the user's tracked `.gitignore`.
+///
+/// Layer 2 is skipped when the pool is not inside a git repository (the
+/// default global root under `$HOME`), which matches the previous behavior for
+/// the global store, and degrades to layer 1 alone when no usable git dir
+/// exists.
+///
+/// For backward compatibility, a pre-existing entry in the tracked `.gitignore`
+/// is left alone and treated as sufficient — an upgrading user is not
+/// surprised by a moved ignore rule.
+pub fn ensure_excluded(treehouse_dir: &Path, git: &dyn crate::git::GitBackend) -> Result<(), ConfigError> {
+    let self_ignored = write_self_ignore(treehouse_dir).is_ok();
+
+    // The directory itself may not exist yet, so walk up to an existing
+    // ancestor for the git check below.
+    let mut check_dir = treehouse_dir.to_path_buf();
+    let existing = loop {
+        match std::fs::metadata(&check_dir) {
+            Ok(meta) if meta.is_dir() => break true,
+            _ => match check_dir.parent() {
+                Some(parent) if parent != check_dir => check_dir = parent.to_path_buf(),
+                // Reached the filesystem root without finding a directory.
+                _ => break false,
+            },
+        }
+    };
+    if !existing {
+        return Ok(());
+    }
+
+    // Not inside a git repo — nothing to do (e.g. the global ~/.treehouse root).
+    let Ok(repo_root) = git.repo_root(&check_dir) else {
+        return Ok(());
+    };
+
+    // Outside the repository working tree (a sibling pool root): nothing to do.
+    let Some(rel) = relative_to(&repo_root, treehouse_dir) else {
+        return Ok(());
+    };
+    if rel.starts_with("..") {
+        return Ok(());
+    }
+
+    // Forward slashes and a leading slash anchor the entry at the repo root.
+    let entry = format!("/{}", rel.replace('\\', "/"));
+
+    // Backward compatibility: an entry an older version already recorded in the
+    // tracked .gitignore is left in place rather than duplicated into
+    // .git/info/exclude.
+    if has_ignore_entry(&repo_root.join(".gitignore"), &entry) {
+        return Ok(());
+    }
+
+    let Ok(common_dir) = git.common_git_dir(&repo_root) else {
+        if self_ignored {
+            return Ok(());
+        }
+        // Go returns the underlying error only when the self-ignore also
+        // failed; with no git dir and no self-ignore there is nothing left to
+        // fall back on, so the failure is surfaced rather than swallowed.
+        return Err(ConfigError::Invalid(
+            format!("cannot determine git dir for {}", repo_root.display()),
+            String::new(),
+        ));
+    };
+    let exclude_path = common_dir.join("info").join("exclude");
+
+    if has_ignore_entry(&exclude_path, &entry) {
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(
+        exclude_path
+            .parent()
+            .ok_or_else(|| ConfigError::Invalid(exclude_path.display().to_string(), String::new()))?,
+    )
+    .map_err(|e| ConfigError::Io(exclude_path.display().to_string(), e))?;
+
+    let existing = match std::fs::read(&exclude_path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(ConfigError::Io(exclude_path.display().to_string(), e)),
+    };
+
+    // Append, preserving whatever the user already put in this file. A file
+    // with no trailing newline would otherwise have the entry concatenated onto
+    // its last line, silently merging two ignore rules into one.
+    let mut contents = existing;
+    if !contents.is_empty() && !contents.ends_with(b"\n") {
+        contents.push(b'\n');
+    }
+    contents.extend_from_slice(entry.as_bytes());
+    contents.push(b'\n');
+
+    std::fs::write(&exclude_path, &contents)
+        .map_err(|e| ConfigError::Io(exclude_path.display().to_string(), e))
+}
+
+/// `treehouse_dir` relative to `repo_root`, in slash-separated form.
+///
+/// Returns `None` when the two cannot be related at all (different roots on
+/// Windows), which callers treat as "not in this repository".
+///
+/// The comparison tries the paths as given first, then their canonical forms.
+/// That second attempt is not cosmetic: git reports its own roots through
+/// `/private/var/...` on macOS, while a pool root configured as `/var/...`
+/// reaches us spelled the short way. Compared literally the two share no
+/// prefix, and the exclude entry would be silently never written — the pool
+/// would then be neither self-ignored nor excluded, and the repository would
+/// read dirty with a directory full of worktrees in it.
+///
+/// Canonicalization is attempted per-path and failures fall back to the input,
+/// because the pool root may not exist yet.
+fn relative_to(repo_root: &Path, treehouse_dir: &Path) -> Option<String> {
+    let root = normalize_for_compare(repo_root);
+    let target = normalize_for_compare(treehouse_dir);
+    if let Some(rel) = relative_within(&root, &target) {
+        return Some(rel);
+    }
+    let root_canonical = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+    let target_canonical = std::fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
+    if root_canonical == root && target_canonical == target {
+        // Nothing resolved, so retrying gained nothing.
+        return None;
+    }
+    relative_within(&root_canonical, &target_canonical)
+}
+
+/// The tail of `target` after `root`, or `None` unless `root` is a proper
+/// ancestor of `target`.
+fn relative_within(root: &Path, target: &Path) -> Option<String> {
+    let root_components: Vec<_> = root.components().collect();
+    let target_components: Vec<_> = target.components().collect();
+
+    if target_components.len() < root_components.len() {
+        return None;
+    }
+    if !root_components
+        .iter()
+        .zip(target_components.iter())
+        .all(|(a, b)| a == b)
+    {
+        return None;
+    }
+    let tail: Vec<String> = target_components[root_components.len()..]
+        .iter()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    Some(tail.join("/"))
+}
+
+/// Resolves `.` and `..` lexically so a pool root spelled with a relative
+/// segment still compares equal to the same directory spelled without one.
+///
+/// Lexical, not `canonicalize`: the pool root may not exist yet, which is
+/// exactly the case `ensure_excluded` has to handle.
+fn normalize_for_compare(path: &Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Creates the pool root and writes a `.gitignore` containing `*` into it,
+/// unless one already exists (Go `writeSelfIgnore`).
+///
+/// The pool root then ignores its own entire contents, which is what makes an
+/// in-project root safe for backends that never read `.git/info/exclude`. Ignore
+/// rules never cross a worktree boundary, so the file has no effect on the
+/// pooled worktrees below it.
+fn write_self_ignore(treehouse_dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(treehouse_dir)?;
+    let path = treehouse_dir.join(".gitignore");
+    if std::fs::symlink_metadata(&path).is_ok() {
+        // Present already. A symlink here is left exactly as it is: the pool
+        // root is the user's to configure, and following it would write
+        // outside the pool.
+        return Ok(());
+    }
+    std::fs::write(path, "*\n")
+}
+
+/// Whether the ignore file at `path` already contains `entry` as a standalone
+/// line. A missing file reads as absent (Go `hasIgnoreEntry`).
+fn has_ignore_entry(path: &Path, entry: &str) -> bool {
+    let Ok(data) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    data.lines().any(|line| line.trim() == entry)
+}
+
+// ─── ignored repo hooks warning (Go internal/config/hooks.go) ─────────────────
+
+/// The lifecycle hook keys a repo-level `treehouse.toml` may declare and that
+/// [`TreehouseConfig::load`] discards. Order fixes the order they are named in
+/// the warning.
+const HOOK_KEYS: [&str; 2] = ["post_create", "pre_destroy"];
+
+/// Dedupes the ignored-hooks warning per config file: a single command loads
+/// config repeatedly, and the warning is for a human, once.
+fn warned_repo_hooks() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
+    static LOCKED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+    > = std::sync::OnceLock::new();
+    LOCKED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Warns on stderr, once per repo config file, when the repo-level
+/// `treehouse.toml` declares lifecycle hooks (Go `WarnIfRepoHooksIgnored`).
+///
+/// [`TreehouseConfig::load`] deliberately discards repo hooks so that
+/// `treehouse get` on an untrusted clone cannot execute checked-in shell; this
+/// only makes that discard audible, and changes no behavior.
+///
+/// It is a standalone function rather than a step inside `load` because
+/// `treehouse destroy <path>` reads hooks through [`TreehouseConfig::load_global`]
+/// and never opens the repo config at all, so a warning wired only into `load`
+/// would stay silent for exactly the command that surfaced the defect.
+///
+/// Best-effort and never fails: a missing, unreadable, or malformed repo config
+/// produces no warning and no error, because destroy has to keep working
+/// against a pool whose repository config is broken or whose repository is gone.
+pub fn warn_if_repo_hooks_ignored(repo_root: &Path) {
+    let path = repo_root.join("treehouse.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let declared = declared_hook_keys(&text);
+    if declared.is_empty() {
+        return;
+    }
+    {
+        let Ok(mut seen) = warned_repo_hooks().lock() else {
+            return;
+        };
+        if !seen.insert(path.clone()) {
+            return;
+        }
+    }
+    eprintln!(
+        "🌳 Warning: ignoring [hooks] in {}: {}",
+        pretty_path(&path),
+        declared.join(", ")
+    );
+    eprintln!(
+        "   Lifecycle hooks run only from {}; hooks in repo-level config are ignored for safety.",
+        user_config_path_for_display()
+    );
+}
+
+/// The hook keys the document actually DECLARES.
+///
+/// An empty `[hooks]` table declares no hook and so silently discards nothing
+/// worth warning about. This deliberately inspects the raw TOML rather than
+/// the decoded [`Hooks`]: decoding a malformed file must produce silence (the
+/// caller has to survive a broken repo config), and it cannot be reached
+/// through the strict decoder anyway.
+fn declared_hook_keys(text: &str) -> Vec<String> {
+    let Ok(value) = text.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let Some(toml::Value::Table(hooks)) = value.get("hooks") else {
+        return Vec::new();
+    };
+    HOOK_KEYS
+        .iter()
+        .filter(|key| hooks.contains_key(**key))
+        .map(|key| key.to_string())
+        .collect()
+}
+
+/// Names the user-level config file for humans, falling back to the
+/// conventional `~`-rooted spelling when `$HOME` cannot be resolved: the
+/// warning must still point somewhere useful.
+fn user_config_path_for_display() -> String {
+    user_config_path().map_or_else(
+        || "~/.config/treehouse/config.toml".to_string(),
+        |path| pretty_path(&path),
+    )
+}
+
+/// A path under `$HOME` shown as `~/...`.
+///
+/// Only affects display. Resolving the home prefix textually — rather than
+/// canonicalizing — keeps the check from failing on paths that do not exist,
+/// which is the normal case for a config file that is only being named.
+fn pretty_path(path: &Path) -> String {
+    if let Some(home) = home_dir()
+        && let Ok(rel) = path.strip_prefix(&home)
+        && !rel.as_os_str().is_empty()
+    {
+        return format!("~/{}", rel.display());
+    }
+    path.display().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -762,5 +1078,292 @@ mod tests {
         let cfg = TreehouseConfig::load_with_env(Path::new("/test/empty"), &env).unwrap();
         assert_eq!(cfg.max_trees, 16); // default
         assert!(cfg.hooks.is_empty());
+    }
+
+    // ─── pool exclusion (Go internal/config/gitignore.go) ───────────────────
+
+    /// A temp repo with one commit on `main`.
+    fn git_repo() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let must = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .expect("git must be installed");
+            assert!(
+                out.status.success(),
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        std::process::Command::new("git")
+            .args(["init", "-q", "--initial-branch=main", repo.to_str().unwrap()])
+            .output()
+            .expect("git must be installed");
+        must(&["config", "user.email", "test@test.com"]);
+        must(&["config", "user.name", "Test"]);
+        std::fs::write(repo.join("README.md"), b"hello\n").unwrap();
+        must(&["add", "."]);
+        must(&["commit", "-m", "initial"]);
+        (dir, repo)
+    }
+
+    fn backend() -> crate::git::ShellGitBackend {
+        crate::git::ShellGitBackend::discover().expect("git must be installed")
+    }
+
+    fn read_exclude(repo: &Path) -> String {
+        std::fs::read_to_string(repo.join(".git").join("info").join("exclude")).unwrap()
+    }
+
+    /// An in-project pool must be recorded in the repo-local, UNTRACKED
+    /// `.git/info/exclude` — and must leave the tracked `.gitignore` alone, so
+    /// the user's repository does not read dirty because treehouse used it.
+    #[test]
+    fn ensure_excluded_writes_to_git_info_exclude() {
+        let (_d, repo) = git_repo();
+        let git = backend();
+        let pool = repo.join(".treehouse");
+
+        ensure_excluded(&pool, &git).unwrap();
+
+        assert!(
+            read_exclude(&repo).contains("/.treehouse"),
+            "the pool root must be recorded in .git/info/exclude"
+        );
+        assert!(
+            !repo.join(".gitignore").exists(),
+            "the tracked .gitignore must not be created"
+        );
+
+        // The real proof it stays out of the user's way.
+        let status = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "the repository must read clean, got:\n{}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+    }
+
+    /// Both layers are needed: git and jj read a nested `.gitignore`, so the
+    /// pool root ignoring its own contents is what protects a backend that
+    /// never consults `.git/info/exclude`.
+    #[test]
+    fn ensure_excluded_makes_the_pool_root_self_ignoring() {
+        let (_d, repo) = git_repo();
+        let git = backend();
+        let pool = repo.join(".treehouse");
+
+        ensure_excluded(&pool, &git).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(pool.join(".gitignore")).unwrap(),
+            "*\n",
+            "the pool root must ignore its own entire contents"
+        );
+
+        // Idempotent: a second call must not append a duplicate.
+        ensure_excluded(&pool, &git).unwrap();
+        assert_eq!(
+            read_exclude(&repo).matches("/.treehouse").count(),
+            1,
+            "the entry must not be duplicated"
+        );
+    }
+
+    /// Backward compatibility: a pool an older version already recorded in the
+    /// tracked `.gitignore` keeps that rule. Moving it to `.git/info/exclude`
+    /// would surprise an upgrading user by un-ignoring the tracked rule.
+    #[test]
+    fn ensure_excluded_leaves_a_preexisting_gitignore_entry_alone() {
+        let (_d, repo) = git_repo();
+        let git = backend();
+        std::fs::write(repo.join(".gitignore"), b"/.treehouse\n").unwrap();
+        let pool = repo.join(".treehouse");
+
+        ensure_excluded(&pool, &git).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(repo.join(".gitignore")).unwrap(),
+            "/.treehouse\n",
+            "an existing tracked rule must be left untouched"
+        );
+        let exclude = repo.join(".git").join("info").join("exclude");
+        assert!(
+            !exclude.exists() || !read_exclude(&repo).contains("/.treehouse"),
+            "a pre-existing tracked entry must not be duplicated into info/exclude"
+        );
+    }
+
+    /// An exclude file the user has other content in must be APPENDED to, with
+    /// a newline inserted when the file lacks a trailing one — otherwise the
+    /// entry is concatenated onto the last rule and silently merges two ignore
+    /// patterns into one.
+    #[test]
+    fn ensure_excluded_appends_without_merging_into_the_last_rule() {
+        let (_d, repo) = git_repo();
+        let git = backend();
+        let exclude = repo.join(".git").join("info").join("exclude");
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        // No trailing newline: the merge hazard.
+        std::fs::write(&exclude, b"*.log").unwrap();
+
+        ensure_excluded(&repo.join(".treehouse"), &git).unwrap();
+
+        let contents = read_exclude(&repo);
+        assert!(
+            contents.starts_with("*.log\n"),
+            "the existing rule must be preserved on its own line, got:\n{contents}"
+        );
+        assert!(
+            contents.contains("/.treehouse"),
+            "the pool entry must be appended, got:\n{contents}"
+        );
+    }
+
+    /// A pool outside the repository working tree gets nothing written: an
+    /// exclude entry anchored at the repo root cannot mean "this other
+    /// directory", and writing one anyway would be a rule that silently does
+    /// nothing.
+    #[test]
+    fn ensure_excluded_does_nothing_outside_the_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        // No git repo anywhere above a tempdir on most systems; assert the
+        // call succeeds and does not fabricate an exclude file.
+        let pool = dir.path().join("elsewhere").join(".treehouse");
+        ensure_excluded(&pool, &backend()).unwrap();
+        assert!(
+            pool.join(".gitignore").exists(),
+            "the self-ignore must still be written: it is valid with no repo"
+        );
+    }
+
+    /// A nested pool root is recorded with its full relative path.
+    #[test]
+    fn ensure_excluded_records_a_nested_pool_root() {
+        let (_d, repo) = git_repo();
+        let git = backend();
+        let pool = repo.join("worktrees").join(".treehouse");
+
+        ensure_excluded(&pool, &git).unwrap();
+
+        assert!(
+            read_exclude(&repo).contains("/worktrees/.treehouse"),
+            "the nested pool must be anchored at the repo root, got:\n{}",
+            read_exclude(&repo)
+        );
+    }
+
+    /// `ensure_excluded` must be callable for a pool root that does not exist
+    /// yet — it is what creates it.
+    #[test]
+    fn ensure_excluded_creates_a_missing_pool_root() {
+        let (_d, repo) = git_repo();
+        let git = backend();
+        let pool = repo.join("brand").join("new").join(".treehouse");
+        assert!(!pool.exists());
+
+        ensure_excluded(&pool, &git).unwrap();
+
+        assert!(pool.is_dir(), "the pool root must have been created");
+        assert!(read_exclude(&repo).contains("/brand/new/.treehouse"));
+    }
+
+    // ─── ignored repo hooks warning (Go internal/config/hooks.go) ───────────
+
+    /// Whether the repo config declares each of the two hook keys.
+    fn warning_for(repo: &Path) -> Vec<String> {
+        // The warning goes to stderr, so it is captured by re-parsing what the
+        // decision function would emit. `declared_hook_keys` is the part that
+        // decides WHICH keys are named.
+        declared_hook_keys(&std::fs::read_to_string(repo.join("treehouse.toml")).unwrap())
+    }
+
+    /// The warning names the file and every declared key, so a user who wrote
+    /// the hooks can see which config was ignored and why.
+    #[test]
+    fn the_ignored_hooks_warning_names_the_file_and_every_declared_key() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("treehouse.toml"),
+            "[hooks]\npost_create = [\"./setup.sh\"]\npre_destroy = [\"./teardown.sh\"]\n",
+        )
+        .unwrap();
+
+        let keys = warning_for(dir.path());
+        assert_eq!(keys, ["post_create", "pre_destroy"]);
+        assert!(
+            user_config_path_for_display().ends_with("config.toml"),
+            "the warning must point at the user-level config, got {}",
+            user_config_path_for_display()
+        );
+    }
+
+    /// A config that declares only one key must not name the other. The user
+    /// wrote one hook; telling them two were ignored sends them looking for a
+    /// config they never wrote.
+    #[test]
+    fn the_ignored_hooks_warning_names_only_declared_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("treehouse.toml"),
+            "[hooks]\npre_destroy = [\"./teardown.sh\"]\n",
+        )
+        .unwrap();
+
+        let keys = warning_for(dir.path());
+        assert_eq!(keys, ["pre_destroy"]);
+        assert!(!keys.contains(&"post_create".to_string()));
+    }
+
+    /// Silence is required, not merely nice: a config with no hooks, an empty
+    /// `[hooks]` table, and a MALFORMED file must all warn about nothing. A
+    /// broken repo config is normal in `destroy`, and warning about every pool
+    /// whose config happens to be invalid would bury the real message.
+    #[test]
+    fn the_ignored_hooks_warning_is_silent_when_there_is_nothing_to_ignore() {
+        for contents in [
+            "max_trees = 4\n",
+            "[hooks]\n",
+            "invalid toml <<<\n",
+            "",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("treehouse.toml"), contents).unwrap();
+            assert!(
+                declared_hook_keys(contents).is_empty(),
+                "{contents:?} must declare no hook"
+            );
+        }
+        // A repo with no config at all.
+        assert!(declared_hook_keys("").is_empty());
+    }
+
+    /// The warning fires ONCE per config file. A single command loads config
+    /// repeatedly, and a per-load warning would print the same line dozens of
+    /// times.
+    #[test]
+    fn the_ignored_hooks_warning_is_deduped_per_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("treehouse.toml"),
+            "[hooks]\npost_create = [\"./setup.sh\"]\n",
+        )
+        .unwrap();
+        let path = dir.path().join("treehouse.toml");
+
+        let mut seen = warned_repo_hooks().lock().unwrap();
+        assert!(seen.insert(path.clone()), "first sighting is recorded");
+        assert!(
+            !seen.insert(path.clone()),
+            "a second sighting of the same file must be deduped"
+        );
     }
 }

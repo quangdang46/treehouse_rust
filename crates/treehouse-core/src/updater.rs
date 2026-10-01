@@ -289,7 +289,9 @@ const DOWNLOAD_TIMEOUT_SECS: &str = "300";
 const ASSET_PREFIX: &str = "treehouse-v";
 
 /// Per-asset checksum sidecar published next to every release asset
-/// (release.yml:94,99).
+/// (release.yml:94,99). Note that the workflow strips the container extension
+/// before appending it — see [`checksum_sidecar_names`], which accepts both that
+/// spelling and the extension-retained one.
 const CHECKSUM_SUFFIX: &str = ".sha256";
 
 /// Go's aggregate checksum manifest (`updater.go:29`). The Rust release
@@ -421,10 +423,80 @@ pub fn matches_current_platform_asset(name: &str) -> bool {
     )
 }
 
-/// The checksum file that covers `archive_name`: this workflow's per-asset
-/// sidecar, or Go's aggregate manifest if a release ships one instead.
+/// Container extensions a release asset can carry.
+///
+/// Only `.tar.gz` and `.zip` are ever written by `release.yml`; the rest are
+/// here so a hand-uploaded asset does not silently lose its sidecar match just
+/// because its container is spelled differently. Ordered longest-first: `.gz`
+/// would otherwise strip the wrong end of `.tar.gz`.
+const ARCHIVE_EXTS: &[&str] = &[".tar.gz", ".tar.xz", ".tgz", ".txz", ".zip", ".gz", ".xz"];
+
+/// `name` without its container extension, or `None` if it has none.
+///
+/// The length guard keeps a bare `.gz` (or a name that is nothing but an
+/// extension) from stripping to an empty stem, which would make every
+/// `<stem>.sha256` name match.
+fn strip_archive_ext(name: &str) -> Option<&str> {
+    ARCHIVE_EXTS
+        .iter()
+        .find(|ext| name.len() > ext.len() && name.ends_with(**ext))
+        .map(|ext| &name[..name.len() - ext.len()])
+}
+
+/// Every sidecar name that could carry the hash for `archive_name`, most
+/// specific first.
+///
+/// Two spellings exist in the wild and both have to resolve:
+///
+/// - `treehouse-v0.2.0-macos-x86_64.tar.gz.sha256` — the conventional form,
+///   the archive's own name with `.sha256` appended.
+/// - `treehouse-v0.2.0-macos-x86_64.sha256` — the container extension stripped
+///   *first*. This is what `.github/workflows/release.yml` writes
+///   (`printf … > "treehouse-${TAG}-${{ matrix.suffix }}.sha256"`), and it is
+///   what every release published so far carries.
+///
+/// Accepting only the first spelling was the defect that made `treehouse
+/// update` fail on every platform: the workflow never published a file the
+/// updater was willing to look at, so `check_latest_result` resolved a
+/// `checksum_url` of `None` and `apply` refused to run. The updater is the
+/// tolerant side on purpose — matching the stripped spelling costs nothing and
+/// means no existing release has to be re-uploaded.
+///
+/// `every_published_asset_has_a_sidecar_the_updater_accepts` (in the
+/// `release_workflow_contract` test module) ties this list back to the workflow
+/// so the two cannot drift apart again.
+fn checksum_sidecar_names(archive_name: &str) -> Vec<String> {
+    let mut names = vec![format!("{archive_name}{CHECKSUM_SUFFIX}")];
+    if let Some(stem) = strip_archive_ext(archive_name) {
+        let stripped = format!("{stem}{CHECKSUM_SUFFIX}");
+        if !names.contains(&stripped) {
+            names.push(stripped);
+        }
+    }
+    names
+}
+
+/// How good a match `candidate` is as the checksum file for `archive_name`:
+/// `None` when it is not one at all, otherwise a lower-is-better rank.
+///
+/// A rank rather than a bare bool because a release carrying both spellings has
+/// to resolve the same way on every run. The per-asset sidecars rank in
+/// [`checksum_sidecar_names`] order — most specific first — and Go's aggregate
+/// manifest ranks last, behind everything, because it is the only candidate
+/// that covers more than this one archive.
+fn checksum_rank(archive_name: &str, candidate: &str) -> Option<usize> {
+    let names = checksum_sidecar_names(archive_name);
+    names
+        .iter()
+        .position(|name| name == candidate)
+        .or_else(|| (candidate == AGGREGATE_CHECKSUM_FILE).then_some(names.len()))
+}
+
+/// Whether `candidate` is a checksum file covering `archive_name`: one of this
+/// release's per-asset sidecars ([`checksum_sidecar_names`]), or Go's aggregate
+/// manifest if a release ships one instead.
 fn is_checksum_for(archive_name: &str, candidate: &str) -> bool {
-    candidate == format!("{archive_name}{CHECKSUM_SUFFIX}") || candidate == AGGREGATE_CHECKSUM_FILE
+    checksum_rank(archive_name, candidate).is_some()
 }
 
 // ─── Version check with assets ────────────────────────────────────────────────
@@ -450,10 +522,15 @@ pub fn check_latest_result(
         .find(|a| matches_current_platform_asset(&a.name));
 
     let checksum_url = archive.and_then(|archive| {
+        // Every candidate is vetted by `is_checksum_for` and then ordered by
+        // `checksum_rank`, so a release that somehow carries both sidecar
+        // spellings resolves the same way on every run rather than in whatever
+        // order GitHub happened to return the assets in.
         release
             .assets
             .iter()
-            .find(|c| is_checksum_for(&archive.name, &c.name))
+            .filter(|c| is_checksum_for(&archive.name, &c.name))
+            .min_by_key(|c| checksum_rank(&archive.name, &c.name))
             .map(|c| c.browser_download_url.clone())
     });
 
@@ -1802,5 +1879,335 @@ mod tests {
     fn check_latest_result_rejects_plain_http() {
         let err = check_latest_result("http://insecure.example", "1.0.0", true).unwrap_err();
         assert!(matches!(err, UpdateError::InsecureUrl(_)), "got {err:?}");
+    }
+}
+
+// ─── release-workflow contract ────────────────────────────────────────────────
+//
+// `.github/workflows/release.yml` decides the names of the assets we download;
+// this module decides which of those names we will accept. Nothing in the type
+// system joins them, so the only thing that has ever stopped them drifting
+// apart is a test that reads the real workflow. This is that test.
+//
+// It reads the YAML as TEXT and parses the `tar -czf "…"`, `7z a "…"` and
+// `printf … > "….sha256"` lines out of it, rather than restating the naming as
+// a hardcoded fixture. A fixture would still be green after someone renamed an
+// asset in the workflow, which is precisely the bug this exists to catch.
+//
+// `#[cfg(test)]` because none of it is reachable from production — the parser
+// exists to read a file that only a test has any business reading.
+#[cfg(test)]
+mod release_workflow_contract {
+    use super::*;
+
+    //
+    // `.github/workflows/release.yml` decides the names of the assets we download;
+    // this module decides which of those names we will accept. Nothing in the type
+    // system joins them, so the only thing that has ever stopped them drifting
+    // apart is a test that reads the real workflow. This is that test.
+    //
+    // It reads the YAML as TEXT and parses the `tar -czf "…"`, `7z a "…"` and
+    // `printf … > "….sha256"` lines out of it, rather than restating the naming as
+    // a hardcoded fixture. A fixture would still be green after someone renamed an
+    // asset in the workflow, which is precisely the bug this exists to catch.
+
+    /// The release workflow as it actually exists in this repository.
+    ///
+    /// `include_str!` rather than a runtime read so a workflow that fails to parse
+    /// (or a path that moves) breaks the build instead of the release, and so the
+    /// checked-in copy is exactly the file that runs.
+    const RELEASE_WORKFLOW: &str = include_str!("../../../.github/workflows/release.yml");
+
+    /// The tag used to expand a template. [`is_checksum_for`] is a pure string
+    /// comparison, so the test is about the SHAPE of the asset name; any version
+    /// that looks like the ones we tag releases with does.
+    const SAMPLE_TAG: &str = "v0.2.0";
+
+    /// Expands the two shell variables the workflow's Package step uses.
+    ///
+    /// `$TAG`/`${TAG}` and `${{ matrix.suffix }}` are the only substitutions in the
+    /// asset names. A template containing anything else would be left with its
+    /// placeholders intact, so [`every_published_asset_has_a_sidecar_the_updater_accepts`]
+    /// would fail loudly rather than compare two unexpanded strings for equality.
+    fn expand(template: &str, suffix: &str) -> String {
+        template
+            .replace("${TAG}", SAMPLE_TAG)
+            .replace("$TAG", SAMPLE_TAG)
+            .replace("${{ matrix.suffix }}", suffix)
+            .replace("${matrix.suffix}", suffix)
+    }
+
+    /// The first `"…"` token on `line`, if the line starts with `marker`.
+    fn first_quoted_after<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
+        let rest = line.trim().strip_prefix(marker)?;
+        let rest = rest.strip_prefix('"')?;
+        let end = rest.find('"')?;
+        Some(&rest[..end])
+    }
+
+    /// Every `suffix:` value in the build matrix — `linux-x86_64`, `windows-x86_64`,
+    /// … The job's `name:` line also mentions `matrix.suffix`, but not in the
+    /// `suffix: value` form this looks for.
+    fn matrix_suffixes() -> Vec<String> {
+        RELEASE_WORKFLOW
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("suffix:"))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect()
+    }
+
+    /// Splits a matrix suffix into the `(os, arch)` the updater matches on, plus the
+    /// archive container that platform ships.
+    fn split_suffix(suffix: &str) -> (&str, &str, &str) {
+        let (os, arch) = suffix
+            .rsplit_once('-')
+            .unwrap_or_else(|| panic!("matrix suffix {suffix:?} is not '<os>-<arch>'"));
+        let ext = if os == "windows" { "zip" } else { "tar.gz" };
+        (os, arch, ext)
+    }
+
+    /// The archive filenames the Package step creates: `tar -czf "NAME"` on unix,
+    /// `7z a "NAME"` on Windows.
+    fn archive_templates() -> Vec<&'static str> {
+        RELEASE_WORKFLOW
+            .lines()
+            .filter_map(|line| {
+                first_quoted_after(line, "tar -czf ").or_else(|| first_quoted_after(line, "7z a "))
+            })
+            .collect()
+    }
+
+    /// The archive filename the workflow builds for `suffix`, read out of the
+    /// Package step's `case`.
+    ///
+    /// Both templates sit in the same `case` statement, but only one arm runs per
+    /// platform: `$BIN_NAME` ends in `.exe` exactly when the matrix suffix is a
+    /// `windows-*` one (release.yml:73-75), and that arm packages a zip. Pairing
+    /// every template with every suffix would assert against asset names the
+    /// workflow never publishes.
+    fn archive_for_suffix(suffix: &str) -> String {
+        let (_, _, ext) = split_suffix(suffix);
+        let template = archive_templates()
+            .into_iter()
+            .find(|template| template.ends_with(ext))
+            .unwrap_or_else(|| panic!("release.yml publishes no {ext} archive"));
+        expand(template, suffix)
+    }
+
+    /// The checksum filenames the Package step writes: the right-hand side of a
+    /// `printf … > "NAME.sha256"` redirect.
+    ///
+    /// Scoped to `.sha256` on purpose. An aggregate `checksums.txt` written by the
+    /// workflow would be the Go manifest, which [`is_checksum_for`] already accepts
+    /// unconditionally; what has to be tied to the workflow is the per-asset sidecar,
+    /// because that is the name the two halves used to disagree about.
+    fn sidecar_templates() -> Vec<&'static str> {
+        RELEASE_WORKFLOW
+            .lines()
+            .filter_map(|line| line.rsplit_once('>').map(|(_, rhs)| rhs.trim()))
+            .filter(|rhs| rhs.starts_with('"') && rhs.ends_with(".sha256\""))
+            .map(|rhs| &rhs[1..rhs.len() - 1])
+            .collect()
+    }
+
+    /// The heart of the contract: for every (platform, archive) pair the workflow
+    /// publishes, the sidecar the workflow will emit must be one the updater
+    /// accepts — and every platform must actually be covered.
+    ///
+    /// This is the test that fails if either side moves alone. Narrow
+    /// [`is_checksum_for`] back to the extension-retained spelling and it fails on
+    /// the stripped form the workflow writes; rename an asset in the workflow and
+    /// it fails on the coverage assertion.
+    #[test]
+    fn every_published_asset_has_a_sidecar_the_updater_accepts() {
+        let suffixes = matrix_suffixes();
+        let archives = archive_templates();
+        let sidecars = sidecar_templates();
+
+        // A parser that silently matches nothing would make every assertion below
+        // vacuous and the test permanently green. Refuse to run in that state.
+        assert!(
+            !suffixes.is_empty(),
+            "parsed no matrix suffixes out of release.yml — the parser is broken"
+        );
+        assert!(
+            !archives.is_empty(),
+            "parsed no archive names out of release.yml — the parser is broken"
+        );
+        assert!(
+            !sidecars.is_empty(),
+            "parsed no `printf … > \"….sha256\"` lines out of release.yml — the parser \
+         is broken"
+        );
+
+        for suffix in &suffixes {
+            let sidecars: Vec<String> = sidecars.iter().map(|name| expand(name, suffix)).collect();
+            let archive = archive_for_suffix(suffix);
+            assert!(
+                sidecars
+                    .iter()
+                    .any(|sidecar| is_checksum_for(&archive, sidecar)),
+                "release.yml publishes `{archive}` and writes {sidecars:?}, none of which \
+             is_checksum_for accepts for it"
+            );
+        }
+    }
+
+    /// The other half of the contract, and the one the workflow cannot check for
+    /// itself: the updater has to be able to FIND each asset. A sidecar name is
+    /// useless if the archive selector rejects the archive next to it.
+    #[test]
+    fn the_updater_can_select_every_archive_the_workflow_publishes() {
+        for suffix in matrix_suffixes() {
+            let (os, arch, ext) = split_suffix(&suffix);
+            let name = archive_for_suffix(&suffix);
+            assert!(
+                matches_asset(&name, os, arch, ext),
+                "release.yml publishes `{name}` for {os}/{arch}, which matches_asset \
+             rejects — `treehouse update` would never find it"
+            );
+        }
+    }
+
+    /// A sidecar that passed [`matches_asset`] would be downloaded *as* the binary
+    /// and unpacked as one, so the archive selector has to reject every name the
+    /// workflow hands it.
+    ///
+    /// Checked per platform rather than only for the running one: this is the same
+    /// string-vs-string comparison on every machine, and a Linux CI run is the only
+    /// place the Windows asset's spelling gets exercised here.
+    #[test]
+    fn no_sidecar_the_workflow_writes_can_be_mistaken_for_an_archive() {
+        for suffix in matrix_suffixes() {
+            let (os, arch, ext) = split_suffix(&suffix);
+            for template in sidecar_templates() {
+                let name = expand(template, &suffix);
+                assert!(
+                    !matches_asset(&name, os, arch, ext),
+                    "sidecar `{name}` matches the {os}/{arch} archive selector"
+                );
+            }
+        }
+    }
+
+    /// The specific mismatch this module was written for, spelled out so a future
+    /// reader does not have to reconstruct it from a diff: the workflow drops the
+    /// container extension, the updater used to keep it, and no release had both.
+    #[test]
+    fn is_checksum_for_accepts_both_sidecar_spellings() {
+        let archive = "treehouse-v0.2.0-macos-aarch64.tar.gz";
+        // What release.yml's Package step writes for the above archive.
+        assert!(is_checksum_for(
+            archive,
+            "treehouse-v0.2.0-macos-aarch64.sha256"
+        ));
+        // The conventional spelling, kept working for hand-uploaded releases.
+        assert!(is_checksum_for(
+            archive,
+            "treehouse-v0.2.0-macos-aarch64.tar.gz.sha256"
+        ));
+        // Go's aggregate manifest.
+        assert!(is_checksum_for(archive, AGGREGATE_CHECKSUM_FILE));
+        // The Windows container behaves the same way.
+        assert!(is_checksum_for(
+            "treehouse-v0.2.0-windows-x86_64.zip",
+            "treehouse-v0.2.0-windows-x86_64.sha256"
+        ));
+
+        // Fail closed on everything else: another platform's sidecar, the archive
+        // itself, a near-miss extension, and an empty name. A wrong checksum file
+        // that "looks close enough" would either fail the update on a valid release
+        // or — worse — verify against the wrong hash.
+        assert!(!is_checksum_for(
+            archive,
+            "treehouse-v0.2.0-linux-x86_64.sha256"
+        ));
+        assert!(!is_checksum_for(archive, archive));
+        assert!(!is_checksum_for(
+            archive,
+            "treehouse-v0.2.0-macos-aarch64.sha256.txt"
+        ));
+        assert!(!is_checksum_for(archive, ""));
+    }
+
+    /// Ordering is part of the contract: a release carrying both spellings must
+    /// resolve the same way on every run rather than in API order.
+    #[test]
+    fn the_exact_spelling_is_preferred_over_the_stripped_one() {
+        let names = checksum_sidecar_names("treehouse-v0.2.0-macos-aarch64.tar.gz");
+        assert_eq!(
+            names,
+            vec![
+                "treehouse-v0.2.0-macos-aarch64.tar.gz.sha256",
+                "treehouse-v0.2.0-macos-aarch64.sha256",
+            ]
+        );
+    }
+
+    /// `strip_archive_ext` must not strip a bare extension down to nothing, which
+    /// would make `<empty>.sha256` a match for every asset.
+    #[test]
+    fn strip_archive_ext_refuses_a_name_that_is_only_an_extension() {
+        assert_eq!(strip_archive_ext(".sha256"), None);
+        assert_eq!(strip_archive_ext(".gz"), None);
+        assert_eq!(strip_archive_ext("treehouse.tar.gz"), Some("treehouse"));
+        assert_eq!(strip_archive_ext("treehouse.zip"), Some("treehouse"));
+        assert_eq!(strip_archive_ext("treehouse"), None);
+    }
+
+    /// End-to-end over the names the workflow really publishes: the release JSON is
+    /// built from `expand`ed workflow templates, so this exercises the whole
+    /// lookup — archive selection, sidecar selection, and the `CheckResult` the CLI
+    /// hands to `apply` — with no name written by hand.
+    #[test]
+    fn check_latest_result_finds_the_workflows_own_sidecar_name() {
+        let suffix = format!(
+            "{}-{}",
+            if cfg!(target_os = "macos") {
+                "macos"
+            } else {
+                std::env::consts::OS
+            },
+            std::env::consts::ARCH
+        );
+        let asset = archive_for_suffix(&suffix);
+        let sidecar = expand(
+            sidecar_templates()
+                .first()
+                .expect("release.yml must write a per-asset sidecar"),
+            &suffix,
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(&asset), b"archive bytes").unwrap();
+        // The sidecar's CONTENTS are also the workflow's: `printf '%s  %s\n' <hash>
+        // <archive>` — the full archive name, extension included.
+        std::fs::write(
+            dir.path().join(&sidecar),
+            format!("{}  {asset}\n", "a".repeat(64)),
+        )
+        .unwrap();
+        let body = format!(
+            r#"{{"tag_name":"{SAMPLE_TAG}","assets":[
+             {{"name":"{asset}","browser_download_url":"file://{archive}"}},
+             {{"name":"{sidecar}","browser_download_url":"file://{sidecar_path}"}}]}}"#,
+            archive = dir.path().join(&asset).display(),
+            sidecar_path = dir.path().join(&sidecar).display(),
+        );
+        let api = dir.path().join("latest.json");
+        std::fs::write(&api, body).unwrap();
+
+        let result = check_latest_result(&format!("file://{}", api.display()), "0.0.1", false)
+            .expect("the release fixture must resolve");
+
+        assert_eq!(result.asset_name.as_deref(), Some(asset.as_str()));
+        assert_eq!(
+            result.checksum_url.as_deref(),
+            Some(format!("file://{}", dir.path().join(&sidecar).display()).as_str()),
+            "`treehouse update` needs a checksum URL; the workflow's stripped sidecar \
+         name must resolve to one"
+        );
+        assert!(result.update_available, "{SAMPLE_TAG} is newer than 0.0.1");
     }
 }

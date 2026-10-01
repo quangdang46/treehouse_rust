@@ -208,6 +208,52 @@ impl ShellGitBackend {
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
+
+    /// Runs git and returns RAW stdout bytes (never lossy-converted).
+    ///
+    /// Needed wherever git's output is a protocol rather than text: the
+    /// NUL-separated records of `ls-files -z`, and the blob of a committed
+    /// manifest. `String::from_utf8_lossy` would replace a non-UTF-8 byte with
+    /// U+FFFD, and a path that survives that substitution is a path the copy
+    /// then cannot open — or worse, one that names a DIFFERENT file than the
+    /// one git selected.
+    fn run_bytes(&self, cwd: Option<&Path>, args: &[&str]) -> Result<Vec<u8>, GitError> {
+        self.run_bytes_os(cwd, args.iter().map(|s| OsString::from(*s)).collect())
+    }
+
+    /// [`Self::run_bytes`] for an argument list carrying a caller-supplied path
+    /// (the temporary `--exclude-from` file is written from a manifest, so its
+    /// path is not a compile-time literal).
+    fn run_bytes_os(&self, cwd: Option<&Path>, args: Vec<OsString>) -> Result<Vec<u8>, GitError> {
+        let command = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let output = self.run_os(cwd, args);
+        if !output.status.success() {
+            let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(GitError::new(format!("git {command}"), message, GitErrorKind::Other));
+        }
+        Ok(output.stdout)
+    }
+}
+
+/// Splits git's NUL-separated record output into owned paths.
+///
+/// A trailing NUL is the record terminator, not an empty final record; a
+/// missing one (empty output) yields no records at all rather than one empty
+/// path that would later be validated and rejected.
+fn split_nul(bytes: &[u8]) -> Vec<String> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    let body = bytes.strip_suffix(&[0]).unwrap_or(bytes);
+    String::from_utf8_lossy(body)
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// Shared exit-code check: success is `Ok`, anything else is the stderr text
@@ -312,6 +358,212 @@ fn run_one(git_bin: &Path, cwd: Option<&Path>, args: &[&str]) -> Result<String, 
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The committed seed manifest's filename (Go `worktreeIncludeName`).
+const WORKTREE_INCLUDE: &str = ".worktreeinclude";
+
+impl ShellGitBackend {
+    /// Reads the blob of `.worktreeinclude` at the destination worktree's HEAD.
+    ///
+    /// Only the COMMITTED blob is read, never a working-tree file: the manifest
+    /// decides which of the user's ignored files get copied into a new
+    /// checkout, and a repo that is dirty or mid-merge must not be able to widen
+    /// that selection with an uncommitted edit. A missing file is a no-op, not
+    /// an error — most repos do not seed at all.
+    fn committed_worktree_include(&self, worktree: &Path) -> Result<Option<Vec<u8>>, GitError> {
+    let listed = self.run_bytes(
+        Some(worktree),
+        &[
+            "ls-tree",
+            "-z",
+            "--name-only",
+            "--full-tree",
+            "HEAD",
+            "--",
+            WORKTREE_INCLUDE,
+        ],
+    )?;
+    if !split_nul(&listed).iter().any(|n| n == WORKTREE_INCLUDE) {
+        return Ok(None);
+    }
+    // A tree entry of the same name (a directory, say) must not be read as a
+    // manifest: `cat-file blob` would fail with a confusing message, and
+    // treating the failure as "no manifest" would hide a real misconfiguration.
+    let spec = format!("HEAD:{WORKTREE_INCLUDE}");
+    let kind = self.run_stdout(
+        Some(worktree),
+        &["cat-file", "-t", &spec],
+        GitErrorKind::Other,
+    )?;
+    if kind.trim() != "blob" {
+        return Err(GitError::new(
+            format!("git cat-file -t {spec}"),
+            format!("committed {WORKTREE_INCLUDE} is not a file"),
+            GitErrorKind::Other,
+        ));
+    }
+    Ok(Some(self.run_bytes(
+        Some(worktree),
+        &["cat-file", "blob", &spec],
+    )?))
+}
+
+    /// The ignored paths a manifest selects in `repo` (Go `selectedSeedPathsWithManifestEnv`).
+    ///
+    /// Git itself evaluates the pattern language, by handing the manifest to
+    /// `ls-files` as an exclude file. Reimplementing gitignore matching in Rust
+    /// would silently diverge on negation, escaping, and `**`, and the divergence
+    /// would show up as "the wrong files got copied" — so the patterns are given
+    /// to the tool that owns them.
+    ///
+    /// The second `ls-files` pass is the security-relevant one: it intersects
+    /// the manifest's selections with the paths the repository ACTUALLY ignores.
+    /// A manifest that names a tracked file selects nothing, so
+    /// `.worktreeinclude` can never be used to smuggle a tracked file's content
+    /// into a worktree.
+    fn selected_seed_paths(
+        &self,
+        repo_root: &Path,
+        manifest: &[u8],
+    ) -> Result<Vec<String>, GitError> {
+    // The temp file must live and be written before `ls-files` reads it, and
+    // must not outlive the call: it holds repository-selection content in a
+    // predictable path, so it is removed on every path out.
+    let exclude = tempfile::NamedTempFile::new().map_err(|e| {
+        GitError::new(
+            "git ls-files --exclude-from",
+            format!("creating temporary exclude file: {e}"),
+            GitErrorKind::Other,
+        )
+    })?;
+    std::fs::write(exclude.path(), manifest).map_err(|e| {
+        GitError::new(
+            "git ls-files --exclude-from",
+            format!("writing temporary exclude file: {e}"),
+            GitErrorKind::Other,
+        )
+    })?;
+
+    let exclude_from = format!("--exclude-from={}", exclude.path().display());
+    let selected = self.run_bytes(
+        Some(repo_root),
+        &["ls-files", "-z", "--others", "--ignored", &exclude_from],
+    )?;
+    if selected.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let ignored = self.run_bytes(
+        Some(repo_root),
+        &[
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+        ],
+    )?;
+    let ignored: std::collections::HashSet<String> = split_nul(&ignored).into_iter().collect();
+
+    Ok(split_nul(&selected)
+        .into_iter()
+        .filter(|name| ignored.contains(name))
+        .collect())
+    }
+}
+
+/// Whether the destination worktree tracks `name` or anything at or beneath it.
+///
+/// Checked in the DESTINATION, not the source: the worktree may be cut from a
+/// different commit than the source repo's current checkout, so the source's
+/// index says nothing about what this worktree already has. A seed must never
+/// overwrite tracked content — that is a working-tree edit dressed up as a copy.
+fn destination_tracks(tracked: &[String], name: &str) -> bool {
+    if tracked.iter().any(|t| t == name) {
+        return true;
+    }
+    // A tracked DESCENDANT counts: the manifest selected a directory-shaped
+    // pattern, and something inside it is tracked at the destination.
+    let prefix = format!("{name}/");
+    if tracked.iter().any(|t| t.starts_with(&prefix)) {
+        return true;
+    }
+    // So does a tracked ANCESTOR: `config` is not itself listed, but
+    // `config/settings.env` is, and seeding a file over it would clobber it.
+    let mut ancestor = name;
+    while let Some((head, _)) = ancestor.rsplit_once('/') {
+        if tracked.iter().any(|t| t == head) {
+            return true;
+        }
+        ancestor = head;
+    }
+    false
+}
+
+/// Creates `worktree/rel`'s parent directories, refusing to replace a file.
+///
+/// A seed whose ancestor exists as a regular file is refused rather than
+/// removed: the alternative is deleting something the user (or git) put there
+/// to make room for a copy.
+fn ensure_seed_parent_dir(worktree: &Path, rel: &str) -> Result<(), GitError> {
+    let Some((parent, _)) = rel.rsplit_once('/') else {
+        return Ok(()); // Top-level seed: the worktree root is its parent.
+    };
+    let mut current = worktree.to_path_buf();
+    for part in parent.split('/') {
+        current.push(part);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.is_dir() => continue,
+            Ok(_) => {
+                return Err(GitError::new(
+                    "seed worktree",
+                    format!("refusing to replace existing seed ancestor {}", current.display()),
+                    GitErrorKind::Other,
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current).map_err(|e| {
+                    GitError::new(
+                        "seed worktree",
+                        format!("creating {}: {e}", current.display()),
+                        GitErrorKind::Other,
+                    )
+                })?;
+            }
+            Err(e) => {
+                return Err(GitError::new(
+                    "seed worktree",
+                    format!("reading {}: {e}", current.display()),
+                    GitErrorKind::Other,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a worktree path that is not a plain directory.
+///
+/// Seeded content is written BELOW this path, so a symlinked destination would
+/// redirect every write outside the pool — into the user's real repository, or
+/// anywhere else the link points.
+fn require_plain_worktree_dir(worktree: &Path) -> Result<(), GitError> {
+    let meta = std::fs::symlink_metadata(worktree).map_err(|e| {
+        GitError::new(
+            "seed worktree",
+            format!("reading worktree {}: {e}", worktree.display()),
+            GitErrorKind::Other,
+        )
+    })?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(GitError::new(
+            "seed worktree",
+            format!("refusing to seed symlinked worktree {}", worktree.display()),
+            GitErrorKind::Other,
+        ));
+    }
+    Ok(())
 }
 
 impl GitBackend for ShellGitBackend {
@@ -663,6 +915,237 @@ impl GitBackend for ShellGitBackend {
             _ => remote,
         }
     }
+
+    fn common_git_dir(&self, start: &Path) -> Result<PathBuf, GitError> {
+        // --path-format=absolute lands on Git ≥2.31. Older git rejects the
+        // flag outright, so the fallback is a second invocation rather than a
+        // parse of its stderr: a relative answer is then resolved against
+        // `start`, which is where git resolved it from.
+        let out = match self.run_stdout(
+            Some(start),
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            GitErrorKind::Other,
+        ) {
+            Ok(out) => out,
+            Err(_) => self.run_stdout(
+                Some(start),
+                &["rev-parse", "--git-common-dir"],
+                GitErrorKind::Other,
+            )?,
+        };
+        let path = PathBuf::from(out.trim());
+        if path.is_absolute() {
+            Ok(path)
+        } else {
+            Ok(start.join(path))
+        }
+    }
+
+    fn seed_worktree(
+        &self,
+        repo: &GitRepo,
+        worktree: &Path,
+        manifest: Option<&[u8]>,
+    ) -> Result<Vec<String>, GitError> {
+        // The destination is validated BEFORE anything is read or written. A
+        // symlinked worktree would redirect every seeded write outside the pool,
+        // and running git inside it first would resolve that link and report
+        // whatever repository it points at — an error message that names the
+        // wrong problem for the operator who has to fix it.
+        require_plain_worktree_dir(worktree)?;
+
+        // `None` selects the committed manifest; `Some` REPLACES it. An empty
+        // `Some` is therefore "seed nothing" and must not fall back — a caller
+        // that computed an empty selection means it, and reading the committed
+        // manifest instead would copy files the caller excluded.
+        let manifest: Vec<u8> = match manifest {
+            Some(bytes) => bytes.to_vec(),
+            None => self.committed_worktree_include(worktree)?.unwrap_or_default(),
+        };
+        if manifest.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let selected = self.selected_seed_paths(&repo.common_dir, &manifest)?;
+        if selected.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // What the DESTINATION already tracks, which seeding must not touch.
+        let tracked = split_nul(&self.run_bytes(Some(worktree), &["ls-files", "-z"])?);
+        let selected: Vec<String> = selected
+            .into_iter()
+            .filter(|name| !destination_tracks(&tracked, name))
+            .collect();
+        if selected.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut copied: Vec<String> = Vec::new();
+        for name in selected {
+            let source = repo.common_dir.join(&name);
+            let meta = std::fs::symlink_metadata(&source).map_err(|e| {
+                GitError::new(
+                    "seed worktree",
+                    format!("reading {}: {e}", source.display()),
+                    GitErrorKind::Other,
+                )
+            })?;
+
+            // A symlink is FLATTENED into a regular file holding its target,
+            // rather than recreated as a link. Copying the link would put a
+            // dangling or escaping reference into the worktree; copying the
+            // target text keeps the seed data-only, with nothing to follow.
+            let (data, mode) = if meta.file_type().is_symlink() {
+                let target = std::fs::read_link(&source).map_err(|e| {
+                    GitError::new(
+                        "seed worktree",
+                        format!("reading link {}: {e}", source.display()),
+                        GitErrorKind::Other,
+                    )
+                })?;
+                (target.to_string_lossy().into_owned().into_bytes(), 0o666)
+            } else if meta.is_file() {
+                (
+                    std::fs::read(&source).map_err(|e| {
+                        GitError::new(
+                            "seed worktree",
+                            format!("reading {}: {e}", source.display()),
+                            GitErrorKind::Other,
+                        )
+                    })?,
+                    mode_of(&meta),
+                )
+            } else {
+                // Directories and special files are not seeds. `ls-files`
+                // lists files, so this is unreachable in practice; skipping is
+                // the safe reading of anything unexpected.
+                continue;
+            };
+
+            ensure_seed_parent_dir(worktree, &name)?;
+
+            let dest = worktree.join(&name);
+            // create_new == O_EXCL: never clobber a file that appeared between
+            // the selection and this write.
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&dest)
+                .map_err(|e| {
+                    GitError::new(
+                        "seed worktree",
+                        format!("creating {}: {e}", dest.display()),
+                        GitErrorKind::Other,
+                    )
+                })?;
+            // Recorded BEFORE the write completes: a path that exists belongs
+            // in the cleanup inventory even if writing it then fails, or the
+            // next reset would leave an unrecorded file behind forever.
+            copied.push(name.clone());
+            std::io::Write::write_all(&mut file, &data).map_err(|e| {
+                GitError::new(
+                    "seed worktree",
+                    format!("writing {}: {e}", dest.display()),
+                    GitErrorKind::Other,
+                )
+            })?;
+            drop(file);
+            set_mode(&dest, mode).map_err(|e| {
+                GitError::new(
+                    "seed worktree",
+                    format!("setting mode on {}: {e}", dest.display()),
+                    GitErrorKind::Other,
+                )
+            })?;
+        }
+        Ok(copied)
+    }
+
+    fn reset_worktree_with_seeded_paths(
+        &self,
+        worktree: &Path,
+        branch: &str,
+        seeded: &[String],
+    ) -> Result<(), GitError> {
+        // The inventory is validated BEFORE anything else happens, including
+        // before the reset itself. An empty or malformed inventory must
+        // authorize zero deletions — it means the caller lost its bookkeeping,
+        // and treating that as "delete nothing silently" would leave the
+        // reset looking successful while the pool's own seeds accumulate.
+        crate::vcs::validate_seed_inventory(seeded)?;
+        require_worktree_marker(worktree)?;
+        require_plain_worktree_dir(worktree)?;
+
+        // Seeds are removed FIRST, while the worktree is still known to be the
+        // one that was checked, and BEFORE the tracked tree is rewritten: a
+        // tracked path can only appear at a seeded path after `read-tree -u`
+        // restores it, and that ordering is what makes the inventory the
+        // authority on what may be deleted.
+        for name in seeded {
+            let target = worktree.join(name);
+            match std::fs::symlink_metadata(&target) {
+                Ok(meta) if meta.is_dir() => {
+                    std::fs::remove_dir_all(&target).map_err(|e| {
+                        GitError::new(
+                            "reset worktree",
+                            format!("removing seeded directory {}: {e}", target.display()),
+                            GitErrorKind::Other,
+                        )
+                    })?;
+                }
+                Ok(_) => {
+                    std::fs::remove_file(&target).map_err(|e| {
+                        GitError::new(
+                            "reset worktree",
+                            format!("removing seeded file {}: {e}", target.display()),
+                            GitErrorKind::Other,
+                        )
+                    })?;
+                }
+                // Already gone: nothing to remove, and NOT a failure. The
+                // inventory is a permission to delete, not an obligation.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(GitError::new(
+                        "reset worktree",
+                        format!("reading seeded path {}: {e}", target.display()),
+                        GitErrorKind::Other,
+                    ));
+                }
+            }
+        }
+
+        self.reset_worktree(worktree, branch)
+    }
+}
+
+/// The permission bits of a metadata value (Go `info.Mode().Perm()`).
+#[cfg(unix)]
+fn mode_of(meta: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o777
+}
+
+#[cfg(not(unix))]
+fn mode_of(_meta: &std::fs::Metadata) -> u32 {
+    0o644
+}
+
+/// Applies permission bits, a no-op where the platform has none.
+///
+/// Best effort by design: a seed that copied correctly but could not be
+/// chmod'ed is still a usable seed, and failing the whole acquisition over it
+/// would leave the worktree half-seeded.
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: u32) -> std::io::Result<()> {
+    Ok(())
 }
 
 impl ShellGitBackend {
@@ -991,6 +1474,498 @@ mod tests {
             err.message.contains("refusing to modify"),
             "got: {}",
             err.message
+        );
+    }
+
+    // ── .worktreeinclude seeding ─────────────────────────────────────────────
+
+    /// A repo with a committed `.gitignore` (`*`, so everything is ignored) and
+    /// a committed `.worktreeinclude` manifest, plus a detached worktree.
+    /// Returns `(TempDir, repo, worktree)`; the manifest is `""` for none.
+    fn seed_repo(manifest: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let worktree = dir.path().join("worktree");
+        must_git(
+            None,
+            &["init", "--initial-branch=main", repo.to_str().unwrap()],
+        );
+        must_git(Some(&repo), &["config", "user.email", "test@test.com"]);
+        must_git(Some(&repo), &["config", "user.name", "Test"]);
+        std::fs::write(repo.join(".gitignore"), b"*\n").unwrap();
+        std::fs::write(repo.join(".worktreeinclude"), manifest.as_bytes()).unwrap();
+        // -f: the manifest is itself ignored by `.gitignore` containing `*`,
+        // and it still has to be committed — it is the one file seeding reads
+        // from the OBJECT store, never the working tree.
+        must_git(Some(&repo), &["add", "-f", ".gitignore", ".worktreeinclude"]);
+        must_git(Some(&repo), &["commit", "-m", "seed manifest"]);
+        must_git(
+            Some(&repo),
+            &["worktree", "add", "--detach", worktree.to_str().unwrap()],
+        );
+        (dir, repo, worktree)
+    }
+
+    /// Writes `contents` to `root/name`, creating parent directories.
+    fn write_under(root: &Path, name: &str, contents: &str) {
+        let path = root.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    /// The end-to-end shape: seed a worktree, then reset it with the recorded
+    /// inventory, and prove both halves of the contract.
+    ///
+    /// The last assertion is the one that matters. `clean -fd` does not remove
+    /// IGNORED files, so a reset would leave the seed behind whether or not the
+    /// inventory did anything — and a naive implementation that simply ran the
+    /// reset would pass the first check while never actually cleaning anything.
+    /// The user-placed file is the mirror image: it must survive because it is
+    /// not in the inventory, and it would also survive a correct implementation.
+    /// Together they pin that the deletion is driven by the inventory and by
+    /// nothing else.
+    #[test]
+    fn integration_seed_then_reset_removes_only_the_recorded_seeds() {
+        let (_dir, repo, worktree) = seed_repo("*.env\n");
+        let backend = ShellGitBackend::discover().unwrap();
+        let repo_ref = GitRepo {
+            common_dir: repo.clone(),
+            worktree: None,
+        };
+
+        // An ignored file the manifest selects, and one it does not.
+        write_under(&repo, ".env", "SECRET=1\n");
+        write_under(&repo, "notes.txt", "not selected\n");
+
+        let seeded = backend
+            .seed_worktree(&repo_ref, &worktree, None)
+            .expect("seeding a committed manifest must succeed");
+
+        assert_eq!(
+            seeded,
+            vec![".env".to_string()],
+            "the inventory must record exactly what was copied"
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.join(".env")).unwrap(),
+            "SECRET=1\n",
+            "the selected ignored file must be seeded"
+        );
+        assert!(
+            !worktree.join("notes.txt").exists(),
+            "a file the manifest does not select must not be seeded"
+        );
+
+        // A file the USER put in the worktree after acquisition. Ignored, and
+        // matched by the same `*.env` pattern, but never in the inventory.
+        write_under(&worktree, "user.env", "MINE=1\n");
+
+        backend
+            .reset_worktree_with_seeded_paths(&worktree, "main", &seeded)
+            .expect("reset with a trusted inventory must succeed");
+
+        assert!(
+            !worktree.join(".env").exists(),
+            "the recorded seed must be removed by the reset"
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("user.env")).unwrap(),
+            "MINE=1\n",
+            "an ignored file the user placed must SURVIVE: the inventory is a \
+             permission to delete specific paths, never a licence to sweep \
+             ignored files"
+        );
+    }
+
+    /// An inventory that is absent, or one naming a path outside the worktree,
+    /// must authorize ZERO deletions. This is the fail-closed property the
+    /// whole design turns on: a lost or tampered state file must never become
+    /// "delete the user's ignored files".
+    #[test]
+    fn integration_reset_refuses_an_untrustworthy_inventory() {
+        let (_dir, repo, worktree) = seed_repo("*.env\n");
+        let backend = ShellGitBackend::discover().unwrap();
+        let repo_ref = GitRepo {
+            common_dir: repo.clone(),
+            worktree: None,
+        };
+        write_under(&repo, ".env", "SECRET=1\n");
+        let seeded = backend.seed_worktree(&repo_ref, &worktree, None).unwrap();
+        assert_eq!(seeded, vec![".env".to_string()]);
+        // A second ignored file that is NOT in the inventory.
+        write_under(&worktree, "user.env", "MINE=1\n");
+
+        for bad in [
+            vec![],                              // lost bookkeeping
+            vec!["".to_string()],                // empty component
+            vec!["../escape.env".to_string()],   // climbs out of the worktree
+            vec!["/etc/passwd".to_string()],     // absolute
+            vec![".git/config".to_string()],     // the repository's own metadata
+            vec!["nested/../../out".to_string()], // traversal mid-path
+        ] {
+            backend
+                .reset_worktree_with_seeded_paths(&worktree, "main", &bad)
+                .expect_err("an untrustworthy inventory must be refused");
+            assert!(
+                worktree.join("user.env").exists() && worktree.join(".env").exists(),
+                "a refused reset must delete nothing, got inventory {bad:?}"
+            );
+        }
+    }
+
+    /// Git owns the manifest's pattern language. These are the cases a
+    /// hand-rolled matcher gets wrong, so they are pinned against git itself.
+    #[test]
+    fn integration_seed_honours_git_exclude_semantics() {
+        for (manifest, want, unwanted) in [
+            // Negation: a later pattern re-includes a file.
+            ("*.env\n!important.env\n", vec!["app.env"], vec!["important.env"]),
+            // Anchored: `/` binds to the repo root.
+            ("/root.env\n", vec!["root.env"], vec!["nested/root.env"]),
+            // `**` spanning directories.
+            (
+                "build/**/cache/*.json\n",
+                vec!["build/cache/a.json", "build/one/two/cache/b.json"],
+                vec!["build/one/data.json"],
+            ),
+            // Comments and spaces are part of the pattern language.
+            (
+                "# a comment\nname with space\n",
+                vec!["name with space"],
+                vec!["a comment"],
+            ),
+        ] {
+            let (_dir, repo, worktree) = seed_repo(manifest);
+            let backend = ShellGitBackend::discover().unwrap();
+            let repo_ref = GitRepo {
+                common_dir: repo.clone(),
+                worktree: None,
+            };
+            for name in want.iter().chain(unwanted.iter()) {
+                write_under(&repo, name, "seeded\n");
+            }
+
+            let seeded = backend
+                .seed_worktree(&repo_ref, &worktree, None)
+                .unwrap_or_else(|e| panic!("seeding {manifest:?} failed: {e}"));
+
+            for name in &want {
+                assert!(
+                    worktree.join(name).exists(),
+                    "{manifest:?} must select {name}"
+                );
+            }
+            for name in &unwanted {
+                assert!(
+                    !worktree.join(name).exists(),
+                    "{manifest:?} must NOT select {name}"
+                );
+            }
+            // The inventory is the record of what was written, so it must match
+            // what actually landed on disk.
+            for name in &want {
+                assert!(
+                    seeded.iter().any(|p| p == name),
+                    "{name} must appear in the returned inventory for {manifest:?}"
+                );
+            }
+        }
+    }
+
+    /// A TRACKED file named by the manifest must not be seeded. Source ignore
+    /// rules say nothing about the destination's index, and the destination may
+    /// be cut from a different commit — so a manifest that names a tracked path
+    /// selects nothing rather than overwriting it.
+    #[test]
+    fn integration_seed_never_overwrites_tracked_content() {
+        let (_dir, repo, worktree) = seed_repo("*.env\n");
+        let backend = ShellGitBackend::discover().unwrap();
+        let repo_ref = GitRepo {
+            common_dir: repo.clone(),
+            worktree: None,
+        };
+
+        // Tracked files the manifest would otherwise select: one named exactly,
+        // one beneath a selected path. `-f` because `.gitignore` is `*`.
+        write_under(&repo, "config/settings.env", "COMMITTED\n");
+        write_under(&repo, "loose.env", "COMMITTED\n");
+        must_git(Some(&repo), &["add", "-f", "config/settings.env", "loose.env"]);
+        must_git(Some(&repo), &["commit", "-m", "tracked"]);
+
+        // Change the SOURCE copy of the tracked file without committing it. If
+        // seeding copies from the working tree, this newer content lands in the
+        // worktree and the assertion below catches it.
+        write_under(&repo, "loose.env", "SOURCE-DIRTIED\n");
+
+        // Re-cut the worktree at the new HEAD, so the destination index is what
+        // decides what seeding may not touch. A DIFFERENT commit is the point:
+        // source ignore rules say nothing about the destination's index.
+        must_git(
+            Some(&repo),
+            &["worktree", "remove", "--force", worktree.to_str().unwrap()],
+        );
+        must_git(
+            Some(&repo),
+            &["worktree", "add", "--detach", worktree.to_str().unwrap()],
+        );
+
+        // A genuinely ignored file, so the test distinguishes "seeded nothing
+        // at all" from "skipped exactly the tracked ones".
+        write_under(&repo, "real.env", "IGNORED\n");
+
+        let seeded = backend
+            .seed_worktree(&repo_ref, &worktree, None)
+            .expect("seeding must succeed");
+
+        // The tracked files DO exist in the worktree — git checked them out. What
+        // must not have happened is a copy over the top of them, so the
+        // assertion is on content: seeding writes the SOURCE's bytes, and
+        // these two differ between source and committed content below.
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("loose.env")).unwrap(),
+            "COMMITTED\n",
+            "a tracked file the manifest names must keep its committed content"
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("config/settings.env")).unwrap(),
+            "COMMITTED\n",
+            "a tracked file beneath a selected path must keep its committed content"
+        );
+        assert!(
+            worktree.join("real.env").exists(),
+            "a genuinely ignored file must still be seeded"
+        );
+        assert!(
+            !seeded.iter().any(|p| p == "loose.env" || p == "config/settings.env"),
+            "tracked paths must not reach the inventory, got {seeded:?}"
+        );
+    }
+
+    /// No committed manifest, an empty one, and an explicit empty override must
+    /// all seed nothing — and an explicit override must not fall back to the
+    /// committed manifest, or a caller that computed "select nothing" would get
+    /// the repository's selections instead.
+    #[test]
+    fn integration_seed_is_a_no_op_without_a_manifest() {
+        let (_dir, repo, worktree) = seed_repo("*.env\n");
+        let backend = ShellGitBackend::discover().unwrap();
+        let repo_ref = GitRepo {
+            common_dir: repo.clone(),
+            worktree: None,
+        };
+        write_under(&repo, ".env", "SECRET=1\n");
+
+        // An explicit EMPTY override selects nothing even though the committed
+        // manifest would select `.env`.
+        assert!(
+            backend
+                .seed_worktree(&repo_ref, &worktree, Some(b""))
+                .unwrap()
+                .is_empty(),
+            "an explicitly empty manifest must select nothing, not fall back"
+        );
+        assert!(
+            !worktree.join(".env").exists(),
+            "an empty override must not fall back to the committed manifest"
+        );
+
+        // A manifest that is present but empty commits the same no-op.
+        assert!(
+            backend
+                .seed_worktree(&repo_ref, &worktree, Some(b"*.env\n"))
+                .unwrap()
+                .contains(&".env".to_string())
+        );
+
+        // A repo with no `.worktreeinclude` at all seeds nothing and does not
+        // error — most repos do not seed.
+        let (_d2, repo2, worktree2) = seed_repo("");
+        must_git(Some(&repo2), &["rm", "--cached", "-f", ".worktreeinclude"]);
+        must_git(Some(&repo2), &["commit", "-m", "drop manifest"]);
+        write_under(&repo2, ".env", "SECRET=1\n");
+        let repo_ref2 = GitRepo {
+            common_dir: repo2.clone(),
+            worktree: None,
+        };
+        let backend2 = ShellGitBackend::discover().unwrap();
+        // The destination worktree was cut before the manifest was dropped, so
+        // rebuild it to read the current HEAD.
+        must_git(Some(&repo2), &["worktree", "remove", "--force", worktree2.to_str().unwrap()]);
+        must_git(
+            Some(&repo2),
+            &["worktree", "add", "--detach", worktree2.to_str().unwrap()],
+        );
+        assert!(
+            backend2
+                .seed_worktree(&repo_ref2, &worktree2, None)
+                .unwrap()
+                .is_empty(),
+            "a repo with no committed manifest must seed nothing"
+        );
+    }
+
+    /// The manifest is read from the committed blob only. An uncommitted edit to
+    /// `.worktreeinclude` must not widen what gets copied into a worktree —
+    /// that would let a dirty or mid-merge repo select files the commit never
+    /// authorized.
+    #[test]
+    fn integration_seed_ignores_an_uncommitted_manifest() {
+        let (_dir, repo, worktree) = seed_repo("");
+        let backend = ShellGitBackend::discover().unwrap();
+        let repo_ref = GitRepo {
+            common_dir: repo.clone(),
+            worktree: None,
+        };
+        write_under(&repo, ".env", "SECRET=1\n");
+        // Uncommitted: selects `.env`, but was never committed.
+        std::fs::write(repo.join(".worktreeinclude"), b"*.env\n").unwrap();
+
+        assert!(
+            backend
+                .seed_worktree(&repo_ref, &worktree, None)
+                .unwrap()
+                .is_empty(),
+            "an uncommitted .worktreeinclude must not authorize any seed"
+        );
+        assert!(
+            !worktree.join(".env").exists(),
+            "the uncommitted manifest must not have been honored"
+        );
+    }
+
+    /// Seeding writes below `worktree`, so a SYMLINKED destination would
+    /// redirect every copy outside the pool — into the user's real repository,
+    /// or anywhere else the link points.
+    #[test]
+    #[cfg(unix)]
+    fn integration_seed_refuses_a_symlinked_worktree() {
+        let (_dir, repo, worktree) = seed_repo("*.env\n");
+        let backend = ShellGitBackend::discover().unwrap();
+        let repo_ref = GitRepo {
+            common_dir: repo.clone(),
+            worktree: None,
+        };
+        write_under(&repo, ".env", "SECRET=1\n");
+
+        // Replace the worktree with a symlink to a directory OUTSIDE the pool.
+        // `worktree remove` already deletes the directory, so nothing is left
+        // to remove — only the path to re-point at the link.
+        let elsewhere = tempfile::tempdir().unwrap();
+        must_git(
+            Some(&repo),
+            &["worktree", "remove", "--force", worktree.to_str().unwrap()],
+        );
+        std::os::unix::fs::symlink(elsewhere.path(), &worktree).unwrap();
+
+        let err = backend
+            .seed_worktree(&repo_ref, &worktree, None)
+            .expect_err("a symlinked worktree must be refused");
+        assert!(
+            err.message.contains("symlinked worktree"),
+            "the refusal must say why, got: {}",
+            err.message
+        );
+        assert!(
+            !elsewhere.path().join(".env").exists(),
+            "no seed may be written through a symlinked worktree"
+        );
+    }
+
+    /// `--git-common-dir` is where the repo-local, untracked `.git/info/exclude`
+    /// lives, and an in-project pool is recorded there.
+    #[test]
+    fn integration_common_git_dir_resolves_the_info_directory() {
+        let (_dir, repo) = temp_repo();
+        let backend = ShellGitBackend::discover().unwrap();
+        let common = backend.common_git_dir(&repo).unwrap();
+        assert!(
+            common.join("info").is_absolute(),
+            "the git dir must be absolute, got {}",
+            common.display()
+        );
+        // For a linked worktree it is the MAIN repo's git dir, not the
+        // worktree's private one — that is what makes one exclude file cover
+        // every worktree in the pool.
+        let wt = repo.join("wt");
+        must_git(
+            Some(&repo),
+            &["worktree", "add", "--detach", wt.to_str().unwrap(), "main"],
+        );
+        let from_worktree = backend.common_git_dir(&wt).unwrap();
+        assert_eq!(
+            from_worktree, common,
+            "a linked worktree must resolve to the owning repository's git dir"
+        );
+    }
+
+    /// The inventory [`GitBackend::seed_worktree`] returns must survive a round
+    /// trip through the pool state file, because it is the ONLY record of what
+    /// a later reset is allowed to delete. A build that drops it on write turns
+    /// every subsequent reset into either a refusal (inventory lost) or, worse,
+    /// an unrecorded set of files nothing will ever clean up.
+    ///
+    /// The fields are carried in `WorktreeEntry::extra` today (there are no
+    /// typed `seeded_paths` fields yet), so this also pins that the flatten map
+    /// keeps working for the one field whose absence would be silent.
+    #[test]
+    fn integration_seeded_inventory_round_trips_through_the_state_file() {
+        use crate::state::{State, WorktreeEntry};
+
+        let (_dir, repo, worktree) = seed_repo("*.env\n");
+        let backend = ShellGitBackend::discover().unwrap();
+        let repo_ref = GitRepo {
+            common_dir: repo.clone(),
+            worktree: None,
+        };
+        write_under(&repo, ".env", "SECRET=1\n");
+
+        let seeded = backend.seed_worktree(&repo_ref, &worktree, None).unwrap();
+        assert_eq!(seeded, vec![".env".to_string()]);
+
+        // Record the inventory the way an acquisition would, then write the
+        // whole state file out and read it back.
+        let mut entry = WorktreeEntry {
+            name: "1".to_string(),
+            path: worktree.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        entry.extra.insert(
+            "seeded_paths".to_string(),
+            serde_json::to_value(&seeded).unwrap(),
+        );
+        entry.extra.insert("seed_inventory_known".to_string(), true.into());
+        let state = State {
+            worktrees: vec![entry],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains(r#""seeded_paths":[".env"]"#),
+            "the inventory must reach the state file, got: {json}"
+        );
+
+        let read_back: State = serde_json::from_str(&json).unwrap();
+        let recovered: Vec<String> = serde_json::from_value(
+            read_back.worktrees[0].extra["seeded_paths"].clone(),
+        )
+        .expect("seeded_paths must read back as a path list");
+        assert_eq!(
+            recovered, seeded,
+            "an inventory that changes across a state write would either \
+             refuse a legitimate reset or delete the wrong path"
+        );
+
+        // And the recovered inventory still authorizes exactly the seeded file:
+        // a user-placed ignored file added after the write is untouched.
+        write_under(&worktree, "user.env", "MINE=1\n");
+        backend
+            .reset_worktree_with_seeded_paths(&worktree, "main", &recovered)
+            .expect("the recovered inventory must still authorize the reset");
+        assert!(!worktree.join(".env").exists(), "the seed must be removed");
+        assert!(
+            worktree.join("user.env").exists(),
+            "a user-placed ignored file must still survive a reset driven by \
+             the RECOVERED inventory"
         );
     }
 }
