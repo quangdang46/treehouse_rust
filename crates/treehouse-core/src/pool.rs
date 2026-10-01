@@ -3521,16 +3521,22 @@ mod tests {
         // what makes it "another clone's" rather than merely "unverifiable",
         // which is the distinction the test below asserts.
         let gitdir = std::fs::read_to_string(acquired.path.join(".git")).unwrap();
-        // Git writes this pointer with forward slashes on EVERY platform, while
-        // `clone_a` is a Rust path spelled with the platform separator — on
-        // Windows the two name the same directory and differ only in `\`.
-        // Compare what they name, not how they are spelled (same normalization
-        // as the main_repo_root round-trip test in git/shell.rs).
-        let norm = |p: &str| p.replace('\\', "/");
-        let clone_a_spelled = norm(clone_a.to_str().unwrap());
+        // Git writes this pointer with forward slashes on EVERY platform, and on a
+        // Windows runner it writes the LONG form of a temp path whose Rust side
+        // is the 8.3 short form (`RUNNER~1` vs `runneradmin`). Neither is a
+        // difference in what the path NAMES, so compare the resolved paths the
+        // same way the product does (`same_file`, pool.rs:2032) — that is also
+        // why this test failing here was never evidence of a product bug.
+        let gitdir_path = Path::new(gitdir.trim().strip_prefix("gitdir:").unwrap().trim());
+        let gitdir_real = std::fs::canonicalize(gitdir_path).unwrap_or_else(|_| {
+            panic!("the slot's gitdir pointer must name a real directory: {gitdir}")
+        });
+        let clone_a_real = std::fs::canonicalize(&clone_a).unwrap();
         assert!(
-            norm(&gitdir).contains(clone_a_spelled.as_str()),
-            "clone A must own the slot, got gitdir: {gitdir}"
+            gitdir_real.starts_with(&clone_a_real),
+            "clone A must own the slot: gitdir {:?} is not inside {:?}",
+            gitdir_real,
+            clone_a_real
         );
 
         // Clone B, with the pool at max_trees: the only way forward would be to
