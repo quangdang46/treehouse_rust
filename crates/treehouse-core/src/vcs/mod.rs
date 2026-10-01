@@ -904,10 +904,20 @@ pub fn validate_seed_inventory(seeded: &[String]) -> Result<(), GitError> {
     }
     for name in seeded {
         let components: Vec<&str> = name.split('/').collect();
+        // The inventory is git's path language, NOT a host path: git spells
+        // every separator as '/' on every platform. So "absolute" here means
+        // "starts with /" — the platform-independent `path.IsAbs` Go uses
+        // (gitvcs.go:959). `Path::is_absolute()` is the WRONG test: on Windows
+        // it is `has_root() && prefix().is_some()`, so a rooted-but-prefixless
+        // name like "/etc/passwd" is not absolute, passes validation here, and
+        // then `worktree.join("/etc/passwd")` drops everything after the
+        // drive prefix and resolves to C:\etc\passwd — outside the worktree.
+        // That turned a gate on deleting ignored files inside the worktree
+        // into one that could name files outside it.
         let clean = !name.is_empty()
             && !name.contains('\\')
             && !name.contains('\0')
-            && !Path::new(name).is_absolute()
+            && !name.starts_with('/')
             && !components.iter().any(|c| *c == "." || *c == "..")
             && !components.is_empty();
         if !clean {
@@ -967,6 +977,11 @@ mod tests {
         run(&["init", "-q", "-b", "main"]);
         run(&["config", "user.email", "t@example.com"]);
         run(&["config", "user.name", "t"]);
+        // Keep tracked-file byte assertions independent of the host's checkout
+        // conversion: GitHub's Windows runners set core.autocrlf=true, which
+        // would write CRLF into the worktree and break the "restores tracked
+        // content" assertions. Git's default elsewhere is no conversion.
+        run(&["config", "core.autocrlf", "false"]);
         std::fs::write(root.join("a.txt"), "one\n").unwrap();
         run(&["add", "-A"]);
         run(&["commit", "-q", "-m", "one"]);
@@ -975,6 +990,21 @@ mod tests {
 
     fn git_backend() -> ShellGitBackend {
         ShellGitBackend::discover().expect("git must be installed")
+    }
+
+    /// A path reduced to the one spelling a backend and `canonicalize` agree
+    /// on, so two routes naming the same directory compare equal.
+    ///
+    /// `repo_root` is "whatever the backend reports", and on Windows the two
+    /// backends spell a path differently by construction: `git rev-parse
+    /// --show-toplevel` prints `C:/repo`, while `std::fs::canonicalize`
+    /// answers the extended-length `\\?\C:\repo`. Both name one directory, so
+    /// it is the COMPARISON that gets normalized here — not the product, whose
+    /// git route is deliberately the backend's own output (Go `gitvcs.go:30`).
+    fn comparable_path(path: &Path) -> String {
+        path.to_string_lossy()
+            .replace("\\\\?\\", "")
+            .replace('\\', "/")
     }
 
     // ── marker inspection ────────────────────────────────────────────────────
@@ -1738,7 +1768,14 @@ mod tests {
         let resolved = global_registry()
             .repo_root_for(&root, None)
             .expect("git must serve its own repository");
-        assert_eq!(resolved, std::fs::canonicalize(&root).unwrap());
+        // Compared, not asserted byte-equal: `canonicalize` answers the Windows
+        // verbatim form and git answers its own forward-slash spelling. Both
+        // name the repo root, and the test's claim is about WHICH root, not how
+        // it is written.
+        assert_eq!(
+            comparable_path(&resolved),
+            comparable_path(&std::fs::canonicalize(&root).unwrap())
+        );
     }
 
     #[test]
@@ -1755,8 +1792,8 @@ mod tests {
             ))),
         );
         assert_eq!(
-            registry.repo_root_for(&root, Some(BACKEND_JJ)).unwrap(),
-            std::fs::canonicalize(&root).unwrap(),
+            comparable_path(&registry.repo_root_for(&root, Some(BACKEND_JJ)).unwrap()),
+            comparable_path(&std::fs::canonicalize(&root).unwrap()),
             "a git tree with a stray jj opt-in must still be served by git"
         );
     }

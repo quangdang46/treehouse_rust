@@ -57,10 +57,17 @@ jobs:
       # Build the binary the e2e harness spawns BEFORE running tests.
       - name: build treehouse binary
         run: cargo build --bin treehouse
+      # --no-fail-fast is load-bearing, not a preference. cargo otherwise aborts
+      # at the FIRST failing test target, so a failure in an early target hides
+      # every later one. That is not hypothetical: the 2 failures in the
+      # `treehouse` bin target meant treehouse-core's 17 lib tests never ran on
+      # Windows at all, and the 2 lib failures meant the update_e2e integration
+      # tests never ran on Linux — all of it green-looking for months. Every
+      # target must run before this job can be called green.
       - name: test workspace
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
       - name: test with hardening feature
-        run: cargo test -p treehouse-core --features hardening
+        run: cargo test -p treehouse-core --features hardening --no-fail-fast
 
   # `toon` is feature-gated and OFF by default, so no job above compiles the
   # TOON encoder — release.yml's `--features toon` build is the only place it is
@@ -88,4 +95,4 @@ jobs:
       - name: build treehouse binary with toon
         run: cargo build --bin treehouse --features toon
       - name: test workspace with toon
-        run: cargo test --workspace --features toon
+        run: cargo test --workspace --features toon --no-fail-fast

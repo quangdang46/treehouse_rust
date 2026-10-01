@@ -1679,9 +1679,18 @@ mod tests {
     /// Writes an archive + sidecar pair into `dir` and returns the CheckResult
     /// that points at them.
     fn fixture(dir: &Path, contents: &[u8]) -> CheckResult {
-        let archive_name = format!("treehouse-v9.9.9-{}.tar.gz", os_arch_suffix());
+        // The container and the entry name have to be the ones this platform
+        // actually publishes. `extract_binary` opens a zip and looks for
+        // `treehouse.exe` on Windows (Go `extractBinary`, updater.go:573-578),
+        // so a hard-coded tar.gz is read as a zip there and dies with
+        // "Could not find EOCD" before the update can be asserted on.
+        let archive_name = format!("treehouse-v9.9.9-{}.{}", os_arch_suffix(), archive_ext());
         let archive = dir.join(&archive_name);
-        let archive_bytes = make_tar_gz("treehouse", contents);
+        let archive_bytes = if cfg!(windows) {
+            make_zip(binary_name(), contents)
+        } else {
+            make_tar_gz(binary_name(), contents)
+        };
         std::fs::write(&archive, &archive_bytes).unwrap();
 
         let sidecar_name = format!("{archive_name}.sha256");
@@ -1765,9 +1774,14 @@ mod tests {
         let target = dir.path().join("treehouse");
         std::fs::write(&target, b"OLD BINARY").unwrap();
 
-        let name = format!("treehouse-v9.9.9-{}.tar.gz", os_arch_suffix());
+        let name = format!("treehouse-v9.9.9-{}.{}", os_arch_suffix(), archive_ext());
         let archive = dir.path().join(&name);
-        std::fs::write(&archive, make_tar_gz("README.md", b"no binary here")).unwrap();
+        let bytes = if cfg!(windows) {
+            make_zip("README.md", b"no binary here")
+        } else {
+            make_tar_gz("README.md", b"no binary here")
+        };
+        std::fs::write(&archive, bytes).unwrap();
         let hash = sha256_file(&archive).unwrap();
         let sidecar = dir.path().join(format!("{name}.sha256"));
         std::fs::write(&sidecar, format!("{hash}  {name}\n")).unwrap();
@@ -2156,6 +2170,20 @@ mod release_workflow_contract {
         assert_eq!(strip_archive_ext("treehouse"), None);
     }
 
+    /// A `file://` URL for `path`, spelled the way curl and JSON both want it.
+    ///
+    /// `Path::display` renders `\` as the separator on Windows, and a backslash is
+    /// not a legal JSON escape - a body built by interpolating a Windows path does
+    /// not parse at all, so the fetch fails before the contract below is ever
+    /// checked. The same string is handed to curl, which wants
+    /// `file://C:/dir/name`, not `file://C:\dir\name`. Forward slashes are what
+    /// `file://` means on every platform, so normalize once here and build every
+    /// URL in this test from it - including the value the final assertion compares
+    /// against, so the two cannot end up disagreeing about separators either.
+    fn file_url(path: &Path) -> String {
+        format!("file://{}", path.display().to_string().replace('\\', "/"))
+    }
+
     /// End-to-end over the names the workflow really publishes: the release JSON is
     /// built from `expand`ed workflow templates, so this exercises the whole
     /// lookup — archive selection, sidecar selection, and the `CheckResult` the CLI
@@ -2190,21 +2218,21 @@ mod release_workflow_contract {
         .unwrap();
         let body = format!(
             r#"{{"tag_name":"{SAMPLE_TAG}","assets":[
-             {{"name":"{asset}","browser_download_url":"file://{archive}"}},
-             {{"name":"{sidecar}","browser_download_url":"file://{sidecar_path}"}}]}}"#,
-            archive = dir.path().join(&asset).display(),
-            sidecar_path = dir.path().join(&sidecar).display(),
+             {{"name":"{asset}","browser_download_url":"{archive}"}},
+             {{"name":"{sidecar}","browser_download_url":"{sidecar_path}"}}]}}"#,
+            archive = file_url(&dir.path().join(&asset)),
+            sidecar_path = file_url(&dir.path().join(&sidecar)),
         );
         let api = dir.path().join("latest.json");
         std::fs::write(&api, body).unwrap();
 
-        let result = check_latest_result(&format!("file://{}", api.display()), "0.0.1", false)
+        let result = check_latest_result(&file_url(&api), "0.0.1", false)
             .expect("the release fixture must resolve");
 
         assert_eq!(result.asset_name.as_deref(), Some(asset.as_str()));
         assert_eq!(
             result.checksum_url.as_deref(),
-            Some(format!("file://{}", dir.path().join(&sidecar).display()).as_str()),
+            Some(file_url(&dir.path().join(&sidecar)).as_str()),
             "`treehouse update` needs a checksum URL; the workflow's stripped sidecar \
          name must resolve to one"
         );

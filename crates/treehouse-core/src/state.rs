@@ -1095,7 +1095,12 @@ mod tests {
         assert!(e.leased, "adopted entry must be quarantined as leased");
         assert_eq!(e.lease_holder, RECOVERED_LEASE_HOLDER);
         assert_eq!(e.recovery_error, "");
-        assert!(e.path.ends_with("1/myrepo"), "got {}", e.path);
+        // `Path::ends_with` compares whole path components, so this holds on
+        // both `/` and `\` platforms. `String::ends_with("1/myrepo")` is a
+        // substring test and hardcodes the POSIX separator: `quarantine_entry`
+        // renders the path from a joined PathBuf, which is `1\myrepo` on
+        // Windows, so the assertion could never pass there.
+        assert!(Path::new(&e.path).ends_with("1/myrepo"), "got {}", e.path);
     }
 
     #[test]
@@ -1171,10 +1176,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         seed_worktree(dir.path(), "1");
         let spelled = format!("{}/./1/myrepo/", dir.path().to_string_lossy());
-        let json = format!(
-            r#"{{"worktrees":[{{"name":"1","path":"{spelled}","created_at":"2026-08-14T12:00:00Z"}}]}}"#
-        );
-        std::fs::write(State::state_file_path(dir.path()), json).unwrap();
+        // Serialize rather than hand-format: a raw Windows pool path contains
+        // backslashes, and `\` is a JSON escape character, so an interpolated
+        // literal would not parse. The parse error routed this read into
+        // corrupt-state recovery, which quarantined the very entry the state
+        // file names — a failure of the fixture, not of adoption.
+        let recorded = State {
+            worktrees: vec![WorktreeEntry {
+                name: "1".into(),
+                path: spelled,
+                created_at: dt("2026-08-14T12:00:00Z"),
+                ..WorktreeEntry::default()
+            }],
+            ..Default::default()
+        };
+        std::fs::write(
+            State::state_file_path(dir.path()),
+            serde_json::to_vec_pretty(&recorded).unwrap(),
+        )
+        .unwrap();
 
         let s = State::read_state(dir.path()).unwrap();
         assert_eq!(

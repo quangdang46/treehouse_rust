@@ -1500,6 +1500,12 @@ mod tests {
         );
         must_git(Some(&repo), &["config", "user.email", "test@test.com"]);
         must_git(Some(&repo), &["config", "user.name", "Test"]);
+        // Keep tracked-file byte assertions independent of the host's checkout
+        // conversion: GitHub's Windows runners set core.autocrlf=true, which
+        // would write CRLF into the worktree and break every "committed
+        // content" comparison. Git's default elsewhere is no conversion, so
+        // this makes the fixture agree with what CI already does.
+        must_git(Some(&repo), &["config", "core.autocrlf", "false"]);
         std::fs::write(repo.join(".gitignore"), b"*\n").unwrap();
         std::fs::write(repo.join(".worktreeinclude"), manifest.as_bytes()).unwrap();
         // -f: the manifest is itself ignored by `.gitignore` containing `*`,

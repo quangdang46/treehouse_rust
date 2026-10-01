@@ -100,18 +100,46 @@ as a failure to verify, not as an absent marker.
 
 ### Not data loss, but the same class of "the flag did nothing"
 
-**`destroy --include-in-use` now terminates on Linux.** After killing the
-processes in a worktree, the survivor re-scan still found the pid it had just
-killed, so destroy skipped with *"worktree processes still running after
-termination"* and `--include-in-use` was a no-op there.
+**`destroy --include-in-use` now terminates, on Linux and on Windows.** After
+killing the processes in a worktree, the survivor re-scan still found the pid it
+had just killed, so destroy skipped with *"worktree processes still running
+after termination"* and `--include-in-use` was a no-op.
 
 The cause was in the process table, not the kill: sysinfo refreshes a process's
 `cwd` only when that field is currently unset (`ProcessRefreshKind::everything()`
 uses `UpdateKind::OnlyIfNotSet`), so it never re-reads a cwd it already holds.
 On Linux a killed child survives as a zombie, its `/proc/<pid>/cwd` disappears,
 and the cached path — the worktree it died in — is what destroy saw. A zombie
-has already terminated: it runs nothing and blocks no removal. Zombies are now
-excluded from the scan.
+has already terminated: it runs nothing and blocks no removal. Windows has the
+same symptom from the other direction — it keeps a terminated process in the
+table until the last handle to it closes, and sysinfo's Windows backend assigns
+`status` exactly once (`ProcessStatus::Run`) and never updates it, so a zombie
+check alone can never fire. Both are now excluded from the scan; on Windows that
+asks the OS directly via `GetExitCodeProcess`, failing closed if the process
+cannot be opened.
+
+**A seed inventory could name a path outside the worktree on Windows.** The
+inventory is git's path language — every separator a `/`, on every platform — so
+"absolute" there means "starts with `/`", which is what Go checks with
+`path.IsAbs`. The port used `Path::is_absolute()` instead, and on Windows that
+is `has_root() && prefix().is_some()`: a rooted-but-prefixless name like
+`/etc/passwd` is not absolute, so it passed validation, and
+`worktree.join("/etc/passwd")` then dropped everything after the drive prefix
+and resolved to `C:\etc\passwd`. That turned a gate on deleting ignored files
+*inside* a worktree into one that could name files outside it. Now rejected on
+every platform.
+
+### Why some of this is only being fixed now
+
+`ci.yml` ran `cargo test --workspace` **without `--no-fail-fast`**, so cargo
+stopped at the first failing test target and every later target reported nothing
+at all. On Windows the `treehouse` bin target failed first, which meant
+`treehouse-core`'s lib tests — 17 of them, spanning pool, state, updater and the
+VCS seam — **never ran on Windows**. On Linux the lib target failed first, which
+meant the `update_e2e` integration tests never ran there either. And
+`--features hardening` did not compile, behind a step that only ran once the
+step before it passed, so the hardening tests had never been built. All of it
+looked green. `--no-fail-fast` is now set on every test step.
 
 ---
 

@@ -104,6 +104,7 @@ mod tests {
                     holder: "race".to_string(),
                     ttl: None,
                 }),
+                ..Default::default()
             })
             .unwrap();
         let lease_id = acquired.lease.as_ref().unwrap().id.clone();

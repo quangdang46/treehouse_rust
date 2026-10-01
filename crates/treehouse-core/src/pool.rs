@@ -2573,6 +2573,12 @@ mod tests {
         };
         run_git(&["config", "user.email", "t@t.com"]);
         run_git(&["config", "user.name", "T"]);
+        // Keep tracked-file byte assertions independent of the host's checkout
+        // conversion: GitHub's Windows runners set core.autocrlf=true, which
+        // would write CRLF into the slot and break every "committed content"
+        // comparison. Git's default elsewhere is no conversion, so this makes
+        // the fixture agree with what CI already does.
+        run_git(&["config", "core.autocrlf", "false"]);
         std::fs::write(repo.join("README.md"), b"hi\n").unwrap();
         run_git(&["add", "."]);
         run_git(&["commit", "-m", "init"]);
@@ -3515,8 +3521,15 @@ mod tests {
         // what makes it "another clone's" rather than merely "unverifiable",
         // which is the distinction the test below asserts.
         let gitdir = std::fs::read_to_string(acquired.path.join(".git")).unwrap();
+        // Git writes this pointer with forward slashes on EVERY platform, while
+        // `clone_a` is a Rust path spelled with the platform separator — on
+        // Windows the two name the same directory and differ only in `\`.
+        // Compare what they name, not how they are spelled (same normalization
+        // as the main_repo_root round-trip test in git/shell.rs).
+        let norm = |p: &str| p.replace('\\', "/");
+        let clone_a_spelled = norm(clone_a.to_str().unwrap());
         assert!(
-            gitdir.contains(clone_a.to_str().unwrap()),
+            norm(&gitdir).contains(clone_a_spelled.as_str()),
             "clone A must own the slot, got gitdir: {gitdir}"
         );
 
@@ -3812,33 +3825,46 @@ mod tests {
         assert!(validate_worktree_path_template("").is_ok());
     }
 
+    /// An absolute root for the fake paths below. `/pool` has a root but no
+    /// volume, so it is absolute on unix and drive-RELATIVE on Windows, where
+    /// `is_absolute` also requires a prefix — the resolver would refuse its own
+    /// template. Never touched on disk: `resolve_worktree_path` is pure string
+    /// expansion.
+    fn fake_abs_root(unix: &str, windows: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(windows)
+        } else {
+            PathBuf::from(unix)
+        }
+    }
+
     /// `resolve_worktree_path` must expand each placeholder to its own meaning,
     /// and a relative result must be refused rather than created.
     #[test]
     fn worktree_path_expands_every_placeholder() {
-        let repo = Path::new("/src/myrepo");
-        let pool_dir = Path::new("/pool");
+        let repo = fake_abs_root("/src/myrepo", r"C:\src\myrepo");
+        let pool_dir = fake_abs_root("/pool", r"C:\pool");
         assert_eq!(
-            resolve_worktree_path(repo, pool_dir, "3", "", false).unwrap(),
-            PathBuf::from("/pool/3/myrepo"),
+            resolve_worktree_path(&repo, &pool_dir, "3", "", false).unwrap(),
+            pool_dir.join("3").join("myrepo"),
             "the built-in layout must be unchanged"
         );
         assert_eq!(
-            resolve_worktree_path(repo, pool_dir, "3", "", true).unwrap(),
-            PathBuf::from("/pool/3/myrepo-3"),
+            resolve_worktree_path(&repo, &pool_dir, "3", "", true).unwrap(),
+            pool_dir.join("3").join("myrepo-3"),
             "--unique-leaf appends the slot"
         );
         assert_eq!(
-            resolve_worktree_path(repo, pool_dir, "3", "{pool}/{slot}/{repo}", false).unwrap(),
-            PathBuf::from("/pool/3/myrepo")
+            resolve_worktree_path(&repo, &pool_dir, "3", "{pool}/{slot}/{repo}", false).unwrap(),
+            pool_dir.join("3").join("myrepo")
         );
         // `{repo_parent}` IS a valid placeholder to expand, but on its own it is not
         // enough: two sibling repositories expand it identically, so it cannot tell
         // their slots apart. It only works alongside a repository-scoped placeholder.
         assert_eq!(
-            resolve_worktree_path(repo, pool_dir, "3", "{repo_parent}/{repo}/{slot}", false)
+            resolve_worktree_path(&repo, &pool_dir, "3", "{repo_parent}/{repo}/{slot}", false)
                 .unwrap(),
-            PathBuf::from("/src/myrepo/3")
+            repo.join("3")
         );
         // Relative templates are refused: a worktree must land where the caller
         // named, not wherever the process happens to be running.
@@ -3853,11 +3879,11 @@ mod tests {
     /// this out loud rather than resolving silently (pool.go:391-394).
     #[test]
     fn a_template_supersedes_unique_leaf() {
-        let repo = Path::new("/src/myrepo");
-        let pool_dir = Path::new("/pool");
+        let repo = fake_abs_root("/src/myrepo", r"C:\src\myrepo");
+        let pool_dir = fake_abs_root("/pool", r"C:\pool");
         assert_eq!(
-            resolve_worktree_path(repo, pool_dir, "2", "{pool}/{slot}/{repo}-x", true).unwrap(),
-            PathBuf::from("/pool/2/myrepo-x"),
+            resolve_worktree_path(&repo, &pool_dir, "2", "{pool}/{slot}/{repo}-x", true).unwrap(),
+            pool_dir.join("2").join("myrepo-x"),
             "the template names the leaf, so unique_leaf adds nothing"
         );
     }

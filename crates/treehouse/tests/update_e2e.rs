@@ -98,10 +98,7 @@ fn run_update(fixture: &ReleaseFixture, home: &Path, target: &Path) -> (String, 
         ("TREEHOUSE_UPDATE_API_URL", fixture.url()),
         ("TREEHOUSE_UPDATE_TARGET", target.display().to_string()),
     ];
-    let out = Command::new(target)
-        .arg("update")
-        .envs(env)
-        .output()
+    let out = common::output_tolerating_etxtbsy(Command::new(target).arg("update").envs(env))
         .expect("failed to run treehouse update");
     (
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -112,6 +109,13 @@ fn run_update(fixture: &ReleaseFixture, home: &Path, target: &Path) -> (String, 
 
 /// A fresh copy of the built binary standing in for an installed release.
 /// Leaked like `common::setup` does, so it outlives the assertion helpers.
+///
+/// The copy is deliberate and must NOT be collapsed into the shared
+/// `target/debug/treehouse`: it is what `TREEHOUSE_UPDATE_TARGET` points at, so
+/// a passing update replaces THIS file and leaves the one every other suite
+/// execs untouched. It is also why this suite alone writes an executable and
+/// execs it in the same breath, which is what the two exec sites below guard
+/// with [`common::output_tolerating_etxtbsy`]. Do not "simplify" it away.
 fn install_target(name: &str) -> PathBuf {
     let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
     let target = dir.path().join(name);
@@ -266,10 +270,7 @@ fn e2e_update_fails_loudly_when_the_release_cannot_be_reached() {
         ),
         ("TREEHOUSE_UPDATE_TARGET", target.display().to_string()),
     ];
-    let out = Command::new(&target)
-        .arg("update")
-        .envs(env)
-        .output()
+    let out = common::output_tolerating_etxtbsy(Command::new(&target).arg("update").envs(env))
         .expect("failed to run treehouse update");
 
     assert_ne!(
