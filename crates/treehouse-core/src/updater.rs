@@ -6,10 +6,29 @@
 //! - `update` downloads the release asset, verifies sha256, and atomically
 //!   replaces the executable.
 //! - HTTPS is enforced on all download URLs (configurable in tests).
+//!
+//! The apply half ([`apply`]) is the part that actually changes bytes on disk:
+//! download → verify sha256 against the release sidecar → extract → de-quarantine
+//! → temp-file-in-target-dir + rename. Every step returns `Err`; nothing here
+//! can report success for an update that did not happen.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::env::TreehouseEnv;
+
+/// Reads the mode bits out of a `Permissions` value. On unix that is the whole
+/// struct; on Windows there are no mode bits, so the original value is passed
+/// straight back to `set_permissions` and this is the identity.
+#[cfg(unix)]
+fn mode_of(p: std::fs::Permissions) -> std::fs::Permissions {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::Permissions::from_mode(p.mode())
+}
+
+#[cfg(not(unix))]
+fn mode_of(p: std::fs::Permissions) -> std::fs::Permissions {
+    p
+}
 
 /// The default GitHub API URL for the latest release. Overridable in tests.
 pub const DEFAULT_GITHUB_API_URL: &str =
@@ -126,18 +145,12 @@ pub fn read_cache() -> Option<UpdateCheckCache> {
 
 /// Fetches the latest release version from the GitHub API (or the injected URL).
 /// Returns None on network/parse failure (best-effort background check).
+///
+/// This is the *cache-write* half of the check. The download half is
+/// [`check_latest_result`] + [`apply`]; use those for `treehouse update`, which
+/// must not report success without having replaced the binary.
 pub fn check_latest(github_api_url: &str, enforce_https: bool) -> Option<String> {
-    if enforce_https && !github_api_url.starts_with("https://") {
-        return None;
-    }
-    let resp = std::process::Command::new("curl")
-        .args(["-fsSL", github_api_url])
-        .output()
-        .ok()?;
-    if !resp.status.success() {
-        return None;
-    }
-    let body = String::from_utf8_lossy(&resp.stdout);
+    let body = curl_capture(github_api_url, enforce_https, MAX_API_RESPONSE_SIZE).ok()?;
     let v: serde_json::Value = serde_json::from_str(&body).ok()?;
     v.get("tag_name")?.as_str().map(|s| s.to_string())
 }
@@ -237,6 +250,782 @@ pub fn update_available_with_env(current: &str, env: &dyn TreehouseEnv) -> bool 
     }
 }
 
+// ─── Apply pipeline ───────────────────────────────────────────────────────────
+//
+// Go's `internal/updater` does this in `Apply` (updater.go:319). The port keeps
+// the same five steps and, more importantly, the same failure discipline: a
+// step that does not fully succeed returns Err and the binary on disk is left
+// exactly as it was. The whole reason M-027 was filed is that the old CLI
+// printed "Successfully updated" for an update that never happened, so nothing
+// below is allowed to return Ok on a partial result.
+
+// ─── Limits ────────────────────────────────────────────────────────────────────
+
+/// Ceiling on a downloaded release archive (Go `maxDownloadSize`). A release
+/// asset is tens of MB, so 100 MB is generous; past it we are either looking at
+/// a broken release or at something trying to fill the user's disk.
+const MAX_DOWNLOAD_SIZE: u64 = 100 << 20;
+
+/// Ceiling on the *extracted* binary, kept separate from the archive cap
+/// because a small archive can expand without bound — this is the number that
+/// bounds what actually gets written toward the target directory.
+const MAX_BINARY_SIZE: u64 = 100 << 20;
+
+/// Ceiling on the GitHub API response (Go `maxAPIResponseSize`).
+const MAX_API_RESPONSE_SIZE: u64 = 5 << 20;
+
+/// Ceiling on the checksum sidecar: one 64-hex line per release asset, a few
+/// KB at most. Anything bigger is not a checksum file.
+const MAX_CHECKSUM_SIZE: u64 = 1 << 20;
+
+/// Curl timeout for the API and checksum fetches (Go `httpTimeout` = 30s).
+const FETCH_TIMEOUT_SECS: &str = "30";
+
+/// Curl timeout for the asset download. Go allows 5 minutes here for the same
+/// reason: this is the one big transfer.
+const DOWNLOAD_TIMEOUT_SECS: &str = "300";
+
+/// Prefix every release asset starts with (`.github/workflows/release.yml`).
+const ASSET_PREFIX: &str = "treehouse-v";
+
+/// Per-asset checksum sidecar published next to every release asset
+/// (release.yml:94,99).
+const CHECKSUM_SUFFIX: &str = ".sha256";
+
+/// Go's aggregate checksum manifest (`updater.go:29`). The Rust release
+/// workflow emits per-asset sidecars instead, but both are the same
+/// `sha256  filename` line format, so [`checksum_for`] reads either.
+const AGGREGATE_CHECKSUM_FILE: &str = "checksums.txt";
+
+/// The archive extension this platform's asset uses — zip on Windows, tar.gz
+/// everywhere else (Go `extractBinary`, updater.go:573-578).
+const fn archive_ext() -> &'static str {
+    if cfg!(windows) { "zip" } else { "tar.gz" }
+}
+
+/// The binary's file name inside the archive, per platform (Go `extractTarGz`
+/// and `extractZip` hard-code these).
+const fn binary_name() -> &'static str {
+    if cfg!(windows) {
+        "treehouse.exe"
+    } else {
+        "treehouse"
+    }
+}
+
+// ─── Errors ───────────────────────────────────────────────────────────────────
+
+/// Why an update did not happen. Every variant is a path where the binary on
+/// disk is unchanged; there is deliberately no variant meaning "partially
+/// applied", because no code path produces one.
+#[derive(Debug, thiserror::Error)]
+pub enum UpdateError {
+    #[error("no download URL for {os}/{arch}")]
+    NoDownloadUrl {
+        os: &'static str,
+        arch: &'static str,
+    },
+
+    /// HTTPS rejection. The caller prefixes this with the URL's role
+    /// ("download URL: " / "checksum URL: ") so the reason reads on its own.
+    #[error("{0}")]
+    InsecureUrl(String),
+
+    #[error("fetching latest release: {0}")]
+    Fetch(String),
+
+    #[error("downloading update: {0}")]
+    Download(String),
+
+    #[error("checksum verification failed: {0}")]
+    Checksum(String),
+
+    #[error("extracting update: {0}")]
+    Extract(String),
+
+    #[error("resolving current executable: {0}")]
+    ResolveExecutable(String),
+
+    #[error("replacing binary: {0}")]
+    Replace(String),
+}
+
+// ─── Release metadata ─────────────────────────────────────────────────────────
+
+/// The outcome of a version check: what the latest release is, and — when one
+/// exists for this platform — where to fetch it and how to verify it.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CheckResult {
+    pub current_version: String,
+    pub latest_version: String,
+    pub update_available: bool,
+    /// The release archive for this OS/arch, if the release ships one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum_url: Option<String>,
+}
+
+/// What [`apply`] actually did. The CLI should print its success line from this
+/// and not before, so "updated X -> Y" can only be said about a binary that was
+/// really replaced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Applied {
+    pub from_version: String,
+    pub to_version: String,
+    /// The path that was replaced, after symlink resolution.
+    pub replaced_path: PathBuf,
+}
+
+/// The subset of the GitHub latest-release response we consume
+/// (Go `githubRelease`).
+#[derive(Debug, serde::Deserialize)]
+struct GithubRelease {
+    #[serde(rename = "tag_name", default)]
+    tag_name: String,
+    #[serde(default)]
+    assets: Vec<GithubAsset>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GithubAsset {
+    name: String,
+    #[serde(rename = "browser_download_url")]
+    browser_download_url: String,
+}
+
+// ─── Asset selection ──────────────────────────────────────────────────────────
+
+/// Whether `name` is this platform's release asset, regardless of version.
+///
+/// The suffix vocabulary is the release matrix in `.github/workflows/release.yml`
+/// (`linux-x86_64`, `macos-aarch64`, `windows-x86_64`, …), NOT Go's
+/// GOOS/GOARCH spelling — the Rust workflow publishes `macos-aarch64`, so
+/// copying Go's matcher verbatim would find nothing on Apple Silicon.
+fn matches_asset(name: &str, os: &str, arch: &str, ext: &str) -> bool {
+    name.starts_with(ASSET_PREFIX) && name.ends_with(&format!("-{os}-{arch}.{ext}"))
+}
+
+/// [`matches_asset`] bound to the running platform. Used by both the release
+/// lookup and the checksum sidecar lookup, so the two can never disagree about
+/// which file is "the current platform's asset".
+pub fn matches_current_platform_asset(name: &str) -> bool {
+    matches_asset(
+        name,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        archive_ext(),
+    )
+}
+
+/// The checksum file that covers `archive_name`: this workflow's per-asset
+/// sidecar, or Go's aggregate manifest if a release ships one instead.
+fn is_checksum_for(archive_name: &str, candidate: &str) -> bool {
+    candidate == format!("{archive_name}{CHECKSUM_SUFFIX}") || candidate == AGGREGATE_CHECKSUM_FILE
+}
+
+// ─── Version check with assets ────────────────────────────────────────────────
+
+/// Checks for the latest release and resolves this platform's asset URLs.
+///
+/// Unlike [`check_latest`] this surfaces failures instead of swallowing them:
+/// `treehouse update` must be able to tell the user the network is down rather
+/// than exit 0. The update-check cache is *not* written here — the caller
+/// decides when (Go writes it inside `CheckLatest`, updater.go:89-94).
+pub fn check_latest_result(
+    github_api_url: &str,
+    current_version: &str,
+    enforce_https: bool,
+) -> Result<CheckResult, UpdateError> {
+    let body = curl_capture(github_api_url, enforce_https, MAX_API_RESPONSE_SIZE)?;
+    let release: GithubRelease = serde_json::from_str(&body)
+        .map_err(|e| UpdateError::Fetch(format!("decoding release: {e}")))?;
+
+    let archive = release
+        .assets
+        .iter()
+        .find(|a| matches_current_platform_asset(&a.name));
+
+    let checksum_url = archive.and_then(|archive| {
+        release
+            .assets
+            .iter()
+            .find(|c| is_checksum_for(&archive.name, &c.name))
+            .map(|c| c.browser_download_url.clone())
+    });
+
+    let update_available = match (
+        Version::parse(&release.tag_name),
+        Version::parse(current_version),
+    ) {
+        (Some(latest), Some(cur)) => latest > cur,
+        // Unparseable on either side: refuse to claim an update is available.
+        // Guessing "yes" would send the CLI into a download it cannot verify.
+        _ => false,
+    };
+
+    Ok(CheckResult {
+        current_version: current_version.to_string(),
+        latest_version: release.tag_name,
+        update_available,
+        asset_name: archive.map(|a| a.name.clone()),
+        download_url: archive.map(|a| a.browser_download_url.clone()),
+        checksum_url,
+    })
+}
+
+/// [`check_latest_result`] plus the cache write, matching Go's `CheckLatest`
+/// (which caches inside the check). For callers that want Go's exact shape.
+pub fn check_and_cache(
+    github_api_url: &str,
+    current_version: &str,
+    enforce_https: bool,
+) -> Result<CheckResult, UpdateError> {
+    let result = check_latest_result(github_api_url, current_version, enforce_https)?;
+    write_cache(&result.latest_version);
+    Ok(result)
+}
+
+// ─── Apply ────────────────────────────────────────────────────────────────────
+
+/// Downloads, verifies, extracts and installs the release described by
+/// `result`, replacing the running executable.
+///
+/// `enforce_https` is threaded in rather than read from a global so tests can
+/// drive the whole pipeline off `file://` fixtures; production passes `true`.
+///
+/// # CLI usage
+///
+/// ```text
+/// let result = updater::check_latest_result(DEFAULT_GITHUB_API_URL, VERSION, true)?;
+/// if !result.update_available { /* "up to date" */ }
+/// let applied = updater::apply(&result, true)?;   // prints "X -> Y" from `applied`
+/// ```
+///
+/// Resolves `std::env::current_exe()`. Prefer [`apply_into`] when the target
+/// is not the running binary (tests; packagers staging an install prefix).
+pub fn apply(result: &CheckResult, enforce_https: bool) -> Result<Applied, UpdateError> {
+    let exe = std::env::current_exe().map_err(|e| UpdateError::ResolveExecutable(e.to_string()))?;
+    // EvalSymlinks equivalent. Skipping it would replace the resolved binary
+    // while the user (or their package manager) is looking at a symlink, so
+    // the next `treehouse` invocation follows the link back to the old file.
+    let target = std::fs::canonicalize(&exe)
+        .map_err(|e| UpdateError::ResolveExecutable(format!("resolving symlinks: {e}")))?;
+    apply_into(result, enforce_https, &target)
+}
+
+/// [`apply`] against an explicit target path.
+///
+/// Split out so the full pipeline can be tested without touching the test
+/// binary itself — replacing `current_exe()` mid-suite would corrupt every
+/// other test in the process.
+pub fn apply_into(
+    result: &CheckResult,
+    enforce_https: bool,
+    target: &Path,
+) -> Result<Applied, UpdateError> {
+    let Some(url) = result.download_url.as_deref().filter(|u| !u.is_empty()) else {
+        return Err(UpdateError::NoDownloadUrl {
+            os: std::env::consts::OS,
+            arch: std::env::consts::ARCH,
+        });
+    };
+    require_https(url, enforce_https)
+        .map_err(|e| UpdateError::InsecureUrl(format!("download URL: {e}")))?;
+
+    // An unverified binary is not an update, it is arbitrary code execution
+    // with a version string attached. Refuse before downloading anything.
+    let Some(checksum_url) = result.checksum_url.as_deref().filter(|u| !u.is_empty()) else {
+        return Err(UpdateError::Checksum(
+            "no checksums file in release assets".to_string(),
+        ));
+    };
+    require_https(checksum_url, enforce_https)
+        .map_err(|e| UpdateError::InsecureUrl(format!("checksum URL: {e}")))?;
+
+    let archive = download_to_temp(url, MAX_DOWNLOAD_SIZE)?;
+    let sidecar = curl_capture(checksum_url, enforce_https, MAX_CHECKSUM_SIZE)
+        .map_err(|e| UpdateError::Checksum(format!("downloading checksums: {e}")))?;
+    verify_checksum(
+        archive.path(),
+        &sidecar,
+        result.asset_name.as_deref().unwrap_or_default(),
+    )?;
+
+    let new_binary = extract_binary(archive.path())?;
+    remove_quarantine(new_binary.path());
+
+    atomic_replace(target, new_binary.path())?;
+
+    Ok(Applied {
+        from_version: result.current_version.clone(),
+        to_version: result.latest_version.clone(),
+        replaced_path: target.to_path_buf(),
+    })
+}
+
+// ─── HTTP ─────────────────────────────────────────────────────────────────────
+
+/// Rejects a non-HTTPS URL unless enforcement is off. Go `requireHTTPS`
+/// (updater.go:442-453).
+fn require_https(url: &str, enforce_https: bool) -> Result<(), UpdateError> {
+    if !enforce_https {
+        return Ok(());
+    }
+    if url.is_empty() {
+        return Err(UpdateError::InsecureUrl("URL is empty".to_string()));
+    }
+    if !url.starts_with("https://") {
+        return Err(UpdateError::InsecureUrl(format!(
+            "refusing non-HTTPS URL: {url}"
+        )));
+    }
+    Ok(())
+}
+
+/// Fetches a small text resource (release metadata, checksum sidecar) with curl.
+///
+/// curl rather than an HTTP client crate because this crate already shells out
+/// to curl for the version check and the install path promises curl; a second
+/// HTTP stack would be a second dependency tree to keep current for the same
+/// job. `--max-filesize` bounds the declared-length case and the post-read
+/// length check bounds the rest.
+fn curl_capture(url: &str, enforce_https: bool, max_bytes: u64) -> Result<String, UpdateError> {
+    require_https(url, enforce_https)?;
+    let out = std::process::Command::new("curl")
+        .args(["-fsSL", "--max-time", FETCH_TIMEOUT_SECS])
+        .args(["--max-filesize", &max_bytes.to_string()])
+        .arg(url)
+        .output()
+        .map_err(|e| UpdateError::Fetch(format!("invoking curl: {e}")))?;
+    if !out.status.success() {
+        return Err(UpdateError::Fetch(format!(
+            "{url}: curl {} {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    if out.stdout.len() as u64 > max_bytes {
+        return Err(UpdateError::Fetch(format!(
+            "{url}: response exceeds maximum size of {max_bytes} bytes"
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Rejects a transfer that landed larger than its ceiling.
+///
+/// This is the backstop behind curl's `--max-filesize`, which only fires when
+/// the response declares a Content-Length. A chunked response declares nothing,
+/// so the bytes are counted here instead (Go does the same with
+/// `io.LimitReader` + a post-copy length check, updater.go:560-568).
+fn check_download_size(len: u64, max_bytes: u64) -> Result<(), UpdateError> {
+    if len > max_bytes {
+        return Err(UpdateError::Download(format!(
+            "download exceeds maximum size of {max_bytes} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// Streams `url` into a fresh temp file, refusing anything over `max_bytes`
+/// (Go `downloadToTemp`, updater.go:542-571).
+///
+/// stdout goes straight to the file handle rather than through `.output()`:
+/// `.output()` would buffer the whole asset in memory, and the cap exists
+/// precisely because the size is not trusted.
+fn download_to_temp(url: &str, max_bytes: u64) -> Result<tempfile::NamedTempFile, UpdateError> {
+    let tmp = tempfile::Builder::new()
+        .prefix("treehouse-update-")
+        .tempfile()
+        .map_err(|e| UpdateError::Download(format!("creating temp file: {e}")))?;
+
+    let out = std::process::Command::new("curl")
+        .args(["-fsSL", "--max-time", DOWNLOAD_TIMEOUT_SECS])
+        // Aborts early on a declared oversize body.
+        .args(["--max-filesize", &max_bytes.to_string()])
+        .arg("-o")
+        .arg(tmp.path())
+        .arg(url)
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| UpdateError::Download(format!("invoking curl: {e}")))?;
+    if !out.status.success() {
+        return Err(UpdateError::Download(format!(
+            "{url}: curl {} {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+
+    let len = std::fs::metadata(tmp.path())
+        .map_err(|e| UpdateError::Download(format!("measuring download: {e}")))?
+        .len();
+    check_download_size(len, max_bytes)?;
+    Ok(tmp)
+}
+
+// ─── Checksum ─────────────────────────────────────────────────────────────────
+
+/// Extracts the expected sha256 for `asset_name` out of a checksum sidecar.
+///
+/// Sidecar lines are `sha256  filename`, exactly as `sha256sum -c` and the
+/// release workflow write them. An exact filename match wins; failing that we
+/// fall back to the platform match Go uses (updater.go:502-506) so an aggregate
+/// `checksums.txt` still resolves. Anything that is not 64 hex digits is
+/// treated as absent — a malformed line must fail the update, never be silently
+/// compared as a string that happens to be equal.
+fn checksum_for(sidecar: &str, asset_name: &str) -> Option<String> {
+    let mut by_platform = None;
+    for line in sidecar.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() != 2 || !is_sha256(fields[0]) {
+            continue;
+        }
+        // `./name` is a legal sha256sum output when the file was hashed by path.
+        let file = fields[1].strip_prefix("./").unwrap_or(fields[1]);
+        if file == asset_name {
+            return Some(fields[0].to_string());
+        }
+        if by_platform.is_none() && matches_current_platform_asset(file) {
+            by_platform = Some(fields[0].to_string());
+        }
+    }
+    by_platform
+}
+
+fn is_sha256(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Hashes a file with sha256 (Go `verifyChecksum` body, updater.go:512-526).
+fn sha256_file(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        sha2::Digest::update(&mut hasher, &buf[..n]);
+    }
+    Ok(to_hex(&sha2::Digest::finalize(hasher)))
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
+/// Verifies `archive_path` against the sidecar's hash for `asset_name`.
+fn verify_checksum(
+    archive_path: &Path,
+    sidecar: &str,
+    asset_name: &str,
+) -> Result<(), UpdateError> {
+    let expected = checksum_for(sidecar, asset_name).ok_or_else(|| {
+        UpdateError::Checksum(format!(
+            "no checksum found for current platform asset{}",
+            if asset_name.is_empty() {
+                String::new()
+            } else {
+                format!(" ({asset_name})")
+            }
+        ))
+    })?;
+    let actual = sha256_file(archive_path)
+        .map_err(|e| UpdateError::Checksum(format!("hashing download: {e}")))?;
+    if actual != expected {
+        return Err(UpdateError::Checksum(format!(
+            "expected {expected}, got {actual}"
+        )));
+    }
+    Ok(())
+}
+
+// ─── Extraction ───────────────────────────────────────────────────────────────
+
+/// Pulls the executable out of the downloaded archive into a fresh temp file,
+/// already `chmod 0755` (Go `extractBinary`).
+///
+/// The archive's own entry paths are never honoured — the entry is matched by
+/// base name and its bytes are written to a temp file we chose. That makes
+/// `../../.ssh/authorized_keys` style archive entries inert here rather than
+/// something the caller has to defend against.
+fn extract_binary(archive_path: &Path) -> Result<tempfile::NamedTempFile, UpdateError> {
+    if cfg!(windows) {
+        extract_zip(archive_path, binary_name())
+    } else {
+        extract_tar_gz(archive_path, binary_name())
+    }
+}
+
+fn new_binary_temp() -> Result<tempfile::NamedTempFile, UpdateError> {
+    tempfile::Builder::new()
+        .prefix("treehouse-new-")
+        .tempfile()
+        .map_err(|e| UpdateError::Extract(format!("creating temp file: {e}")))
+}
+
+/// Copies one archive entry into a 0755 temp file, bounded by `max_bytes`.
+///
+/// The bound is a parameter so a test can prove it fires without building a
+/// 100 MB fixture; production callers pass [`MAX_BINARY_SIZE`]. Streaming
+/// matters here: the reader is a decompression stream, so an unbounded copy
+/// would expand a small archive into as much disk as the attacker likes.
+fn write_entry<R: std::io::Read>(
+    reader: &mut R,
+    temp: &mut tempfile::NamedTempFile,
+    max_bytes: u64,
+) -> Result<(), UpdateError> {
+    use std::io::Read;
+    let mut limited = reader.take(max_bytes + 1);
+    let n = std::io::copy(&mut limited, temp.as_file_mut())
+        .map_err(|e| UpdateError::Extract(format!("reading archive: {e}")))?;
+    if n > max_bytes {
+        return Err(UpdateError::Extract(format!(
+            "binary exceeds maximum size of {max_bytes} bytes"
+        )));
+    }
+    temp.as_file_mut()
+        .sync_all()
+        .map_err(|e| UpdateError::Extract(format!("syncing temp file: {e}")))?;
+    set_executable(temp.path())
+}
+
+#[cfg(unix)]
+fn set_executable(path: &Path) -> Result<(), UpdateError> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| UpdateError::Extract(format!("setting mode 0755: {e}")))
+}
+
+#[cfg(not(unix))]
+fn set_executable(_path: &Path) -> Result<(), UpdateError> {
+    // Windows has no execute bit; the extension decides what runs.
+    Ok(())
+}
+
+/// `want` is the entry's base name to look for — see [`binary_name`]. It is a
+/// parameter rather than a constant so the Windows `.exe` branch is exercised
+/// by the same tests on Linux and macOS, which never publish a zip.
+fn extract_tar_gz(archive_path: &Path, want: &str) -> Result<tempfile::NamedTempFile, UpdateError> {
+    let file = std::fs::File::open(archive_path)
+        .map_err(|e| UpdateError::Extract(format!("opening archive: {e}")))?;
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+
+    let entries = archive
+        .entries()
+        .map_err(|e| UpdateError::Extract(format!("reading archive: {e}")))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| UpdateError::Extract(format!("reading archive: {e}")))?;
+        // Go requires tar.TypeReg (updater.go:606): a *directory* named
+        // `treehouse` must not be mistaken for the binary.
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        // Read the entry's own path but never act on it — the match is on the
+        // base name and the bytes go to a temp file this function chose, so a
+        // `../../…/treehouse` entry is inert here rather than a write primitive.
+        let name = entry
+            .path()
+            .map_err(|e| UpdateError::Extract(format!("bad entry path: {e}")))?;
+        if name.file_name() != Some(std::ffi::OsStr::new(want)) {
+            continue;
+        }
+        let mut temp = new_binary_temp()?;
+        write_entry(&mut entry, &mut temp, MAX_BINARY_SIZE)?;
+        return Ok(temp);
+    }
+    Err(UpdateError::Extract(format!(
+        "binary {want:?} not found in archive"
+    )))
+}
+
+/// `want` is the entry's base name to look for — see [`binary_name`].
+fn extract_zip(archive_path: &Path, want: &str) -> Result<tempfile::NamedTempFile, UpdateError> {
+    let file = std::fs::File::open(archive_path)
+        .map_err(|e| UpdateError::Extract(format!("opening archive: {e}")))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| UpdateError::Extract(format!("opening archive: {e}")))?;
+
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| UpdateError::Extract(format!("reading archive: {e}")))?;
+        if !entry.is_file() {
+            continue;
+        }
+        // As in the tar path: the archive's path is inspected, never honoured.
+        let name = std::path::Path::new(entry.name());
+        if name.file_name() != Some(std::ffi::OsStr::new(want)) {
+            continue;
+        }
+        let mut temp = new_binary_temp()?;
+        write_entry(&mut entry, &mut temp, MAX_BINARY_SIZE)?;
+        return Ok(temp);
+    }
+    Err(UpdateError::Extract(format!(
+        "binary {want:?} not found in archive"
+    )))
+}
+
+/// Drops the macOS quarantine xattr from the freshly extracted binary.
+///
+/// A quarantined binary is killed on first exec, which turns a successful
+/// update into "the binary I just installed will not run". Best-effort, as in
+/// Go (quarantine_darwin.go:8-12): an asset that was never quarantined has no
+/// xattr, and failing the update over that would be wrong.
+#[cfg(target_os = "macos")]
+fn remove_quarantine(path: &Path) {
+    let _ = std::process::Command::new("xattr")
+        .args(["-d", "com.apple.quarantine"])
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn remove_quarantine(_path: &Path) {}
+
+// ─── Replacement ──────────────────────────────────────────────────────────────
+
+/// Installs `new_binary` at `target`, atomically where the platform allows.
+///
+/// Mirrors Go `atomicReplace` (updater.go:679-733) including its two
+/// escape hatches, because both are load-bearing:
+///
+/// 1. The temp file is created **in the target's own directory**. A temp file
+///    in `/tmp` would make the final rename a cross-device copy — not atomic,
+///    and a crash mid-copy leaves a half-written executable at the target path.
+/// 2. If the directory is not writable (`/usr/local/bin` owned by root) but the
+///    file is, we fall back to overwriting in place. Not atomic, and Go accepts
+///    that trade: a failed update is worse than a brief window.
+fn atomic_replace(target: &Path, new_binary: &Path) -> Result<(), UpdateError> {
+    let info = std::fs::metadata(target)
+        .map_err(|e| UpdateError::Replace(format!("stating target {}: {e}", target.display())))?;
+
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = match tempfile::Builder::new()
+        .prefix(".treehouse-update-")
+        .tempfile_in(dir)
+    {
+        Ok(t) => t,
+        // No write access to the directory. Go falls back to direct overwrite
+        // here too; anything else would make `treehouse update` fail for every
+        // user who installed into a root-owned prefix.
+        Err(_) => return direct_overwrite(target, new_binary, mode_of(info.permissions())),
+    };
+
+    let tmp_path = tmp.into_temp_path();
+    let mut src = std::fs::File::open(new_binary)
+        .map_err(|e| UpdateError::Replace(format!("opening new binary: {e}")))?;
+    let mut dst = std::fs::File::create(&tmp_path)
+        .map_err(|e| UpdateError::Replace(format!("opening staged binary: {e}")))?;
+    if let Err(e) = std::io::copy(&mut src, &mut dst) {
+        return Err(UpdateError::Replace(format!("staging new binary: {e}")));
+    }
+    // Data before metadata before rename. `rename` is atomic with respect to
+    // other processes, but it makes no promise about the bytes it points at;
+    // without this sync a crash can leave a zero-length "new" binary in place.
+    if let Err(e) = dst.sync_all() {
+        return Err(UpdateError::Replace(format!("syncing staged binary: {e}")));
+    }
+    drop(dst);
+    // Carry the *original* binary's mode over: the extracted file is 0755, but
+    // a user's installed binary may be 0750 or group-writable by design.
+    std::fs::set_permissions(&tmp_path, info.permissions())
+        .map_err(|e| UpdateError::Replace(format!("setting mode: {e}")))?;
+
+    if let Err(e) = std::fs::rename(&tmp_path, target) {
+        // Windows maps a running .exe and refuses to overwrite it in place,
+        // but a mapped image CAN be renamed aside. Go took the same exit.
+        #[cfg(windows)]
+        if replace_running_windows(target, &tmp_path).is_ok() {
+            return Ok(());
+        }
+        let _ = e;
+        return Err(UpdateError::Replace(format!(
+            "renaming onto {}: {e}",
+            target.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Windows-only escape hatch (Go `replaceRunningWindows`, updater.go:742-753):
+/// move the locked image aside, then place the new binary at its original path.
+///
+/// Not `#[cfg]`-gated so the naming rule below — the part Go actually got wrong
+/// once — is covered by the test suite on every platform.
+///
+/// The backup name is unique **per attempt** (`<target>.old.<pid>.<nanos>`). A
+/// fixed `.old` name cannot be reused: a previous update's `.old` may still be
+/// mapped by a still-running process, and renaming onto it fails. That was Go
+/// issue #121.
+//
+// Compiled on every platform, not just Windows, so the naming rule is type-checked
+// by the Linux/macOS build and covered by tests there; only the call site in
+// [`atomic_replace`] is Windows-gated.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn replace_running_windows(target: &Path, staged: &Path) -> std::io::Result<()> {
+    let old_path = windows_backup_path(target);
+    std::fs::rename(target, &old_path)?;
+    if let Err(e) = std::fs::rename(staged, target) {
+        // Put the old image back: leaving it aside would delete the user's
+        // working binary as a side effect of a failed update.
+        let _ = std::fs::rename(&old_path, target);
+        return Err(e);
+    }
+    let _ = std::fs::remove_file(&old_path);
+    Ok(())
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_backup_path(target: &Path) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let name = target.file_name().unwrap_or_default().to_string_lossy();
+    target.with_file_name(format!("{name}.old.{}.{nanos}", std::process::id()))
+}
+
+/// Last-resort, non-atomic install for a target directory we cannot write to.
+///
+/// There is a window where `target` is a truncated binary. It exists because the
+/// alternative is refusing to update at all for anyone who installed into a
+/// root-owned `/usr/local/bin` while owning the file (Go `directOverwrite`,
+/// updater.go:760-778).
+fn direct_overwrite(
+    target: &Path,
+    new_binary: &Path,
+    mode: std::fs::Permissions,
+) -> Result<(), UpdateError> {
+    let mut src = std::fs::File::open(new_binary)
+        .map_err(|e| UpdateError::Replace(format!("opening new binary: {e}")))?;
+    let mut dst = std::fs::File::create(target)
+        .map_err(|e| UpdateError::Replace(format!("opening target: {e}")))?;
+    if let Err(e) = std::io::copy(&mut src, &mut dst) {
+        return Err(UpdateError::Replace(format!("writing target: {e}")));
+    }
+    std::fs::set_permissions(target, mode)
+        .map_err(|e| UpdateError::Replace(format!("setting mode: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,5 +1102,705 @@ mod tests {
         write_cache_with_env(&env, "2.0.0");
         assert!(update_available_with_env("1.0.0", &env)); // 2.0.0 > 1.0.0
         assert!(!update_available_with_env("3.0.0", &env)); // 2.0.0 < 3.0.0
+    }
+
+    // ─── Apply pipeline ────────────────────────────────────────────────────
+    //
+    // Fixtures are built on disk and served over `file://` so the whole
+    // pipeline — download, verify, extract, replace — runs with no network.
+
+    /// The five assets `.github/workflows/release.yml` actually publishes,
+    /// each paired with the (os, arch) that must select it.
+    const RELEASE_MATRIX: &[(&str, &str, &str)] = &[
+        ("linux-x86_64", "linux", "x86_64"),
+        ("linux-aarch64", "linux", "aarch64"),
+        ("macos-x86_64", "macos", "x86_64"),
+        ("macos-aarch64", "macos", "aarch64"),
+        ("windows-x86_64", "windows", "x86_64"),
+    ];
+
+    #[test]
+    fn asset_matcher_covers_every_release_matrix_entry() {
+        for (suffix, os, arch) in RELEASE_MATRIX {
+            let ext = if *os == "windows" { "zip" } else { "tar.gz" };
+            let name = format!("treehouse-v0.1.2-{suffix}.{ext}");
+            assert!(
+                matches_asset(&name, os, arch, ext),
+                "{name} should match {os}/{arch}"
+            );
+            // A different platform's asset must not match, or `update` would
+            // install a binary built for the wrong architecture.
+            for (_, other_os, other_arch) in RELEASE_MATRIX {
+                if *other_os != *os || *other_arch != *arch {
+                    assert!(
+                        !matches_asset(&name, other_os, other_arch, ext),
+                        "{name} must not match {other_os}/{other_arch}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn asset_matcher_rejects_wrong_extension_and_prefix() {
+        // The zip and tar.gz of one platform differ only in extension; picking
+        // the wrong one means extracting the wrong container.
+        assert!(!matches_asset(
+            "treehouse-v0.1.2-linux-x86_64.zip",
+            "linux",
+            "x86_64",
+            "tar.gz"
+        ));
+        // Checksum sidecars are not the archive.
+        assert!(!matches_asset(
+            "treehouse-v0.1.2-linux-x86_64.tar.gz.sha256",
+            "linux",
+            "x86_64",
+            "tar.gz"
+        ));
+        assert!(!matches_asset(
+            "something-else.tar.gz",
+            "linux",
+            "x86_64",
+            "tar.gz"
+        ));
+    }
+
+    #[test]
+    fn checksum_for_reads_sidecar_exact_match() {
+        // The asset this platform would actually be published under comes
+        // first; the exact-match rule must still pick the second line. A
+        // matcher that returned "the first line that looks like ours" would
+        // happily install a hash belonging to a different file.
+        let ours = format!("treehouse-v9.9.9-{}.tar.gz", os_arch_suffix());
+        let other_version = format!("treehouse-v8.8.8-{}.tar.gz", os_arch_suffix());
+        let exact_hash = "a".repeat(64);
+        let sidecar = format!(
+            "{}  {other}\n{exact_hash}  {ours}\n",
+            "b".repeat(64),
+            exact_hash = exact_hash,
+            ours = ours,
+            other = other_version,
+        );
+        assert_eq!(checksum_for(&sidecar, &ours), Some(exact_hash));
+    }
+
+    #[test]
+    fn checksum_for_tolerates_leading_dot_slash() {
+        let hash = "c".repeat(64);
+        let sidecar = format!("{hash}  ./treehouse-v1.0.0-linux-x86_64.tar.gz\n");
+        assert_eq!(
+            checksum_for(&sidecar, "treehouse-v1.0.0-linux-x86_64.tar.gz"),
+            Some(hash)
+        );
+    }
+
+    #[test]
+    fn checksum_for_rejects_malformed_hash() {
+        // A truncated or non-hex line must read as "absent" (fail closed),
+        // never as a hash that could accidentally compare equal.
+        let sidecar = "deadbeef  treehouse-v1.0.0-linux-x86_64.tar.gz\n";
+        assert_eq!(
+            checksum_for(sidecar, "treehouse-v1.0.0-linux-x86_64.tar.gz"),
+            None
+        );
+        let upper = format!("{}  treehouse-v1.0.0-linux-x86_64.tar.gz\n", "A".repeat(64));
+        assert_eq!(
+            checksum_for(&upper, "treehouse-v1.0.0-linux-x86_64.tar.gz"),
+            None
+        );
+    }
+
+    #[test]
+    fn checksum_for_missing_asset_is_none() {
+        let sidecar = format!("{}  other-file.tar.gz\n", "a".repeat(64));
+        assert_eq!(
+            checksum_for(&sidecar, "treehouse-v1.0.0-linux-x86_64.tar.gz"),
+            None
+        );
+    }
+
+    #[test]
+    fn verify_checksum_accepts_match_and_rejects_tamper() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("treehouse.tar.gz");
+        std::fs::write(&archive, b"hello archive").unwrap();
+        let hash = sha256_file(&archive).unwrap();
+        let name = "treehouse-v1.0.0-linux-x86_64.tar.gz";
+        let sidecar = format!("{hash}  {name}\n");
+
+        verify_checksum(&archive, &sidecar, name).unwrap();
+
+        // One flipped byte in the download must fail the whole update.
+        std::fs::write(&archive, b"hello archivf").unwrap();
+        let err = verify_checksum(&archive, &sidecar, name).unwrap_err();
+        assert!(matches!(err, UpdateError::Checksum(_)), "got {err:?}");
+    }
+
+    /// Builds a tar.gz containing `contents` under `entry_name`.
+    fn make_tar_gz(entry_name: &str, contents: &[u8]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, entry_name, contents)
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    /// Builds a tar.gz whose single entry sits at a traversal path.
+    ///
+    /// `tar::Builder` refuses to author one (correctly), so the 512-byte header
+    /// is written by hand — otherwise nothing could ever test the reader
+    /// against a hostile archive.
+    fn make_tar_gz_traversal(entry_name: &str, contents: &[u8]) -> Vec<u8> {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o755);
+        {
+            let old = header.as_old_mut();
+            old.name[..entry_name.len()].copy_from_slice(entry_name.as_bytes());
+        }
+        header.set_cksum();
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(header.as_bytes());
+        raw.extend_from_slice(contents);
+        raw.resize(512 + contents.len().next_multiple_of(512), 0);
+        raw.extend_from_slice(&[0u8; 1024]); // end-of-archive marker
+
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut enc, &raw).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// Builds a tar.gz containing a single *directory* entry named `entry_name`.
+    fn make_tar_gz_dir(entry_name: &str) -> Vec<u8> {
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        header.set_mode(0o755);
+        builder
+            .append_data(&mut header, entry_name, std::io::empty())
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    /// Builds a stored (uncompressed) zip containing `contents` under `entry_name`.
+    fn make_zip(entry_name: &str, contents: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        w.start_file(
+            entry_name,
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored)
+                .unix_permissions(0o755),
+        )
+        .unwrap();
+        w.write_all(contents).unwrap();
+        w.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn extract_tar_gz_writes_binary_and_sets_mode_0755() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar.gz");
+        // Nested like the real archive (`tar -czf ... -C dirname treehouse`).
+        std::fs::write(&archive, make_tar_gz("treehouse", b"NEW BINARY")).unwrap();
+
+        let out = extract_tar_gz(&archive, "treehouse").unwrap();
+        assert_eq!(std::fs::read(out.path()).unwrap(), b"NEW BINARY");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(out.path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755, "extracted binary must be executable");
+        }
+    }
+
+    #[test]
+    fn extract_tar_gz_finds_nested_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar.gz");
+        std::fs::write(&archive, make_tar_gz("dist/treehouse", b"NESTED BINARY")).unwrap();
+        let out = extract_tar_gz(&archive, "treehouse").unwrap();
+        assert_eq!(std::fs::read(out.path()).unwrap(), b"NESTED BINARY");
+    }
+
+    #[test]
+    fn extract_tar_gz_ignores_traversal_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar.gz");
+        // A hostile archive naming the treehouse binary at a traversal path
+        // must still be extracted to a temp file we chose, never to that path.
+        std::fs::write(
+            &archive,
+            make_tar_gz_traversal("../../../../tmp/treehouse", b"ESCAPED"),
+        )
+        .unwrap();
+        let out = extract_tar_gz(&archive, "treehouse").unwrap();
+        assert_eq!(
+            std::fs::canonicalize(out.path().parent().unwrap()).unwrap(),
+            std::fs::canonicalize(std::env::temp_dir()).unwrap(),
+            "extraction must land in our temp dir, not at the archive's path"
+        );
+        assert_eq!(std::fs::read(out.path()).unwrap(), b"ESCAPED");
+    }
+
+    #[test]
+    fn extract_tar_gz_errors_when_binary_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar.gz");
+        std::fs::write(&archive, make_tar_gz("README.md", b"nope")).unwrap();
+        let err = extract_tar_gz(&archive, "treehouse").unwrap_err();
+        assert!(matches!(err, UpdateError::Extract(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("not found in archive"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn extract_tar_gz_skips_a_directory_named_like_the_binary() {
+        // Go requires tar.TypeReg (updater.go:606). A directory entry whose
+        // base name matches must not be extracted as the executable.
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar.gz");
+        let bytes = make_tar_gz_dir("treehouse/");
+        std::fs::write(&archive, bytes).unwrap();
+        let err = extract_tar_gz(&archive, "treehouse").unwrap_err();
+        assert!(
+            err.to_string().contains("not found in archive"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn extract_zip_writes_binary() {
+        // Runs on every platform, not just Windows: this is the branch the
+        // Linux/macOS CI can never reach through `extract_binary`.
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.zip");
+        std::fs::write(&archive, make_zip("treehouse.exe", b"WINDOWS BINARY")).unwrap();
+        let out = extract_zip(&archive, "treehouse.exe").unwrap();
+        assert_eq!(std::fs::read(out.path()).unwrap(), b"WINDOWS BINARY");
+    }
+
+    #[test]
+    fn write_entry_refuses_an_oversized_binary() {
+        // A small archive that expands without bound is the shape of a
+        // decompression bomb; the cap on the extracted bytes is what stops it,
+        // and it has to stop it while streaming, not after.
+        let mut payload = vec![0u8; 64 * 1024];
+        payload.extend_from_slice(b"tail past the limit");
+        let mut temp = new_binary_temp().unwrap();
+        let err = write_entry(&mut payload.as_slice(), &mut temp, 1024).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds maximum size"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn write_entry_accepts_a_binary_exactly_at_the_limit() {
+        let payload = vec![0u8; 4096];
+        let mut temp = new_binary_temp().unwrap();
+        write_entry(&mut payload.as_slice(), &mut temp, 4096).unwrap();
+        assert_eq!(std::fs::metadata(temp.path()).unwrap().len(), 4096);
+    }
+
+    #[test]
+    fn extract_zip_ignores_traversal_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.zip");
+        std::fs::write(
+            &archive,
+            make_zip("../../../../tmp/treehouse.exe", b"ESCAPED"),
+        )
+        .unwrap();
+        let out = extract_zip(&archive, "treehouse.exe").unwrap();
+        assert_eq!(
+            std::fs::canonicalize(out.path().parent().unwrap()).unwrap(),
+            std::fs::canonicalize(std::env::temp_dir()).unwrap()
+        );
+        assert_eq!(std::fs::read(out.path()).unwrap(), b"ESCAPED");
+    }
+
+    #[test]
+    fn extract_zip_errors_when_binary_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.zip");
+        std::fs::write(&archive, make_zip("other.txt", b"nope")).unwrap();
+        let err = extract_zip(&archive, "treehouse.exe").unwrap_err();
+        assert!(
+            err.to_string().contains("not found in archive"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn extract_binary_dispatches_on_the_current_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        if cfg!(windows) {
+            let archive = dir.path().join("a.zip");
+            std::fs::write(&archive, make_zip("treehouse.exe", b"WIN")).unwrap();
+            assert_eq!(
+                std::fs::read(extract_binary(&archive).unwrap().path()).unwrap(),
+                b"WIN"
+            );
+        } else {
+            let archive = dir.path().join("a.tar.gz");
+            std::fs::write(&archive, make_tar_gz("treehouse", b"UNIX")).unwrap();
+            assert_eq!(
+                std::fs::read(extract_binary(&archive).unwrap().path()).unwrap(),
+                b"UNIX"
+            );
+        }
+    }
+
+    #[test]
+    fn atomic_replace_swaps_contents_and_keeps_original_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("treehouse");
+        let staged = dir.path().join("staged");
+        std::fs::write(&target, b"OLD BINARY").unwrap();
+        std::fs::write(&staged, b"NEW BINARY").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o750)).unwrap();
+        }
+
+        atomic_replace(&target, &staged).unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"NEW BINARY");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o750,
+                "install must carry the original binary's mode, not 0755"
+            );
+        }
+        // The staging file lives in the target's directory so the final rename
+        // is same-filesystem; it must not survive the update.
+        let strays: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".treehouse-update-"))
+            .collect();
+        assert!(strays.is_empty(), "stray staging files: {strays:?}");
+    }
+
+    #[test]
+    fn atomic_replace_errors_on_missing_target_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("does-not-exist");
+        let staged = dir.path().join("staged");
+        std::fs::write(&staged, b"NEW").unwrap();
+
+        let err = atomic_replace(&target, &staged).unwrap_err();
+        assert!(matches!(err, UpdateError::Replace(_)), "got {err:?}");
+        assert!(
+            !target.exists(),
+            "a failed replace must not create the target"
+        );
+    }
+
+    #[test]
+    fn atomic_replace_falls_back_when_target_dir_is_not_writable() {
+        // The `/usr/local/bin` case: directory owned by root, file owned by the
+        // user. Failing here would make `update` impossible for them, so Go
+        // falls back to a non-atomic overwrite and so must we.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("treehouse");
+        let staged = dir.path().join("staged");
+        std::fs::write(&target, b"OLD").unwrap();
+        std::fs::write(&staged, b"NEW").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+            let result = atomic_replace(&target, &staged);
+            // Restore before asserting so the tempdir can clean itself up.
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            result.unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), b"NEW");
+        }
+        #[cfg(not(unix))]
+        let _ = (target, staged);
+    }
+
+    #[test]
+    fn windows_backup_name_is_unique_per_attempt() {
+        // Go issue #121: a fixed `.old` path cannot be reused because a prior
+        // update's backup may still be mapped by a running process.
+        let target = Path::new("/usr/local/bin/treehouse");
+        let a = windows_backup_path(target);
+        let b = windows_backup_path(target);
+        assert_ne!(a, b, "backup name must differ between attempts");
+        for p in [&a, &b] {
+            let name = p.file_name().unwrap().to_string_lossy();
+            assert!(name.starts_with("treehouse.old."), "got {name}");
+            assert_eq!(p.parent(), target.parent());
+        }
+    }
+
+    #[test]
+    fn replace_running_windows_swaps_content_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("treehouse.exe");
+        let staged = dir.path().join("staged.exe");
+        std::fs::write(&target, b"LOCKED").unwrap();
+        std::fs::write(&staged, b"NEW").unwrap();
+
+        replace_running_windows(&target, &staged).unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"NEW");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".old."))
+            .collect();
+        assert!(leftovers.is_empty(), "backup not cleaned: {leftovers:?}");
+    }
+
+    #[test]
+    fn replace_running_windows_rolls_back_when_staging_lost() {
+        // The second rename failing must not leave the user's working binary
+        // sitting under a `.old.` name — that would delete it as a side effect.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("treehouse.exe");
+        std::fs::write(&target, b"LOCKED").unwrap();
+        let missing = dir.path().join("never-created.exe");
+
+        assert!(replace_running_windows(&target, &missing).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"LOCKED");
+    }
+
+    // ─── apply / apply_into ─────────────────────────────────────────────────
+
+    fn file_url(path: &Path) -> String {
+        format!("file://{}", path.display())
+    }
+
+    /// Writes an archive + sidecar pair into `dir` and returns the CheckResult
+    /// that points at them.
+    fn fixture(dir: &Path, contents: &[u8]) -> CheckResult {
+        let archive_name = format!("treehouse-v9.9.9-{}.tar.gz", os_arch_suffix());
+        let archive = dir.join(&archive_name);
+        let archive_bytes = make_tar_gz("treehouse", contents);
+        std::fs::write(&archive, &archive_bytes).unwrap();
+
+        let sidecar_name = format!("{archive_name}.sha256");
+        let sidecar = dir.join(&sidecar_name);
+        let hash = sha256_file(&archive).unwrap();
+        std::fs::write(&sidecar, format!("{hash}  {archive_name}\n")).unwrap();
+
+        CheckResult {
+            current_version: "0.1.1".to_string(),
+            latest_version: "v9.9.9".to_string(),
+            update_available: true,
+            asset_name: Some(archive_name),
+            download_url: Some(file_url(&archive)),
+            checksum_url: Some(file_url(&sidecar)),
+        }
+    }
+
+    /// The archive name suffix this platform would actually be published under.
+    fn os_arch_suffix() -> String {
+        format!(
+            "{}-{}",
+            match std::env::consts::OS {
+                "macos" => "macos",
+                other => other,
+            },
+            std::env::consts::ARCH
+        )
+    }
+
+    #[test]
+    fn apply_into_replaces_the_target_end_to_end() {
+        // The M-027 regression: an update must actually change the bytes on
+        // disk, and must report the path it changed.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("treehouse");
+        std::fs::write(&target, b"OLD BINARY").unwrap();
+
+        let result = fixture(dir.path(), b"NEW BINARY");
+        let applied = apply_into(&result, false, &target).unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"NEW BINARY");
+        assert_eq!(applied.from_version, "0.1.1");
+        assert_eq!(applied.to_version, "v9.9.9");
+        assert_eq!(applied.replaced_path, target);
+    }
+
+    #[test]
+    fn apply_into_is_idempotent_on_a_second_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("treehouse");
+        std::fs::write(&target, b"OLD").unwrap();
+        let result = fixture(dir.path(), b"NEW");
+
+        apply_into(&result, false, &target).unwrap();
+        // A second update over an already-updated binary must still land.
+        apply_into(&result, false, &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"NEW");
+    }
+
+    #[test]
+    fn apply_into_leaves_target_untouched_on_checksum_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("treehouse");
+        std::fs::write(&target, b"OLD BINARY").unwrap();
+
+        let mut result = fixture(dir.path(), b"NEW BINARY");
+        // Corrupt the sidecar after hashing: the archive no longer matches.
+        result.checksum_url = Some(file_url(&dir.path().join("does-not-exist.sha256")));
+        let err = apply_into(&result, false, &target).unwrap_err();
+        assert!(matches!(err, UpdateError::Checksum(_)), "got {err:?}");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"OLD BINARY",
+            "a failed verification must never touch the installed binary"
+        );
+    }
+
+    #[test]
+    fn apply_into_leaves_target_untouched_when_archive_has_no_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("treehouse");
+        std::fs::write(&target, b"OLD BINARY").unwrap();
+
+        let name = format!("treehouse-v9.9.9-{}.tar.gz", os_arch_suffix());
+        let archive = dir.path().join(&name);
+        std::fs::write(&archive, make_tar_gz("README.md", b"no binary here")).unwrap();
+        let hash = sha256_file(&archive).unwrap();
+        let sidecar = dir.path().join(format!("{name}.sha256"));
+        std::fs::write(&sidecar, format!("{hash}  {name}\n")).unwrap();
+
+        let result = CheckResult {
+            current_version: "0.1.1".to_string(),
+            latest_version: "v9.9.9".to_string(),
+            update_available: true,
+            asset_name: Some(name),
+            download_url: Some(file_url(&archive)),
+            checksum_url: Some(file_url(&sidecar)),
+        };
+        let err = apply_into(&result, false, &target).unwrap_err();
+        assert!(matches!(err, UpdateError::Extract(_)), "got {err:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"OLD BINARY");
+    }
+
+    #[test]
+    fn apply_into_errors_when_no_asset_for_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("treehouse");
+        std::fs::write(&target, b"OLD").unwrap();
+        let result = CheckResult::default();
+        let err = apply_into(&result, true, &target).unwrap_err();
+        assert!(
+            matches!(err, UpdateError::NoDownloadUrl { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn apply_into_refuses_plain_http_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("treehouse");
+        let result = CheckResult {
+            download_url: Some("http://evil.example/treehouse.tar.gz".to_string()),
+            checksum_url: Some("https://ok.example/treehouse.tar.gz.sha256".to_string()),
+            ..Default::default()
+        };
+        let err = apply_into(&result, true, &target).unwrap_err();
+        assert!(matches!(err, UpdateError::InsecureUrl(_)), "got {err:?}");
+        assert!(err.to_string().contains("download URL"), "got {err}");
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn apply_into_refuses_plain_http_checksum() {
+        // The asset is on https but the hash is not: an attacker who can
+        // rewrite the sidecar picks the hash, so both must be pinned.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("treehouse");
+        let result = CheckResult {
+            download_url: Some("https://ok.example/treehouse.tar.gz".to_string()),
+            checksum_url: Some("http://evil.example/treehouse.tar.gz.sha256".to_string()),
+            ..Default::default()
+        };
+        let err = apply_into(&result, true, &target).unwrap_err();
+        assert!(matches!(err, UpdateError::InsecureUrl(_)), "got {err:?}");
+        assert!(err.to_string().contains("checksum URL"), "got {err}");
+    }
+
+    #[test]
+    fn apply_into_refuses_to_update_without_a_checksum_file() {
+        // Go updater.go:483-485. Without a sidecar there is nothing to verify
+        // against, so the update is refused outright.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("treehouse");
+        let result = CheckResult {
+            download_url: Some("https://ok.example/treehouse.tar.gz".to_string()),
+            ..Default::default()
+        };
+        let err = apply_into(&result, true, &target).unwrap_err();
+        assert!(matches!(err, UpdateError::Checksum(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn download_to_temp_rejects_oversize() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big.bin");
+        std::fs::write(&big, vec![0u8; 4096]).unwrap();
+        // curl aborts first here because the local file has a declared size;
+        // either way the update must fail rather than extract 4 KB of "binary".
+        let err = download_to_temp(&file_url(&big), 1024).unwrap_err();
+        assert!(matches!(err, UpdateError::Download(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn download_size_cap_is_enforced_independently_of_curl() {
+        // The backstop for a chunked response, where curl's --max-filesize has
+        // no declared length to act on.
+        check_download_size(1024, 1024).unwrap();
+        let err = check_download_size(1025, 1024).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds maximum size"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn download_to_temp_accepts_a_within_limit_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = dir.path().join("ok.bin");
+        std::fs::write(&ok, vec![7u8; 512]).unwrap();
+        let tmp = download_to_temp(&file_url(&ok), 4096).unwrap();
+        assert_eq!(std::fs::read(tmp.path()).unwrap(), vec![7u8; 512]);
+    }
+
+    #[test]
+    fn check_latest_result_rejects_plain_http() {
+        let err = check_latest_result("http://insecure.example", "1.0.0", true).unwrap_err();
+        assert!(matches!(err, UpdateError::InsecureUrl(_)), "got {err:?}");
     }
 }

@@ -72,7 +72,7 @@ fn render_human(
                 }
             }
         }
-        CommandResult::Prune(r) => {
+        CommandResult::Prune(r, _scope) => {
             if r.candidates.is_empty() && r.skipped.is_empty() && r.errors.is_empty() {
                 writeln!(err, "🌳 No stale worktrees to prune.")?;
                 return Ok(());
@@ -157,8 +157,75 @@ fn render_human(
                 )?;
             }
         }
+        CommandResult::Gc(r, _scope) => {
+            if r.candidates.is_empty() && r.skipped.is_empty() && r.errors.is_empty() {
+                writeln!(err, "🌳 No stale worktrees to reclaim.")?;
+                return Ok(());
+            }
+            if r.dry_run {
+                writeln!(
+                    out,
+                    "🌳 Dry run: would reclaim {} worktree(s) and free {}.",
+                    r.candidates.len(),
+                    treehouse_core::prune::format_bytes(r.reclaimable_bytes)
+                )?;
+                writeln!(out, "🌳 Re-run with --yes to reclaim these worktrees.")?;
+                for c in &r.candidates {
+                    writeln!(
+                        out,
+                        "  [{}] {} {}",
+                        c.tag,
+                        treehouse_core::prune::format_bytes(c.bytes),
+                        c.path
+                    )?;
+                }
+            } else {
+                writeln!(
+                    out,
+                    "🌳 Reclaimed {} worktree(s) and freed {}.",
+                    r.reclaimed.len(),
+                    treehouse_core::prune::format_bytes(r.freed_bytes)
+                )?;
+            }
+            if !r.skipped.is_empty() {
+                writeln!(err, "🌳 Skipped {} worktree(s):", r.skipped.len())?;
+                for sk in &r.skipped {
+                    writeln!(err, "  [{}] {} ({})", sk.category, sk.path, sk.reason)?;
+                }
+            }
+            if !r.errors.is_empty() {
+                writeln!(
+                    err,
+                    "🌳 Cleanup failed for {} worktree(s) (will retry next run):",
+                    r.errors.len()
+                )?;
+                for error in &r.errors {
+                    writeln!(
+                        err,
+                        "  [{}] {} — {}: {}",
+                        error.phase, error.path, error.name, error.detail
+                    )?;
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Renders only what belongs on **stdout**, discarding anything a command
+/// would otherwise banner on stderr.
+///
+/// `treehouse lease` needs this: its stderr line names the slot by the name it
+/// was given, which the shared `Get`-lease banner does not carry, so the
+/// caller prints its own banner and asks for the machine half alone. Machine
+/// formats already write stdout only, so this is exactly [`render`] with a
+/// sink in the error position.
+pub fn render_stdout(
+    format: OutputFormat,
+    result: &CommandResult,
+    out: &mut dyn Write,
+) -> std::io::Result<()> {
+    render(format, result, out, &mut std::io::sink())
 }
 
 /// JSON format: compact, one document, trailing newline. Machine data only.
@@ -207,7 +274,7 @@ fn render_toon(
 mod tests {
     use super::*;
     use treehouse_core::lease::LeaseInfo;
-    use treehouse_core::result::{CommandResult, GetResult};
+    use treehouse_core::result::{CommandResult, GetResult, SweepScope};
     use treehouse_core::state::ZERO_TIME;
 
     fn ws(name: &str, status: &str) -> treehouse_core::pool::WorktreeStatus {
@@ -305,5 +372,105 @@ mod tests {
         assert!(toon_out.contains("status: leased"), "got: {toon_out}");
         let _ = decoded;
         let _ = json_val;
+    }
+
+    // ─── M-018: gc/prune/return now honour --format ───────────────────────
+
+    fn gc(candidates: usize, reclaimed: usize, dry_run: bool) -> CommandResult {
+        use treehouse_core::gc::{GcResult, GcWorktree};
+        CommandResult::Gc(
+            GcResult {
+                dry_run,
+                candidates: (0..candidates)
+                    .map(|i| GcWorktree {
+                        name: format!("{i}"),
+                        path: format!("/pool/{i}/repo"),
+                        bytes: 1024,
+                        tag: "expired lease".into(),
+                        warning: String::new(),
+                    })
+                    .collect(),
+                reclaimed: (0..reclaimed)
+                    .map(|i| GcWorktree {
+                        name: format!("{i}"),
+                        path: format!("/pool/{i}/repo"),
+                        bytes: 1024,
+                        tag: "expired lease".into(),
+                        warning: String::new(),
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            SweepScope::default(),
+        )
+    }
+
+    #[test]
+    fn gc_json_carries_the_documented_keys() {
+        let (out, err) = render_str(OutputFormat::Json, &gc(2, 0, true));
+        assert_eq!(err, "", "machine formats must keep stderr clean");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        for key in [
+            "dry_run",
+            "orphans_included",
+            "global",
+            "pool_count",
+            "candidates",
+            "reclaimed",
+            "skipped",
+            "errors",
+            "reclaimable_bytes",
+            "freed_bytes",
+        ] {
+            assert!(v.get(key).is_some(), "gc JSON is missing {key}: {out}");
+        }
+        assert_eq!(v["candidates"], 2);
+        assert_eq!(v["dry_run"], true);
+    }
+
+    #[test]
+    fn gc_human_matches_the_legacy_render_byte_for_byte() {
+        let (out, err) = render_str(OutputFormat::Human, &gc(1, 0, true));
+        assert_eq!(
+            out,
+            "🌳 Dry run: would reclaim 1 worktree(s) and free 0 B.\n\
+             🌳 Re-run with --yes to reclaim these worktrees.\n\
+             \x20 [expired lease] 1 KiB /pool/0/repo\n",
+            "the human gc output must be exactly what the pre-formatter println! block produced"
+        );
+        assert_eq!(err, "");
+    }
+
+    #[test]
+    fn gc_human_reports_the_executed_shape() {
+        // A candidate keeps the "nothing to do" guard from short-circuiting,
+        // which is what the legacy `render_gc` did too.
+        let (out, err) = render_str(OutputFormat::Human, &gc(1, 3, false));
+        assert_eq!(out, "🌳 Reclaimed 3 worktree(s) and freed 0 B.\n");
+        assert_eq!(err, "");
+    }
+
+    #[test]
+    fn gc_human_empty_pool_banner_goes_to_stderr_only() {
+        let (out, err) = render_str(OutputFormat::Human, &gc(0, 0, true));
+        assert_eq!(out, "");
+        assert_eq!(err, "🌳 No stale worktrees to reclaim.\n");
+    }
+
+    /// The stdout-only renderer must drop every banner: `lease` prints its own
+    /// stderr line naming the slot, so a second one here would be noise on a
+    /// stream callers capture.
+    #[test]
+    fn render_stdout_drops_the_banner() {
+        let lease = LeaseInfo {
+            path: "/pool/1/repo".into(),
+            lease_id: "a".repeat(32),
+            lease_holder: "agent".into(),
+            leased_at: chrono::Utc::now(),
+        };
+        let r = CommandResult::Get(GetResult::Lease(lease));
+        let mut out = Vec::new();
+        render_stdout(OutputFormat::Human, &r, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "/pool/1/repo\n");
     }
 }

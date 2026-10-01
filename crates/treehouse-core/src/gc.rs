@@ -93,29 +93,58 @@ pub const GC_SKIP_VALID_LEASE: &str = "valid lease";
 pub const GC_SKIP_IN_USE: &str = "in use";
 pub const GC_SKIP_DISPOSABLE_BAR: &str = "not disposable";
 
+/// The `tag` gc assigns to an orphaned candidate. An orphan has no live
+/// repository to deregister the worktree from, so its cleanup is filesystem
+/// only.
+const GC_TAG_ORPHANED: &str = "stale/orphaned";
+
 impl Pool {
     /// Reclaims stale worktrees (Go-style two-phase, strictly safe).
     pub fn gc(&self, opts: &GcOptions) -> Result<GcResult, PoolError> {
         // Snapshot under one lock: read + heal + write.
         let entries = crate::prune::with_pool_snapshot(self)?;
 
-        let repo_root = self
-            .git
-            .main_repo_root(&self.root)
-            .unwrap_or_else(|_| self.root.clone());
-        let default_ref = self.resolve_prune_default_ref(&repo_root);
+        // Each slot is resolved against its OWN repository (M-020); the fetch
+        // + default-ref lookup is memoized per resolved root. Under an `--all`
+        // sweep `self.root` is the pool directory's PARENT and not a
+        // repository at all, so a single pool-wide root would leave every slot
+        // permanently unverifiable and gc would reclaim nothing, forever.
+        let mut resolver = crate::prune::PruneContextResolver::new(self);
 
         let mut result = GcResult {
             dry_run: opts.dry_run,
             ..Default::default()
         };
-        let mut planned: Vec<GcWorktree> = Vec::new();
+        let mut planned: Vec<(GcWorktree, crate::prune::PruneContext)> = Vec::new();
         let now = chrono::Utc::now();
 
         for wt in &entries {
+            // An orphan has no live repository to resolve a ref in, and
+            // `analyze_gc_candidate` answers from the orphan branch before it
+            // ever reads the default ref.
+            let context = if self.backing_repository_missing(&wt.path) {
+                crate::prune::PruneContext {
+                    repo_root: std::path::PathBuf::new(),
+                    default_ref: None,
+                    context_error: None,
+                }
+            } else {
+                match resolver.context(wt) {
+                    Ok(c) => c,
+                    Err(reason) => {
+                        result.skipped.push(GcSkipped {
+                            name: wt.name.clone(),
+                            path: wt.path.clone(),
+                            category: crate::prune::PRUNE_SKIP_CANNOT_VERIFY.to_string(),
+                            reason: format!("cannot verify worktree: {reason}"),
+                        });
+                        continue;
+                    }
+                }
+            };
             let (candidate, skipped) = self.analyze_gc_candidate(
                 wt,
-                default_ref.as_ref().ok().map(|s| s.as_str()),
+                context.default_ref.as_deref(),
                 opts,
                 now,
             );
@@ -126,7 +155,7 @@ impl Pool {
             if let Some(c) = candidate {
                 result.reclaimable_bytes += c.bytes;
                 result.candidates.push(c.clone());
-                planned.push(c);
+                planned.push((c, context));
             }
         }
 
@@ -134,7 +163,7 @@ impl Pool {
             return Ok(result);
         }
 
-        let (reclaimed, errors) = self.execute_gc(&planned)?;
+        let (reclaimed, errors) = self.execute_gc(&planned, opts)?;
         result.reclaimed = reclaimed.clone();
         result.errors = errors;
         result.freed_bytes = reclaimed.iter().map(|w| w.bytes).sum();
@@ -208,7 +237,7 @@ impl Pool {
                     name,
                     path,
                     bytes,
-                    tag: "stale/orphaned".into(),
+                    tag: GC_TAG_ORPHANED.into(),
                     warning: "content could not be verified".into(),
                 }),
                 None,
@@ -293,15 +322,16 @@ impl Pool {
     /// for retry on the next gc run.
     fn execute_gc(
         &self,
-        planned: &[GcWorktree],
+        planned: &[(GcWorktree, crate::prune::PruneContext)],
+        opts: &GcOptions,
     ) -> Result<(Vec<GcWorktree>, Vec<CleanupError>), PoolError> {
         // Phase 1: reserve Destroying + fresh owner.
-        let reserved: Vec<(Reservation, GcWorktree)> =
+        let reserved: Vec<(Reservation, GcWorktree, crate::prune::PruneContext)> =
             crate::pool::with_pool_lock(&self.dir, self.lock_timeout, || {
                 let mut state = State::read_state(&self.dir).map_err(PoolError::State)?;
                 heal_state(&mut state, |pid| self.process.started_at(pid));
                 let mut reserved = Vec::new();
-                for w in planned {
+                for (w, context) in planned {
                     let Some(idx) = state.worktrees.iter().position(|e| e.path == w.path) else {
                         continue;
                     };
@@ -318,25 +348,32 @@ impl Pool {
                             crate::git::GitErrorKind::Other,
                         ))
                     })?;
-                    reserved.push((reservation, w.clone()));
+                    reserved.push((reservation, w.clone(), context.clone()));
                 }
                 state_file::write_state(&self.dir, &state)
                     .map_err(|e| PoolError::Io("writing state".into(), e))?;
                 Ok::<_, PoolError>(reserved)
             })?;
 
-        // Phase 2: re-verify + physical cleanup + state commit.
+        // Phase 2: RE-CLASSIFY + physical cleanup + state commit.
         //
-        // Invariant: a worktree is removed from state **only** when both
-        // `git worktree remove` and `remove_dir_all` succeed. On failure the
-        // entry is retained so the next gc run can retry.
+        // gc's two-phase engine has the same shape as prune's, so it gets the
+        // same treatment: the plan's verdict is not trusted, because the
+        // `pre_destroy` hooks run with no lock held between the two phases and
+        // a slot can go dirty, gain a process, or gain a valid lease in that
+        // window. The full classification is re-run inside the deleting lock.
+        //
+        // Invariant: a worktree is removed from state **only** when cleanup
+        // fully succeeds. On failure the entry is retained with its
+        // reservation restored, so it is immediately retryable rather than
+        // stuck behind a `destroying` flag naming a still-live process.
         crate::pool::with_pool_lock(&self.dir, self.lock_timeout, || {
             let mut state = State::read_state(&self.dir).map_err(PoolError::State)?;
             let mut reclaimed = Vec::new();
             let mut removed = std::collections::HashSet::new();
             let mut errors = Vec::new();
 
-            for (reservation, w) in &reserved {
+            for (reservation, w, context) in &reserved {
                 let Some(idx) = state
                     .worktrees
                     .iter()
@@ -348,14 +385,25 @@ impl Pool {
                     continue; // re-acquired mid-hook; never remove
                 }
                 let path = state.worktrees[idx].path.clone();
+
+                if self.final_gc_safety_check(&state.worktrees[idx], context, opts) {
+                    reservation.restore_original(&mut state.worktrees[idx]);
+                    continue;
+                }
+
                 let repo = crate::git::GitRepo {
-                    common_dir: self.root.clone(),
+                    // The repository that OWNS this worktree, not whatever
+                    // repository the pool happens to have been opened against.
+                    common_dir: context.repo_root.clone(),
                     worktree: None,
                 };
 
-                // A: git worktree remove.
+                // A: git worktree remove. An orphan has no live repository to
+                // deregister from, so it takes the filesystem route alone.
                 let mut cleanup_ok = true;
-                if let Err(e) = self.git.worktree_remove(&repo, Path::new(&path)) {
+                if w.tag != GC_TAG_ORPHANED
+                    && let Err(e) = self.git.worktree_remove(&repo, Path::new(&path))
+                {
                     errors.push(CleanupError {
                         name: w.name.clone(),
                         path: path.clone(),
@@ -387,8 +435,9 @@ impl Pool {
                 if cleanup_ok {
                     removed.insert(path.clone());
                     reclaimed.push(w.clone());
+                } else {
+                    reservation.restore_original(&mut state.worktrees[idx]);
                 }
-                // !cleanup_ok → entry stays in state, eligible for retry
             }
 
             state.worktrees.retain(|e| !removed.contains(&e.path));
@@ -396,6 +445,48 @@ impl Pool {
                 .map_err(|e| PoolError::Io("writing state".into(), e))?;
             Ok::<_, PoolError>((reclaimed, errors))
         })
+    }
+
+    /// The last word on disposability, run inside the deleting lock. `true`
+    /// means the slot must be left alone.
+    ///
+    /// Every condition the plan checked is checked again against the state
+    /// just read: a valid lease taken during the unlocked hook window, a
+    /// process that walked in, dirtiness, and merge state. Fails closed on
+    /// ambiguity — an `is_dirty` that errors counts as dirty.
+    fn final_gc_safety_check(
+        &self,
+        wt: &WorktreeEntry,
+        context: &crate::prune::PruneContext,
+        opts: &GcOptions,
+    ) -> bool {
+        let now = chrono::Utc::now();
+        // A valid lease taken between plan and delete makes the slot off limits
+        // — this is the whole point of the two-phase contract.
+        if wt.leased && !wt.is_stale_lease(now) {
+            return true;
+        }
+        if self
+            .process
+            .is_worktree_in_use(Path::new(&wt.path))
+            .unwrap_or(true)
+        {
+            return true;
+        }
+        if self.backing_repository_missing(&wt.path) {
+            return !opts.prune_orphans;
+        }
+        if self.git.is_dirty(Path::new(&wt.path)).unwrap_or(true) {
+            return true;
+        }
+        let Some(default_ref) = context.default_ref.as_deref() else {
+            return true;
+        };
+        !matches!(
+            self.git
+                .is_head_merged_into_ref(Path::new(&wt.path), default_ref),
+            Ok(true)
+        )
     }
 }
 
@@ -513,6 +604,7 @@ mod tests {
                     holder: "test-agent".into(),
                     ttl: Some(chrono::Duration::hours(1)),
                 }),
+                ..Default::default()
             })
             .unwrap();
         let wt_path = acquired.path.clone();
@@ -691,5 +783,60 @@ mod tests {
             // FILE_ATTRIBUTE_NORMAL = 0x80
             SetFileAttributesW(wide.as_ptr(), 0x80);
         }
+    }
+
+    // ─── M-020: gc resolves each slot's repository from its own path ──────
+
+    /// M-020: `gc --all` opens the pool BY DIRECTORY, so `self.root` is the
+    /// pool directory's parent — not a repository. One pool-wide root therefore
+    /// failed to resolve for every slot, `default_ref` came back unresolved,
+    /// and every candidate was skipped as unverifiable: `gc --all` reclaimed
+    /// nothing, forever. Each slot must be resolved from its OWN path.
+    #[test]
+    fn gc_under_an_all_sweep_resolves_each_slots_own_repository() {
+        let (pool, wt_path, _home, _repo) = setup_gc_test();
+        let swept = Pool::open_at(pool.pool_dir(), &OpenOptions::default()).unwrap();
+        assert_eq!(
+            swept.root,
+            pool.pool_dir().parent().unwrap(),
+            "an --all sweep has no repository as its root"
+        );
+
+        let result = swept
+            .gc(&GcOptions {
+                dry_run: false,
+                prune_orphans: false,
+            })
+            .unwrap();
+
+        assert!(
+            result.skipped.is_empty(),
+            "no slot should be unverifiable under a per-slot root, got: {:?}",
+            result.skipped
+        );
+        assert_eq!(
+            result.reclaimed.len(),
+            1,
+            "the expired-lease worktree must actually be reclaimed"
+        );
+        assert!(!wt_path.exists(), "the worktree directory must be gone");
+    }
+
+    /// The repository passed to `git worktree remove` must be the one that
+    /// OWNS the worktree. A pool-wide root deregisters the wrong clone's
+    /// bookkeeping; this pins the per-slot context that reaches the executor.
+    #[test]
+    fn gc_context_points_at_the_owning_repository() {
+        let (pool, wt_path, _home, _repo) = setup_gc_test();
+        let mut resolver = crate::prune::PruneContextResolver::new(&pool);
+        let state = crate::state::State::read_state(pool.pool_dir()).unwrap();
+        let wt = state.worktrees.iter().find(|w| w.path == wt_path).unwrap();
+        let context = resolver.context(wt).unwrap();
+        assert!(
+            context.repo_root.ends_with("repo"),
+            "must resolve the worktree's own repository, got: {:?}",
+            context.repo_root
+        );
+        assert!(!context.repo_root.starts_with(&pool.root));
     }
 }

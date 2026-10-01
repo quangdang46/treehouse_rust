@@ -23,6 +23,16 @@ owo-colors = { version = "4.3.0", features = ["supports-colors"] }
 rand = "0.9"
 humantime = "2.1.0"
 sha2 = "0.10"
+# Release-asset pipeline behind `treehouse update` (crates/treehouse-core/src/updater.rs):
+# gzip + tar for the unix assets the release workflow builds, zip for the Windows
+# asset. Both are declared with default features OFF — the workflow produces
+# plain DEFLATE tar.gz / zip, and the default feature sets drag in xattr (tar)
+# and aes-crypto/zstd/xz/lzma/bzip2/ppmd (zip) that we never call. `zip` is NOT
+# target-gated to Windows: gating it would leave the extraction path unbuildable
+# and therefore untested on the Linux/macOS CI that actually runs the suite.
+flate2 = "1.1.10"
+tar = { version = "0.4.46", default-features = false }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 # TOON encoder (toon_rust). Package name is `tru` (v0.2.2), lib name `toon` —
 # imports use `use toon::...`. MSRV 1.88, edition 2024, license MIT +
 # OpenAI/Anthropic Rider (NOT plain MIT — see docs/rust-port-plan.md §3/§5.4).

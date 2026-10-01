@@ -18,24 +18,43 @@ use serde::{Deserialize, Serialize};
 use crate::env::TreehouseEnv;
 
 /// Repo-safe + user config settings.
+///
+/// The struct-level `#[serde(default)]` is load-bearing and must not be
+/// narrowed back to per-field attributes. Go decodes a config file ONTO a
+/// `DefaultConfig()` (`internal/config/config.go:157` then `:163`
+/// `toml.DecodeFile(repoPath, &cfg)`), so a key the document omits keeps the
+/// default it already had. Deserializing into a fresh struct instead makes
+/// every field mandatory in practice — which is how a documented hooks-only
+/// `~/.config/treehouse/config.toml` came to hard-fail with
+/// `missing field 'max_trees'` on every repo-scoped command.
+///
+/// Starting from [`TreehouseConfig::default_config`] here reproduces Go's
+/// semantics for every field, including keys added later: a new field is
+/// optional-by-construction instead of needing its own `#[serde(default)]`
+/// remembered.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TreehouseConfig {
     pub max_trees: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
-    #[serde(default, skip_serializing_if = "Hooks::is_empty")]
+    #[serde(skip_serializing_if = "Hooks::is_empty")]
     pub hooks: Hooks,
     /// P1 additive: default TTL for `treehouse run` leases. Zero/None = no TTL.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_ttl_secs: Option<u64>,
 }
 
 /// Lifecycle hooks (user-level only; repo hooks are ignored for safety).
+///
+/// Same decode-onto-default contract as [`TreehouseConfig`]: `[hooks]` with only
+/// one of the two keys must leave the other empty, not fail the whole file.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Hooks {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub post_create: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pre_destroy: Vec<String>,
 }
 
@@ -73,13 +92,15 @@ impl TreehouseConfig {
         if has_repo_config {
             let text = std::fs::read_to_string(&repo_path)
                 .map_err(|e| ConfigError::Io(repo_path.display().to_string(), e))?;
-            let decoded: TreehouseConfig = toml::from_str(&text)
+            let mut decoded: TreehouseConfig = toml::from_str(&text)
                 .map_err(|e| ConfigError::Toml(repo_path.display().to_string(), e.to_string()))?;
-            cfg.max_trees = decoded.max_trees;
-            cfg.root = decoded.root;
-            cfg.lease_ttl_secs = decoded.lease_ttl_secs;
-            // Repo hooks are ignored for safety.
-            cfg.hooks = Hooks::default();
+            // Repo hooks are ignored for safety. Assign the decoded config
+            // wholesale rather than copying field by field: a field added
+            // later is then picked up from treehouse.toml automatically instead
+            // of silently reading as the default because nobody remembered to
+            // add it to a copy list.
+            decoded.hooks = Hooks::default();
+            cfg = decoded;
         }
 
         let (user_cfg, has_user_config) = load_user()?;
@@ -322,13 +343,12 @@ impl TreehouseConfig {
             let text = env
                 .read_file(&repo_path)
                 .map_err(|e| ConfigError::Io(repo_path.display().to_string(), e))?;
-            let decoded: TreehouseConfig = toml::from_str(&text)
+            let mut decoded: TreehouseConfig = toml::from_str(&text)
                 .map_err(|e| ConfigError::Toml(repo_path.display().to_string(), e.to_string()))?;
-            cfg.max_trees = decoded.max_trees;
-            cfg.root = decoded.root;
-            cfg.lease_ttl_secs = decoded.lease_ttl_secs;
-            // Repo hooks are ignored for safety.
-            cfg.hooks = Hooks::default();
+            // Repo hooks are ignored for safety — same wholesale-assignment
+            // rationale as `load`.
+            decoded.hooks = Hooks::default();
+            cfg = decoded;
         }
 
         let (user_cfg, has_user_config) = load_user_with_env(env)?;
@@ -608,7 +628,9 @@ mod tests {
         let env = crate::env::InMemoryEnv::new(PathBuf::from("/test"));
         // Seed repo config
         env.seed_file(Path::new("/test/repo/treehouse.toml"), b"max_trees = 4\n");
-        // Seed user config with hooks (must include max_trees for TOML parse)
+        // Seed user config with hooks. `max_trees = 99` is deliberately
+        // different from the repo's 4 so this still exercises repo-over-user
+        // precedence rather than just agreeing values.
         env.seed_file(
             Path::new("/test/config/config.toml"),
             b"max_trees = 99\n[hooks]\npost_create = [\"./setup.sh\"]\n",
@@ -618,6 +640,120 @@ mod tests {
         assert_eq!(cfg.max_trees, 4);
         // User provides hooks
         assert_eq!(cfg.hooks.post_create, ["./setup.sh"]);
+    }
+
+    // ─── absent keys keep their default (M-007) ────────────────────────────
+    //
+    // Go decodes a config file ONTO a DefaultConfig(), so every key is
+    // optional. These tests pin that contract: a treehouse.toml or config.toml
+    // that omits a key must load with the default, never fail to parse.
+
+    #[test]
+    fn repo_config_omitting_max_trees_keeps_default() {
+        let _guard = env_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // A treehouse.toml that only sets `root` — previously a hard
+        // `missing field 'max_trees'` error that broke every repo-scoped
+        // command (status/get/prune/destroy) in the repo.
+        std::fs::write(dir.path().join("treehouse.toml"), "root = \"pools\"\n").unwrap();
+
+        let cfg = TreehouseConfig::load(dir.path()).unwrap();
+        assert_eq!(
+            cfg.max_trees, DEFAULT_MAX_TREES,
+            "absent key must keep default"
+        );
+        assert_eq!(cfg.root.as_deref(), Some("pools"));
+    }
+
+    #[test]
+    fn hooks_only_user_config_keeps_default_max_trees() {
+        let _guard = env_lock().lock().unwrap();
+        // The exact shape the Go README tells users to paste into
+        // ~/.config/treehouse/config.toml: a [hooks] table and nothing else.
+        let fake_home = tempfile::tempdir().unwrap();
+        let user_dir = fake_home.path().join(".config").join("treehouse");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::write(
+            user_dir.join("config.toml"),
+            "[hooks]\npre_destroy = [\"./scripts/cleanup.sh\"]\n",
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = TreehouseConfig::load(dir.path()).unwrap();
+        assert_eq!(cfg.max_trees, DEFAULT_MAX_TREES);
+        assert_eq!(cfg.hooks.pre_destroy, ["./scripts/cleanup.sh"]);
+
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn hooks_only_user_config_keeps_default_max_trees_via_env() {
+        let env = crate::env::InMemoryEnv::new(PathBuf::from("/test"));
+        env.seed_file(
+            Path::new("/test/config/config.toml"),
+            b"[hooks]\npost_create = [\"./setup.sh\"]\n",
+        );
+        let cfg = TreehouseConfig::load_with_env(Path::new("/test/repo"), &env).unwrap();
+        assert_eq!(cfg.max_trees, DEFAULT_MAX_TREES);
+        assert_eq!(cfg.hooks.post_create, ["./setup.sh"]);
+    }
+
+    #[test]
+    fn load_with_env_repo_config_omitting_max_trees_keeps_default() {
+        let env = crate::env::InMemoryEnv::new(PathBuf::from("/test"));
+        env.seed_file(
+            Path::new("/test/repo/treehouse.toml"),
+            b"root = \"worktrees\"\n",
+        );
+        let cfg = TreehouseConfig::load_with_env(Path::new("/test/repo"), &env).unwrap();
+        assert_eq!(cfg.max_trees, DEFAULT_MAX_TREES);
+        assert_eq!(cfg.root.as_deref(), Some("worktrees"));
+    }
+
+    #[test]
+    fn partial_hooks_table_keeps_the_other_key_empty() {
+        // Same decode-onto-default contract one level down: naming only one key
+        // under [hooks] must not fail the file.
+        let env = crate::env::InMemoryEnv::new(PathBuf::from("/test"));
+        env.seed_file(
+            Path::new("/test/config/config.toml"),
+            b"[hooks]\npost_create = [\"./setup.sh\"]\n",
+        );
+        let cfg = TreehouseConfig::load_with_env(Path::new("/test/repo"), &env).unwrap();
+        assert_eq!(cfg.hooks.post_create, ["./setup.sh"]);
+        assert!(cfg.hooks.pre_destroy.is_empty());
+    }
+
+    #[test]
+    fn explicit_max_trees_still_overrides_the_default() {
+        // Guard against "fixing" M-007 by making max_trees permanently
+        // default: an explicitly spelled key must still win.
+        let env = crate::env::InMemoryEnv::new(PathBuf::from("/test"));
+        env.seed_file(
+            Path::new("/test/repo/treehouse.toml"),
+            b"max_trees = 3\nroot = \"x\"\n",
+        );
+        let cfg = TreehouseConfig::load_with_env(Path::new("/test/repo"), &env).unwrap();
+        assert_eq!(cfg.max_trees, 3);
+    }
+
+    #[test]
+    fn wrong_type_for_a_present_key_is_still_an_error() {
+        // Decode-onto-default must not turn into decode-anything: a key that IS
+        // present but malformed has to fail closed.
+        let env = crate::env::InMemoryEnv::new(PathBuf::from("/test"));
+        env.seed_file(
+            Path::new("/test/repo/treehouse.toml"),
+            b"max_trees = \"lots\"\n",
+        );
+        let err = TreehouseConfig::load_with_env(Path::new("/test/repo"), &env).unwrap_err();
+        assert!(matches!(err, ConfigError::Toml(..)), "got {err}");
     }
 
     #[test]
