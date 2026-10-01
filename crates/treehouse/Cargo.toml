@@ -13,7 +13,19 @@ path = "src/main.rs"
 
 [features]
 default = []
-# Enable the TOON encoder (git dep, off by default so offline builds work).
+# The TOON encoder (git dep, off by default so offline builds work).
+#
+# OFF BY DEFAULT but REQUIRED IN SHIPPED BUILDS. `format.rs:render_toon` and
+# `main.rs:render_payload` fall back to serde_json without it, so a default
+# build answers `--format toon` with JSON — which is what the README and the
+# release notes promise against. `.github/workflows/release.yml` therefore
+# passes `--features toon` to both `cross build` and `cargo build`.
+#
+# Do NOT "fix" this by promoting it to `default`: that makes every contributor's
+# `cargo build` require a clone of Dicklesworthstone/toon_rust, and the pinned
+# git rev turns a cold checkout into a network dependency for the whole
+# workspace — including `cargo test --workspace`. The release build asks for the
+# feature explicitly instead, and the README's `cargo install` line does too.
 toon = ["treehouse-core/toon", "dep:tru"]
 
 [dependencies]

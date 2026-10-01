@@ -167,7 +167,12 @@ function Main {
         }
 
         # Checksum sidecar (optional) is named `<archive-base>.sha256` (no `.zip`).
-        $checksumUrl = "$url.sha256" -replace '\.zip$', ''
+        # release.yml writes it as `treehouse-${TAG}-${suffix}.sha256`, i.e. the
+        # `.zip` is stripped from the ARCHIVE name and `.sha256` appended. Strip
+        # before appending — `("$url.sha256") -replace '\.zip$',''` is a no-op,
+        # because the string then ends in `.sha256`, not `.zip`, and the request
+        # 404s into the catch below, silently skipping verification.
+        $checksumUrl = ($url -replace '\.zip$', '') + '.sha256'
         try {
             Invoke-WebRequest -Uri $checksumUrl -OutFile "$zipPath.sha256" -UseBasicParsing -TimeoutSec 30
             $expected = (Get-Content "$zipPath.sha256" -First 1).Split()[0]

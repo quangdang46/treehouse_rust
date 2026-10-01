@@ -19,14 +19,15 @@ use std::sync::Arc;
 
 use crate::config::{TreehouseConfig, resolve_pool_dir_with_env};
 use crate::env::{DefaultEnv, TreehouseEnv};
-use crate::git::{GitBackend, GitRepo};
+use crate::git::{GitBackend, GitError, GitErrorKind, GitRepo};
 use crate::hooks;
 use crate::lease::{Lease, LeaseInfo, mark_acquired_lease};
 use crate::lock::{DEFAULT_LOCK_TIMEOUT, LockError, with_state_lock};
 use crate::process::{ProcessInfo, ProcessTable};
 use crate::reservation;
-use crate::state::{State, WorktreeEntry, ZERO_TIME, heal_state};
+use crate::state::{SeedInventory, State, WorktreeEntry, ZERO_TIME, heal_state};
 use crate::state_file;
+use crate::vcs;
 
 /// Options for opening a pool.
 #[derive(Debug, Clone)]
@@ -85,6 +86,20 @@ pub struct AcquireOptions {
     pub worktree_path: Option<String>,
     /// Lease the worktree (non-interactive) instead of an owner reservation.
     pub lease: Option<LeaseAcquireOptions>,
+    /// Replace the committed `.worktreeinclude` for THIS acquisition (Go
+    /// `IncludeManifest`, `--include-file`).
+    ///
+    /// `None` uses the manifest committed at the destination worktree's HEAD.
+    /// `Some(bytes)` — including `Some(&[])` — replaces it, so an empty file
+    /// means "seed nothing" and must NOT fall back to the committed one.
+    pub include_manifest: Option<Vec<u8>>,
+    /// Opt in to copy-on-write sharing of tracked file data for a FRESH slot
+    /// (Go `APFSSharing`, `--apfs-sharing fresh`). Defaults to off.
+    ///
+    /// Only ever applied to a slot this acquisition just created. A recycled
+    /// slot may still have external writers, and neither reuse nor return is
+    /// an invitation to sweep it.
+    pub apfs_sharing: bool,
 }
 
 /// Options for a lease acquisition.
@@ -171,7 +186,10 @@ pub(crate) fn resolve_worktree_path(
         .replace(PLACEHOLDER_POOL, &pool_dir.to_string_lossy())
         .replace(PLACEHOLDER_SLOT, slot)
         .replace(PLACEHOLDER_REPO, &repo_name)
-        .replace(PLACEHOLDER_REPO_PARENT, &repo_root.parent().unwrap_or(repo_root).to_string_lossy());
+        .replace(
+            PLACEHOLDER_REPO_PARENT,
+            &repo_root.parent().unwrap_or(repo_root).to_string_lossy(),
+        );
 
     let resolved = PathBuf::from(clean_slash_path(&replaced));
     if !resolved.is_absolute() {
@@ -516,6 +534,31 @@ impl Pool {
         Ok(self.git.is_dirty(path)?)
     }
 
+    /// Whether a pool SLOT is dirty, answered by the backend that slot's own
+    /// marker names (Go `vcs.IsDirty`, vcs.go:648-650).
+    ///
+    /// Go's `IsDirty` is exactly `backendForWorktree(path).IsDirty(path)` — it
+    /// dispatches on the SLOT, never on whichever backend the pool happened to be
+    /// opened with. Asking `self.git` instead would run git commands inside a
+    /// `.jj` workspace and report the failure in git's vocabulary, which hides
+    /// the real cause. For a git slot the answer is unchanged, because the
+    /// registry's git and the pool's git are both `ShellGitBackend::discover()`
+    /// over the same `GIT_BIN` → `PATH` lookup.
+    ///
+    /// A markerless path still answers: [`vcs::backend_for_worktree`] falls
+    /// back to the default backend for reads, because reading a status is
+    /// harmless where rewriting a checkout is not. A slot the seam cannot
+    /// resolve at all reads as CLEAN, preserving the `.unwrap_or(false)` this
+    /// call site already applied — and `status` only reaches here after
+    /// [`slot_backend_name`] has refused anything that is not a git slot as
+    /// damaged.
+    fn slot_is_dirty(&self, slot: &Path) -> bool {
+        match vcs::backend_for_worktree(slot) {
+            Ok(backend) => backend.is_dirty(slot).unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
     /// Whether `dir` is a treehouse pool directory (Go `pool.IsPoolDir`).
     ///
     /// The state file is the marker, exactly as upstream: a directory that only
@@ -628,13 +671,13 @@ impl Pool {
             validate_branch_name(new_branch)?;
             // Fails if the branch ALREADY exists: `-b` creates, it never
             // adopts (Go pool.go:412-418).
-            if self.git.local_branch_exists(&repo_for_branch(&self.root), new_branch) {
+            if self
+                .git
+                .local_branch_exists(&repo_for_branch(&self.root), new_branch)
+            {
                 return Err(PoolError::Io(
                     format!("branch {new_branch:?} already exists"),
-                    std::io::Error::new(
-                        std::io::ErrorKind::AlreadyExists,
-                        "branch already exists",
-                    ),
+                    std::io::Error::new(std::io::ErrorKind::AlreadyExists, "branch already exists"),
                 ));
             }
         }
@@ -660,7 +703,13 @@ impl Pool {
         let requester = RequesterIdentity::resolve(self.git.as_ref(), &self.root);
 
         // Step 2 (LOCK #1): read + heal + scan + mark acquired + write.
-        let (name, path, lease) = acquire_locked(
+        let AcquiredSlot {
+            name,
+            path,
+            lease,
+            origin,
+            prior_inventory,
+        } = acquire_locked(
             &self.dir,
             self.lock_timeout,
             self.config.max_trees,
@@ -673,11 +722,37 @@ impl Pool {
             &requester,
         )?;
 
-        // Step 3 (OUTSIDE lock): reset the worktree to the default branch.
+        // Step 3 (OUTSIDE lock): reset the worktree to the base branch.
         // The reservation held since step 2 is the anti-TOCTOU wall.
-        self.git
-            .reset_worktree(Path::new(&path), &branch)
-            .map_err(PoolError::Git)?;
+        //
+        // Dispatched through the VCS seam rather than straight at `self.git`,
+        // so a slot whose marker names another backend is handled by THAT
+        // backend (Go `vcs.ResetWorktree`). For a git slot this resolves to the
+        // git backend; for a slot with no marker it refuses instead of
+        // resetting whatever repository encloses the pool.
+        let slot = Path::new(&path);
+        let backend = vcs::destructive_backend_for_worktree(slot).map_err(PoolError::Git)?;
+        reset_for_acquisition(&backend, slot, &branch, &prior_inventory, origin)?;
+
+        // Step 3a (OUTSIDE lock): copy the ignored files this pool is
+        // responsible for into the slot (Go `seedWorktree`, pool.go:697).
+        //
+        // Runs on BOTH origins, after the reset and before the branch is
+        // created, matching Go. The returned inventory is the only record of
+        // what a later reset may delete, so it is computed here and persisted
+        // in step 4.
+        let seeded = backend
+            .seed_worktree(&repo, slot, opts.include_manifest.as_deref())
+            .map_err(|e| {
+                PoolError::Git(GitError::new(
+                    format!("seeding worktree {}", slot.display()),
+                    format!(
+                        "failed to seed .worktreeinclude into {}: {e}",
+                        slot.display()
+                    ),
+                    GitErrorKind::Other,
+                ))
+            })?;
 
         // Step 3b (OUTSIDE lock): create and check out the requested branch.
         //
@@ -686,8 +761,8 @@ impl Pool {
         // was actually acquired at — creating it earlier would pin it to
         // whatever HEAD the slot happened to be recycled with.
         if let Some(new_branch) = opts.new_branch.as_deref() {
-            self.git
-                .create_branch(Path::new(&path), new_branch)
+            backend
+                .create_branch(slot, new_branch)
                 .map_err(PoolError::Git)?;
         }
 
@@ -698,12 +773,39 @@ impl Pool {
             heal_state(&mut state, |pid| self.process.started_at(pid));
             // Reservation check: if the worktree vanished or was re-acquired
             // mid-reset, surface it rather than returning a stale handle.
-            if state.worktrees.iter().any(|w| w.name == name) {
+            if let Some(wt) = state.worktrees.iter_mut().find(|w| w.name == name) {
+                // The seed inventory is recorded HERE, under the second lock,
+                // and only once the files are actually on disk. Recording it
+                // earlier would let a crash between the two leave a reset
+                // authorized to delete files that were never copied.
+                wt.set_seed_inventory(SeedInventory {
+                    paths: seeded.clone(),
+                    known: true,
+                    backend: backend.name().to_string(),
+                    // Go records a jj seed-authentication identity here. This
+                    // port seeds git worktrees only and has no such marker, so
+                    // the field stays empty rather than carrying a value that
+                    // nothing would ever verify.
+                    auth_identity: String::new(),
+                });
+                wt.set_base_branch(&branch);
                 state_file::write_state(&self.dir, &state)
                     .map_err(|e| PoolError::Io("writing state".to_string(), e))?;
             }
             Ok(())
         })?;
+
+        // Step 4b (OUTSIDE lock): opt-in APFS sharing, FRESH slots only
+        // (Go pool.go:782-795).
+        //
+        // Deliberately not on the recycled path: a reused slot may still have
+        // external writers, and neither `return` nor reuse is an invitation to
+        // sweep it. The module's own contract requires exclusive ownership of
+        // the destination for the whole pass, which only a slot this
+        // acquisition just created can promise.
+        if origin == SlotOrigin::Fresh && opts.apfs_sharing {
+            share_slot_files(&self.root, slot, &mut std::io::stderr());
+        }
 
         // Step 5 (OUTSIDE lock): run post_create hooks (lease mode routes
         // stdout to stderr so machine output stays clean).
@@ -835,20 +937,48 @@ impl Pool {
         // LOCK #1: find + validate preconditions + before_reset (under lock,
         // per Go doc — caller's termination/detachment can't race). The entry
         // is still reserved.
-        with_pool_lock(&self.dir, self.lock_timeout, || {
+        //
+        // The seed inventory is captured HERE, under the lock that proves the
+        // entry is still releasable, and handed to the reset outside it. Reading
+        // it after the unlock would race a concurrent acquisition that has
+        // already reserved the slot and re-seeded it: the reset would then
+        // delete files belonging to the NEW occupant.
+        let prior_inventory = with_pool_lock(&self.dir, self.lock_timeout, || {
             let mut state = State::read_state(&self.dir).map_err(PoolError::State)?;
-            let _ = releasable_worktree(&mut state, worktree_path, preconditions, &self.process)?;
+            let wt = releasable_worktree(&mut state, worktree_path, preconditions, &self.process)?;
+            let inventory = wt.seed_inventory();
             if let Some(cb) = before_reset {
                 cb()?;
             }
-            Ok(())
+            Ok(inventory)
         })?;
 
         // OUTSIDE the lock: reset the worktree. The reservation is still held,
         // so no acquire/destroy can take it mid-reset.
-        self.git
-            .reset_worktree(Path::new(worktree_path), &branch)
-            .map_err(PoolError::Git)?;
+        //
+        // A slot whose seed inventory is KNOWN is reset through
+        // `reset_worktree_with_seeded_paths`, which removes exactly those files
+        // and then resets (Go `ResetWorktreeWithSeededPaths`, pool.go:1060). An
+        // ignored file the pool copied is invisible to `clean -fd`, so without
+        // this the pool's own seeds accumulate in a slot forever.
+        //
+        // A slot with NO known inventory authorizes no deletion at all, and
+        // resets plainly instead: the tracked tree is restored and nothing the
+        // pool cannot account for is removed.
+        let slot = Path::new(worktree_path);
+        match prior_inventory.authorized_paths() {
+            Some(seeded) => {
+                vcs::destructive_backend_for_worktree(slot)
+                    .map_err(PoolError::Git)?
+                    .reset_worktree_with_seeded_paths(slot, &branch, seeded)
+                    .map_err(PoolError::Git)?;
+            }
+            None => {
+                self.git
+                    .reset_worktree(slot, &branch)
+                    .map_err(PoolError::Git)?;
+            }
+        }
 
         // LOCK #2: RE-VALIDATE the preconditions AND clear in ONE atomic lock.
         // This is what makes release exactly-once (ABA-safe): a concurrent
@@ -860,6 +990,12 @@ impl Pool {
             wt.owner_pid = 0;
             wt.owner_started_at = 0;
             crate::state::clear_lease(wt);
+            // A returned slot holds nothing this pool put there: the inventory
+            // becomes a VERIFIED empty one (Go `releaseEntry`, pool.go:1466),
+            // so the next acquisition reads "seeded nothing" and deletes
+            // nothing, rather than acting on a list that no longer describes
+            // the slot.
+            wt.clear_seed_inventory();
             state_file::write_state(&self.dir, &state)
                 .map_err(|e| PoolError::Io("writing state".to_string(), e))?;
             Ok(())
@@ -929,7 +1065,7 @@ impl Pool {
                     // slot whose contents cannot be read is never mistaken for
                     // one that was read and found changed.
                     ws.status = STATUS_DAMAGED.to_string();
-                } else if self.git.is_dirty(Path::new(&wt.path)).unwrap_or(false) {
+                } else if self.slot_is_dirty(Path::new(&wt.path)) {
                     ws.status = STATUS_DIRTY.to_string();
                 }
                 // A slot the recovery scan adopted but could not read is
@@ -993,7 +1129,7 @@ fn acquire_locked(
     branch: &str,
     repo: &GitRepo,
     requester: &RequesterIdentity,
-) -> Result<(String, String, Option<Lease>), PoolError> {
+) -> Result<AcquiredSlot, PoolError> {
     with_state_lock(dir, lock_timeout, || {
         let mut state = State::read_state(dir).map_err(PoolError::State)?;
         heal_state(&mut state, |pid| process.started_at(pid));
@@ -1065,10 +1201,17 @@ fn acquire_locked(
             };
             if let Some((name, path)) = candidate {
                 // Stamp the reservation (persisted now).
+                let prior = state.worktrees[i].seed_inventory();
                 let lease_info = mark_acquired_entry(&mut state.worktrees[i], opts, process);
                 state_file::write_state(dir, &state)
                     .map_err(|e| PoolError::Io("writing state".to_string(), e))?;
-                return Ok((name, path, lease_info));
+                return Ok(AcquiredSlot {
+                    name,
+                    path,
+                    lease: lease_info,
+                    origin: SlotOrigin::Recycled,
+                    prior_inventory: prior,
+                });
             }
         }
 
@@ -1101,9 +1244,40 @@ fn acquire_locked(
         state_file::write_state(dir, &state)
             .map_err(|e| PoolError::Io("writing state".to_string(), e))?;
         let path_str = wt_path.to_string_lossy().into_owned();
-        Ok((name, path_str, lease_info))
+        Ok(AcquiredSlot {
+            name,
+            path: path_str,
+            lease: lease_info,
+            origin: SlotOrigin::Fresh,
+            // A slot this call just created has nothing in it that we seeded,
+            // so there is no inventory to honour and none to remove.
+            prior_inventory: SeedInventory::default(),
+        })
     })
     .map_err(Pool::lock_err_ty)
+}
+
+/// Whether a slot was reused or created, and what its previous occupant left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SlotOrigin {
+    /// An available slot this acquisition handed back.
+    Recycled,
+    /// A worktree this acquisition just created.
+    Fresh,
+}
+
+/// A slot the pool has reserved, returned by [`acquire_locked`].
+///
+/// `prior_inventory` is read under the SAME lock that stamped the reservation.
+/// Reading it afterwards would be a race: the entry that recorded it may have
+/// been rewritten by a concurrent acquisition between the unlock and the read,
+/// and a reset that removes the wrong paths is not a recoverable mistake.
+pub(crate) struct AcquiredSlot {
+    pub name: String,
+    pub path: String,
+    pub lease: Option<Lease>,
+    pub origin: SlotOrigin,
+    pub prior_inventory: SeedInventory,
 }
 
 /// The outcome of comparing a candidate slot against the requester's clone.
@@ -1185,15 +1359,23 @@ impl RequesterIdentity {
     /// worktree could not be read, or git failed — and every one of those means
     /// the answer is unknown, so the slot is left alone.
     ///
-    /// Go pins the verified commit SHA and HEAD so the guard and the reset
-    /// target the same object, and consults a second reading (the slot's
-    /// recorded base branch) when the first says unsafe. Neither is ported: the
-    /// `GitBackend` trait exposes no ref-to-SHA or HEAD accessor to pin against,
-    /// and this port's `WorktreeEntry` carries Go's `base_branch` only as an
-    /// uninterpreted `extra` field, so the second reading's required "HEAD did
-    /// not move between the two readings" guard has nothing to compare. What
-    /// ships is the first reading alone, which is strictly safer than the code
-    /// it replaces (no check at all) and strictly less permissive than Go.
+    /// This is the reuse loop's cheap SCREEN, not the authoritative guard, and
+    /// the two are deliberately different calls. The screen asks only "is this
+    /// slot worth taking?" and a wrong answer costs one skipped slot, so it
+    /// stays a single `merge-base` against an unresolved ref. The authoritative
+    /// pair — [`crate::vcs::is_worktree_safe_to_reset`] and
+    /// [`crate::vcs::reset_worktree_to_ref`], reached from
+    /// [`reset_for_acquisition`] as step 3 of [`Pool::get`] — pins the verified
+    /// commit SHA together with the HEAD the ancestry check observed, and makes
+    /// the RESET re-verify both under git's own `HEAD.lock`. Nothing between
+    /// this screen and that reset can discard a commit silently, which is the
+    /// whole reason the pair exists.
+    ///
+    /// Go's SECOND reading — the slot's recorded base branch, consulted when the
+    /// first says unsafe — is still absent, because this port's
+    /// `WorktreeEntry` carries Go's `base_branch` only as an uninterpreted
+    /// `extra` field, so its "HEAD did not move between the two readings"
+    /// guard has nothing to compare.
     fn safe_to_reset(&self, git: &dyn GitBackend, slot: &Path, branch: &str) -> bool {
         let Some(root) = &self.root else {
             return false;
@@ -1207,6 +1389,358 @@ impl RequesterIdentity {
         );
         matches!(git.is_head_merged_into_ref(slot, &ref_), Ok(true))
     }
+}
+
+/// Restores `slot` to `branch` for a new occupant, closing the two races a
+/// plain `reset_worktree` leaves open.
+///
+/// Go does this with one call, `vcs.ResetWorktreeToRefWithSeededPaths` — guard,
+/// then seed removal, then the guarded reset, all under git's `HEAD.lock`
+/// (gitvcs.go:808). This seam ships the guard (`is_worktree_safe_to_reset` +
+/// `reset_worktree_to_ref`) and the seed-removal validator
+/// ([`vcs::validate_seed_inventory`]) as separate pieces, so this composes them
+/// in Go's order.
+///
+/// **Why the guarded pair and not `reset_worktree`.** Between the reuse loop's
+/// safety check and the reset, a commit can land, or a file can be modified.
+/// A plain reset discards both while every check reports success. The guarded
+/// pair re-reads HEAD and re-checks dirtiness while holding git's own
+/// `HEAD.lock`, so a change in that window is refused instead of destroyed.
+/// When the checks pass, the worktree lands on exactly the commit it would
+/// have before — same commit, same contents, plus two races closed.
+///
+/// `require_clean` is true only for a RECYCLED slot. Go's fresh path never
+/// resets at all, so it never requires a clean tree; requiring it here would
+/// newly fail an acquisition whose checkout filters left an untracked file
+/// behind — a case that succeeds today and has nothing to do with the races.
+fn reset_for_acquisition(
+    backend: &Arc<dyn GitBackend>,
+    slot: &Path,
+    branch: &str,
+    prior: &SeedInventory,
+    origin: SlotOrigin,
+) -> Result<(), PoolError> {
+    // Non-git slots keep the pre-seam behavior. The guarded helpers shell out
+    // to git, and a jj workspace has no git HEAD to lock — running them there
+    // would guard the wrong repository rather than a wrong one.
+    //
+    // A git binary we cannot resolve is the same situation: the pool was
+    // opened, so this is unexpected, but a slot that resets unguarded is
+    // exactly what happened before this change and losing the guard is better
+    // than failing every acquisition.
+    let guarded = if backend.name() == vcs::BACKEND_GIT {
+        resolved_git_bin()
+    } else {
+        None
+    };
+
+    let Some(git_bin) = guarded else {
+        return backend.reset_worktree(slot, branch).map_err(PoolError::Git);
+    };
+
+    // The guard is taken BEFORE anything is deleted, so a refusal leaves the
+    // slot exactly as it was. Both SHAs it returns travel into the reset: they
+    // are only meaningful as a pair, and re-deriving either at reset time is
+    // the bug the pair exists to prevent.
+    let guard = vcs::is_worktree_safe_to_reset(&git_bin, backend.as_ref(), slot, branch)
+        .map_err(PoolError::Git)?;
+    if !guard.safe {
+        return Err(PoolError::Git(GitError::new(
+            "worktree reset",
+            format!(
+                "refusing to reset {} to {branch:?}: its HEAD holds commits that \
+                 branch does not contain",
+                slot.display()
+            ),
+            GitErrorKind::Other,
+        )));
+    }
+
+    // Only now, with the slot proven reusable, remove what the pool itself put
+    // there. `authorized_paths` returns None for a missing OR empty inventory,
+    // so an entry that lost its bookkeeping deletes nothing — the safety
+    // property this whole seam exists for.
+    if let Some(paths) = prior.authorized_paths() {
+        remove_seeded_paths(slot, paths)?;
+    }
+
+    vcs::reset_worktree_to_ref(
+        &git_bin,
+        backend.as_ref(),
+        slot,
+        &guard.reset_ref,
+        &guard.head,
+        origin == SlotOrigin::Recycled,
+    )
+    .map_err(PoolError::Git)
+}
+
+/// Deletes exactly the paths a prior seeding recorded, and nothing else.
+///
+/// [`vcs::validate_seed_inventory`] runs FIRST and gates everything: it refuses
+/// an empty list outright and rejects any entry that is absolute, contains `..`,
+/// carries a backslash or NUL, or starts with `.git`/`.jj`. Only once the whole
+/// inventory has been cleared is a single path touched.
+///
+/// Removal happens before the tracked tree is rewritten, so the inventory stays
+/// the authority on what may be deleted: a tracked path can only appear at a
+/// seeded location after `read-tree -u` restores it.
+///
+/// A listed path that is already gone is not a failure — the inventory is
+/// permission to delete, not an obligation. A path that is neither a file nor a
+/// directory (a socket, a device) IS a failure: refusing leaves the operator
+/// looking at a real file this tool cannot safely remove, which beats silently
+/// unlinking something it did not create.
+fn remove_seeded_paths(slot: &Path, seeded: &[String]) -> Result<(), PoolError> {
+    vcs::validate_seed_inventory(seeded).map_err(PoolError::Git)?;
+    for name in seeded {
+        let target = slot.join(name);
+        match std::fs::symlink_metadata(&target) {
+            // `symlink_metadata` does not follow, so a symlink is removed as a
+            // link rather than as whatever it points at. Seeding flattens
+            // symlinks into regular files precisely so this never has to guess.
+            Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&target).map_err(|e| {
+                PoolError::Git(GitError::new(
+                    "worktree reset",
+                    format!("removing seeded directory {}: {e}", target.display()),
+                    GitErrorKind::Other,
+                ))
+            })?,
+            Ok(meta) if meta.is_file() || meta.file_type().is_symlink() => {
+                std::fs::remove_file(&target).map_err(|e| {
+                    PoolError::Git(GitError::new(
+                        "worktree reset",
+                        format!("removing seeded file {}: {e}", target.display()),
+                        GitErrorKind::Other,
+                    ))
+                })?;
+            }
+            Ok(_) => {
+                return Err(PoolError::Git(GitError::new(
+                    "worktree reset",
+                    format!(
+                        "seeded path {} is neither a file nor a directory; refusing \
+                         to remove it",
+                        target.display()
+                    ),
+                    GitErrorKind::Other,
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(PoolError::Git(GitError::new(
+                    "worktree reset",
+                    format!("reading seeded path {}: {e}", target.display()),
+                    GitErrorKind::Other,
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Shares tracked file data between the source checkout and a FRESH slot
+/// (Go `vcs.ShareWorktreeFiles`, gitvcs/sharing.go:19).
+///
+/// **Every failure path degrades to the plain copy the worktree already has.**
+/// The files are written by `git worktree add` before this runs, so a refusal
+/// here leaves a correct worktree that merely does not share storage. Failing
+/// the acquisition instead would make a performance option an availability
+/// hazard, and would be a behavior change for anyone who opts in and then hits
+/// a filesystem this module declines to touch.
+fn share_slot_files(repo_root: &Path, slot: &Path, err: &mut dyn std::io::Write) {
+    use crate::fileclone;
+
+    if !fileclone::SUPPORTED {
+        let _ = writeln!(err, "APFS sharing skipped: only supported on macOS/APFS");
+        return;
+    }
+    let reason = fileclone::filesystem_reason(repo_root, slot);
+    if !reason.is_empty() {
+        let _ = writeln!(err, "APFS sharing skipped: {reason}");
+        return;
+    }
+    let Some(git_bin) = resolved_git_bin() else {
+        let _ = writeln!(
+            err,
+            "APFS sharing skipped: no git binary to enumerate tracked paths"
+        );
+        return;
+    };
+
+    // The module's contract is that the caller EXCLUSIVELY owns the destination
+    // for the whole pass. Git's checkout and reference-transaction hooks run
+    // before this insertion point and may have left asynchronous writers
+    // behind, and a finished hook is not evidence that they are gone. Without
+    // these checks the pass could race a live writer and publish bytes it never
+    // hashed.
+    if let Some(reason) = concurrent_writer_reason(repo_root, &git_bin) {
+        let _ = writeln!(err, "APFS sharing skipped: {reason}");
+        return;
+    }
+
+    let listed = match git_out(&git_bin, slot, &["ls-files", "-z"]) {
+        Ok(v) => v,
+        Err(_) => {
+            let _ = writeln!(
+                err,
+                "APFS sharing skipped: tracked paths cannot be enumerated"
+            );
+            return;
+        }
+    };
+    let paths: Vec<String> = String::from_utf8_lossy(&listed)
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if paths.is_empty() {
+        return;
+    }
+
+    match fileclone::share(repo_root, slot, &paths) {
+        Ok(report) => {
+            let _ = writeln!(err, "{report}");
+        }
+        Err(e) => {
+            let _ = writeln!(
+                err,
+                "APFS sharing skipped: {e}; the worktree keeps its plain copy"
+            );
+        }
+    }
+}
+
+/// The git binary this pool was opened with, re-resolved through the same
+/// `GIT_BIN` → `PATH` lookup [`crate::git::ShellGitBackend::discover`] uses.
+fn resolved_git_bin() -> Option<PathBuf> {
+    crate::git::ShellGitBackend::discover()
+        .ok()
+        .map(|g| g.git_bin().to_path_buf())
+}
+
+/// Runs `git <args>` in `cwd` and returns raw stdout, NUL bytes intact.
+///
+/// Bytes, not text: `ls-files -z` separates paths with NUL precisely so that a
+/// filename containing a newline still round-trips, and decoding here would
+/// throw that away.
+///
+/// Failures are labelled by [`crate::vcs::git_label`], the one rule for what
+/// goes in a [`GitError`]'s `command` field — spelling "git " in here as well
+/// is what rendered `git git ls-files -z: …`.
+fn git_out(git_bin: &Path, cwd: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
+    let out = raw_git(git_bin, cwd, args)?;
+    if !out.0 {
+        return Err(GitError::new(
+            crate::vcs::git_label(args),
+            String::from_utf8_lossy(&out.2).trim().to_string(),
+            GitErrorKind::Other,
+        ));
+    }
+    Ok(out.1)
+}
+
+/// Runs `git <args>` in `cwd`, returning `(success, stdout, stderr)` WITHOUT
+/// treating a nonzero exit as an error.
+///
+/// Needed because `git config --get` exits 1 to mean "not set", which is the
+/// ordinary case — and which a caller must be able to tell apart from a real
+/// failure. Collapsing both into one `Err` makes the common case look like an
+/// unverifiable one.
+fn raw_git(
+    git_bin: &Path,
+    cwd: &Path,
+    args: &[&str],
+) -> Result<(bool, Vec<u8>, Vec<u8>), GitError> {
+    let out = std::process::Command::new(git_bin)
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| {
+            GitError::new(
+                crate::vcs::git_label(args),
+                e.to_string(),
+                GitErrorKind::Other,
+            )
+        })?;
+    Ok((out.status.success(), out.stdout, out.stderr))
+}
+
+/// Whether something may still be writing to these checkouts, which would make
+/// an exclusive-ownership assumption unsafe.
+///
+/// A user-defined fsmonitor, and an executable `post-checkout` or
+/// `reference-transaction` hook, may both have started background processes.
+/// Go checks the same two things for the same reason (gitvcs/sharing.go:26-56).
+/// This does NOT check smudge/clean filters: a filter that reports itself
+/// configured would mean giving up coverage on every LFS checkout, and Go
+/// declines the same trade.
+fn concurrent_writer_reason(repo_root: &Path, git_bin: &Path) -> Option<&'static str> {
+    match raw_git(git_bin, repo_root, &["config", "--get", "core.fsmonitor"]) {
+        Ok((true, value, _)) => {
+            // Booleans select git's BUILT-IN monitor, not a script. Only a
+            // non-boolean value names something that could be running.
+            let v = String::from_utf8_lossy(&value).trim().to_ascii_lowercase();
+            let builtin = matches!(
+                v.as_str(),
+                "" | "false" | "0" | "no" | "off" | "true" | "1" | "yes" | "on"
+            );
+            if !builtin {
+                return Some("Git fsmonitor hook may have started a writer");
+            }
+        }
+        // Exit code 1 is git's documented "key not set" — the ordinary case,
+        // and the one Go treats as safe (gitvcs/sharing.go:30-31). Any other
+        // failure leaves us unable to tell "unset" from "we could not ask",
+        // and unverifiable is not safe.
+        Ok((false, _, _)) => {}
+        Err(_) => return Some("Git fsmonitor configuration cannot be verified"),
+    }
+    for hook in ["post-checkout", "reference-transaction"] {
+        if let Some(reason) = hook_may_have_started_a_writer(repo_root, git_bin, hook) {
+            return Some(reason);
+        }
+    }
+    None
+}
+
+/// Whether `hook` is installed AND executable at the repository root.
+fn hook_may_have_started_a_writer(root: &Path, git_bin: &Path, hook: &str) -> Option<&'static str> {
+    let out = git_out(
+        git_bin,
+        root,
+        &["rev-parse", "--git-path", &format!("hooks/{hook}")],
+    )
+    .ok()?;
+    // Only the trailing newline is framing; whitespace inside a path is part
+    // of the path, and trimming it would point the check at the wrong file.
+    let raw = String::from_utf8_lossy(&out);
+    let reported = raw.strip_suffix('\n').unwrap_or(&raw);
+    let reported = Path::new(reported);
+    let path = if reported.is_absolute() {
+        reported.to_path_buf()
+    } else {
+        root.join(reported)
+    };
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if !meta.file_type().is_symlink() && meta.is_file() && is_executable(&meta) => {
+            Some("Git hook may have started a writer")
+        }
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => Some("Git hook configuration cannot be verified"),
+    }
+}
+
+#[cfg(unix)]
+fn is_executable(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_meta: &std::fs::Metadata) -> bool {
+    false
 }
 
 /// Marks an entry as acquired (owner reservation or lease), returning lease
@@ -1461,23 +1995,28 @@ pub(crate) fn next_free_name(pool_dir: &Path, state: &State) -> String {
 /// instead — destroy classifies it unverified, prune skips it as
 /// unverifiable, and neither path ever resets it.
 ///
-/// lstat-then-stat, matching `git::shell::require_worktree_marker` and
-/// `state::marker_backend`: a dangling `.git` symlink IS an entry that is
-/// present on disk, and its unresolvable target is a read failure for the
-/// caller to report — not an absent marker. Only a genuinely absent entry is
-/// a damaged slot. jj is not a backend in this port, so only `.git` counts.
+/// A slot is "damaged" for BOTH reasons the seam distinguishes — no marker at
+/// all, and a marker whose target cannot be read — because a slot in either
+/// state is one this pool must not touch. That collapsing is safe here and
+/// only here: the caller SKIPS, and skipping is the correct answer for both.
+/// The distinction matters one level up, in
+/// [`vcs::destructive_backend_for_worktree`], which must report a read failure
+/// as a failure rather than answer it with the enclosing repository. So the
+/// marker rule itself lives in [`vcs::worktree_backend_name`] and this is the
+/// pool's own damage test on top of it.
+///
+/// Only a GIT slot counts as intact. A `.jj` marker is a real answer from the
+/// seam, but the pool lifecycle cannot manage a jj slot yet — its reuse checks
+/// are git calls, and running them in a non-git tree fails in terms that hide
+/// the real cause. Reporting such a slot as damaged keeps it out of the reuse
+/// loop AND keeps `is_readable_worktree` / destroy's unverified
+/// classification exactly as they are. Admitting another flavor is a
+/// one-line change HERE once the pool carries flavor state for it (Go
+/// `pool.go`'s `wantFlavor` counters); nothing else in the pool needs to move.
 pub(crate) fn slot_backend_name(worktree: &Path) -> String {
-    let marker = worktree.join(".git");
-    match std::fs::symlink_metadata(&marker) {
-        Ok(meta) if meta.file_type().is_symlink() => match std::fs::metadata(&marker) {
-            // A dangling or self-referential link cannot be judged: report it
-            // as damaged rather than guessing a backend.
-            Ok(_) => "git".to_string(),
-            Err(_) => String::new(),
-        },
-        Ok(_) => "git".to_string(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(_) => String::new(),
+    match vcs::worktree_backend_name(worktree) {
+        Ok(Some(name @ vcs::BACKEND_GIT)) => name.to_string(),
+        _ => String::new(),
     }
 }
 
@@ -2034,10 +2573,520 @@ mod tests {
         };
         run_git(&["config", "user.email", "t@t.com"]);
         run_git(&["config", "user.name", "T"]);
+        // Keep tracked-file byte assertions independent of the host's checkout
+        // conversion: GitHub's Windows runners set core.autocrlf=true, which
+        // would write CRLF into the slot and break every "committed content"
+        // comparison. Git's default elsewhere is no conversion, so this makes
+        // the fixture agree with what CI already does.
+        run_git(&["config", "core.autocrlf", "false"]);
         std::fs::write(repo.join("README.md"), b"hi\n").unwrap();
         run_git(&["add", "."]);
         run_git(&["commit", "-m", "init"]);
         (dir, repo)
+    }
+
+    // ─── acquisition: seeding, guarded reset, and the seed-removal contract ──
+
+    /// A repo whose committed `.worktreeinclude` selects `*.env`, plus one
+    /// ignored file for it to find. `*.env` matches nothing tracked, so the
+    /// seed list is exactly what the manifest names.
+    ///
+    /// The ignore rule and the manifest are committed with `-f` because
+    /// `.gitignore` and `.worktreeinclude` ignore themselves by pattern in
+    /// most setups — the same thing `seed_repo` in `git/shell.rs` does.
+    fn seeding_repo() -> (tempfile::TempDir, PathBuf, tempfile::TempDir) {
+        let (dir, repo) = init_repo();
+        std::fs::write(repo.join(".worktreeinclude"), "*.env\n").unwrap();
+        std::fs::write(repo.join(".gitignore"), "*.env\n").unwrap();
+        let run_git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run_git(&["add", "-f", ".gitignore", ".worktreeinclude"]);
+        run_git(&["commit", "-m", "add seeding manifest"]);
+        std::fs::write(repo.join(".env"), "SECRET=from-source\n").unwrap();
+        (dir, repo, tempfile::tempdir().unwrap())
+    }
+
+    fn pool_for(repo: &Path, home: &Path) -> Pool {
+        let opts = OpenOptions {
+            config: TreehouseConfig {
+                root: Some(home.to_string_lossy().into_owned()),
+                ..TreehouseConfig::default_config()
+            },
+            ..Default::default()
+        };
+        Pool::open(repo, None, &opts).unwrap()
+    }
+
+    fn entry_for<'a>(state: &'a State, name: &str) -> &'a WorktreeEntry {
+        state
+            .worktrees
+            .iter()
+            .find(|w| w.name == name)
+            .expect("the entry must be in state")
+    }
+
+    #[test]
+    fn acquisition_seeds_the_worktree_and_records_the_inventory() {
+        let (_dir, repo, home) = seeding_repo();
+        let pool = pool_for(&repo, home.path());
+
+        let acquired = pool
+            .get(&AcquireOptions {
+                branch: Some("main".into()),
+                skip_fetch: true,
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(acquired.path.join(".env")).unwrap(),
+            "SECRET=from-source\n",
+            "the committed .worktreeinclude must actually seed the worktree"
+        );
+
+        let state = State::read_state(&pool.dir).unwrap();
+        let inventory = entry_for(&state, &acquired.name).seed_inventory();
+        assert!(
+            inventory.known,
+            "an acquisition that seeded files must record a KNOWN inventory"
+        );
+        assert_eq!(inventory.paths, vec![".env".to_string()]);
+        assert_eq!(inventory.backend, vcs::BACKEND_GIT);
+        assert_eq!(
+            inventory.authorized_paths(),
+            Some([".env".to_string()].as_slice()),
+            "the recorded inventory is what the next reset may delete"
+        );
+    }
+
+    #[test]
+    fn recycling_a_slot_reseeds_it_and_leaves_a_users_ignored_file_alone() {
+        let (_dir, repo, home) = seeding_repo();
+        let pool = pool_for(&repo, home.path());
+        let opts = AcquireOptions {
+            branch: Some("main".into()),
+            skip_fetch: true,
+            ..Default::default()
+        };
+
+        let first = pool.get(&opts).unwrap();
+        assert!(first.path.join(".env").exists());
+
+        // A file the USER placed, not the pool. Same ignore class, different
+        // author — the distinction the whole seed inventory exists to draw.
+        std::fs::write(first.path.join("mine.env"), "KEEP=mine\n").unwrap();
+        pool.release(&first.path.to_string_lossy()).unwrap();
+
+        let second = pool.get(&opts).unwrap();
+        assert_eq!(second.name, first.name, "the slot must have been recycled");
+        assert_eq!(
+            std::fs::read_to_string(second.path.join(".env")).unwrap(),
+            "SECRET=from-source\n",
+            "the seed must be present again after the recycle reset"
+        );
+        assert_eq!(
+            std::fs::read_to_string(second.path.join("mine.env")).unwrap(),
+            "KEEP=mine\n",
+            "an ignored file the pool did not seed must survive the reset"
+        );
+
+        let state = State::read_state(&pool.dir).unwrap();
+        let inventory = entry_for(&state, &second.name).seed_inventory();
+        assert_eq!(
+            inventory.paths,
+            vec![".env".to_string()],
+            "only what the pool seeded may be listed; the user's file must not be"
+        );
+    }
+
+    #[test]
+    fn an_include_manifest_selects_exactly_what_it_lists() {
+        let (_dir, repo, home) = seeding_repo();
+        let pool = pool_for(&repo, home.path());
+
+        // The committed manifest selects `*.env`; this one selects nothing, so
+        // the acquisition must seed nothing and must NOT fall back to it.
+        let acquired = pool
+            .get(&AcquireOptions {
+                branch: Some("main".into()),
+                skip_fetch: true,
+                include_manifest: Some(Vec::new()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            !acquired.path.join(".env").exists(),
+            "an empty manifest means seed nothing, not 'use the committed one'"
+        );
+        let state = State::read_state(&pool.dir).unwrap();
+        assert!(
+            entry_for(&state, &acquired.name)
+                .seed_inventory()
+                .authorized_paths()
+                .is_none(),
+            "seeding nothing must leave an inventory that authorizes nothing"
+        );
+
+        pool.release(&acquired.path.to_string_lossy()).unwrap();
+
+        // A manifest that names a real ignored file seeds exactly that file.
+        let acquired = pool
+            .get(&AcquireOptions {
+                branch: Some("main".into()),
+                skip_fetch: true,
+                include_manifest: Some(b"other.env\n".to_vec()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            !acquired.path.join(".env").exists(),
+            "the committed manifest must be REPLACED, not merged"
+        );
+        assert!(!acquired.path.join("other.env").exists());
+        let state = State::read_state(&pool.dir).unwrap();
+        assert!(
+            entry_for(&state, &acquired.name)
+                .seed_inventory()
+                .authorized_paths()
+                .is_none(),
+            "a manifest naming an absent file selects nothing, which is valid"
+        );
+    }
+
+    #[test]
+    fn releasing_a_seeded_slot_clears_its_inventory_to_a_verified_empty_one() {
+        let (_dir, repo, home) = seeding_repo();
+        let pool = pool_for(&repo, home.path());
+        let acquired = pool
+            .get(&AcquireOptions {
+                branch: Some("main".into()),
+                skip_fetch: true,
+                ..Default::default()
+            })
+            .unwrap();
+
+        pool.release(&acquired.path.to_string_lossy()).unwrap();
+
+        let state = State::read_state(&pool.dir).unwrap();
+        let inventory = entry_for(&state, &acquired.name).seed_inventory();
+        assert!(
+            inventory.known,
+            "a released slot holds nothing we seeded — that is a claim, not a gap"
+        );
+        assert!(
+            inventory.paths.is_empty(),
+            "the stale list must not outlive the files it named"
+        );
+        assert!(
+            !acquired.path.join(".env").exists(),
+            "release removes the pool's own seeds"
+        );
+    }
+
+    // ─── the guarded reset ───────────────────────────────────────────────────
+
+    /// Builds a linked worktree at `main` and returns the pool's reset
+    /// function bound to it, so a test can stage a race and then reset.
+    fn reset_fixture() -> (
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        Arc<dyn GitBackend>,
+        PathBuf,
+    ) {
+        let (dir, repo) = init_repo();
+        let slot = dir.path().join("slot");
+        let git: Arc<dyn GitBackend> = Arc::new(crate::git::ShellGitBackend::discover().unwrap());
+        let out = std::process::Command::new("git")
+            .args(["worktree", "add", "--detach"])
+            .arg(&slot)
+            .arg("main")
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let bin = crate::git::ShellGitBackend::discover()
+            .unwrap()
+            .git_bin()
+            .to_path_buf();
+        (dir, repo, slot, git, bin)
+    }
+
+    #[test]
+    fn a_slot_whose_head_moved_since_the_safety_check_is_not_reset() {
+        // The race the guarded pair exists for. `Pool::get` takes the guard and
+        // resets in one function; here the two calls are made separately with a
+        // commit landing between them, which is exactly the interleaving the
+        // pre-seam code silently discarded.
+        let (_d, _repo, slot, git, bin) = reset_fixture();
+        let guard = vcs::is_worktree_safe_to_reset(&bin, git.as_ref(), &slot, "main").unwrap();
+        assert!(guard.safe);
+
+        // The window: a commit lands in the slot after the check.
+        let run_git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&slot)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        std::fs::write(slot.join("landed.txt"), "work\n").unwrap();
+        run_git(&["add", "-A"]);
+        run_git(&["commit", "-m", "landed after the check"]);
+        let moved_head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&slot)
+            .output()
+            .unwrap();
+        let moved_head = String::from_utf8_lossy(&moved_head.stdout)
+            .trim()
+            .to_string();
+
+        let err = vcs::reset_worktree_to_ref(
+            &bin,
+            git.as_ref(),
+            &slot,
+            &guard.reset_ref,
+            &guard.head,
+            true,
+        )
+        .expect_err("a HEAD that moved since the check must refuse the reset");
+
+        assert!(
+            err.message.contains("HEAD changed since safety check"),
+            "the refusal must name the actual cause, got: {}",
+            err.message
+        );
+        assert_eq!(
+            moved_head,
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&slot)
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap(),
+            "the commit that landed in the window must still be there"
+        );
+        assert!(
+            slot.join("landed.txt").exists(),
+            "a refused reset must not touch the worktree"
+        );
+    }
+
+    #[test]
+    fn acquisition_refuses_a_slot_holding_commits_the_branch_does_not_contain() {
+        // The pool-level consequence of the same guard: `reset_for_acquisition`
+        // is what `Pool::get` calls, and it must refuse rather than discard.
+        let (_d, _repo, slot, git, _bin) = reset_fixture();
+        let run_git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&slot)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        std::fs::write(slot.join("unlanded.txt"), "work\n").unwrap();
+        run_git(&["add", "-A"]);
+        run_git(&["commit", "-m", "unlanded"]);
+
+        let err = reset_for_acquisition(
+            &git,
+            &slot,
+            "main",
+            &SeedInventory::default(),
+            SlotOrigin::Recycled,
+        )
+        .expect_err("a slot ahead of its branch must not be reset");
+
+        assert!(
+            matches!(&err, PoolError::Git(e) if e.message.contains("commits that")),
+            "got: {err}"
+        );
+        assert!(
+            slot.join("unlanded.txt").exists(),
+            "the unlanded work must survive a refused reset"
+        );
+    }
+
+    #[test]
+    fn a_recycled_slot_is_reset_under_the_clean_tree_the_reuse_rules_require() {
+        // The no-race counterpart: when the checks pass, the guarded reset does
+        // exactly what the plain reset did. The reuse rules in `acquire_locked`
+        // already refuse a dirty slot, so a recycled slot arrives here clean and
+        // this is the ordinary production shape.
+        let (_d, _repo, slot, git, _bin) = reset_fixture();
+        let head_before = head_of(&slot);
+
+        reset_for_acquisition(
+            &git,
+            &slot,
+            "main",
+            &SeedInventory::default(),
+            SlotOrigin::Recycled,
+        )
+        .unwrap();
+
+        assert_eq!(
+            head_of(&slot),
+            head_before,
+            "a safe reset lands the slot on exactly the commit it already held"
+        );
+        assert_eq!(
+            std::fs::read_to_string(slot.join("README.md")).unwrap(),
+            "hi\n",
+            "tracked content is untouched by a reset of a clean tree"
+        );
+    }
+
+    #[test]
+    fn a_fresh_slot_reset_restores_content_and_sweeps_untracked_files() {
+        // `require_clean` is false for a FRESH slot, matching Go, which never
+        // requires a clean tree on the creation path. That is the one case where
+        // the reset actually has work to do — a checkout filter may have left an
+        // untracked file — and where the pre-seam `reset_worktree` restored the
+        // tracked tree and swept the rest.
+        let (_d, _repo, slot, git, _bin) = reset_fixture();
+        std::fs::write(slot.join("README.md"), "clobbered\n").unwrap();
+        std::fs::write(slot.join("junk.txt"), "untracked\n").unwrap();
+
+        reset_for_acquisition(
+            &git,
+            &slot,
+            "main",
+            &SeedInventory::default(),
+            SlotOrigin::Fresh,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(slot.join("README.md")).unwrap(),
+            "hi\n",
+            "read-tree --reset -u must restore tracked content"
+        );
+        assert!(
+            !slot.join("junk.txt").exists(),
+            "clean -fd must still sweep untracked files"
+        );
+    }
+
+    #[test]
+    fn a_recycled_slot_that_became_dirty_is_refused_not_overwritten() {
+        // The other race the guard closes. `acquire_locked` proved the tree clean
+        // before releasing the lock; something changed it afterwards. Wiping that
+        // would discard the change while every check reported success.
+        let (_d, _repo, slot, git, _bin) = reset_fixture();
+        std::fs::write(slot.join("README.md"), "edited after the reuse check\n").unwrap();
+
+        let err = reset_for_acquisition(
+            &git,
+            &slot,
+            "main",
+            &SeedInventory::default(),
+            SlotOrigin::Recycled,
+        )
+        .expect_err("a tree that went dirty after the check must refuse the reset");
+
+        assert!(
+            matches!(&err, PoolError::Git(e) if e.message.contains("dirty after safety check")),
+            "got: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(slot.join("README.md")).unwrap(),
+            "edited after the reuse check\n",
+            "a refused reset must not overwrite what it refused to trust"
+        );
+    }
+
+    /// `git rev-parse HEAD` in `slot`.
+    fn head_of(slot: &Path) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(slot)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git rev-parse failed in {slot:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    // ─── the seed-removal contract ───────────────────────────────────────────
+
+    #[test]
+    fn an_empty_inventory_authorizes_no_deletion() {
+        // The safety property in isolation. An entry that lost its bookkeeping
+        // must delete nothing — turning that loss into deletion would make a
+        // bookkeeping bug look like a feature.
+        let dir = tempfile::tempdir().unwrap();
+        let slot = dir.path().join("slot");
+        std::fs::create_dir_all(&slot).unwrap();
+        std::fs::write(slot.join("keep.env"), "KEEP\n").unwrap();
+
+        let err = remove_seeded_paths(&slot, &[]).expect_err("an empty inventory must refuse");
+        assert!(matches!(&err, PoolError::Git(e) if e.message.contains("seed inventory")));
+        assert!(slot.join("keep.env").exists());
+    }
+
+    #[test]
+    fn a_traversing_seed_path_is_refused_before_anything_is_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = dir.path().join("slot");
+        std::fs::create_dir_all(&slot).unwrap();
+        let outside = dir.path().join("precious");
+        std::fs::write(&outside, "DO NOT TOUCH\n").unwrap();
+        std::fs::write(slot.join("a.env"), "a\n").unwrap();
+
+        // The first entry is benign; the second escapes. Validation covers the
+        // WHOLE list before the first delete, or a traversal in position two
+        // would be preceded by an unvalidated removal in position one.
+        let err = remove_seeded_paths(&slot, &["a.env".to_string(), "../precious".to_string()])
+            .expect_err("a traversing path must be refused");
+        assert!(matches!(&err, PoolError::Git(e) if e.message.contains("invalid seeded path")));
+        assert!(slot.join("a.env").exists(), "nothing may be deleted");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "DO NOT TOUCH\n");
+    }
+
+    #[test]
+    fn seed_removal_touches_only_the_listed_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = dir.path().join("slot");
+        std::fs::create_dir_all(slot.join("nested")).unwrap();
+        std::fs::write(slot.join("a.env"), "a\n").unwrap();
+        std::fs::write(slot.join("b.env"), "b\n").unwrap();
+        std::fs::write(slot.join("nested/c.env"), "c\n").unwrap();
+
+        remove_seeded_paths(&slot, &["a.env".to_string(), "nested/c.env".to_string()]).unwrap();
+
+        assert!(!slot.join("a.env").exists());
+        assert!(!slot.join("nested/c.env").exists());
+        assert!(
+            slot.join("b.env").exists(),
+            "a path the inventory does not name must never be removed"
+        );
+        assert!(
+            slot.join("nested").is_dir(),
+            "the inventory names a file, not the directory holding it"
+        );
+    }
+
+    #[test]
+    fn a_seed_path_that_is_already_gone_is_not_a_failure() {
+        // The inventory is permission to delete, not an obligation. A slot whose
+        // seeds the user deleted by hand must still reset.
+        let dir = tempfile::tempdir().unwrap();
+        let slot = dir.path().join("slot");
+        std::fs::create_dir_all(&slot).unwrap();
+        remove_seeded_paths(&slot, &["never-existed.env".to_string()]).unwrap();
     }
 
     /// An env whose ONLY override is the pool root — the shape the CLI builds
@@ -2191,6 +3240,41 @@ mod tests {
         // Present on disk (lstat) but unresolvable (stat) — Go reports this as
         // a read failure the caller must surface, never as "no marker at all".
         assert_eq!(slot_backend_name(dir.path()), "");
+    }
+
+    #[test]
+    fn slot_backend_name_does_not_admit_a_jj_workspace_yet() {
+        // The seam answers "jj" for this path; the pool does not. The reuse
+        // loop's checks are git calls, so admitting a non-git slot here would
+        // run them in a tree git cannot read and report the failure in terms
+        // that hide the cause. Documented as the one-line change the jj
+        // backend makes once the pool carries flavor state.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".jj")).unwrap();
+        assert_eq!(vcs::worktree_backend_name(dir.path()).unwrap(), Some("jj"));
+        assert_eq!(slot_backend_name(dir.path()), "");
+    }
+
+    #[test]
+    fn slot_backend_name_agrees_with_the_seam_on_every_git_case() {
+        // The marker rule is implemented once, in the seam. This pins the two
+        // to the same answers so a future edit to one cannot drift from the
+        // other: the pool's damage test and the dispatch the reset actually
+        // goes through MUST agree, or a slot could be classified healthy here
+        // and refused — or worse, the reverse — a few lines later.
+        for case in ["absent", "git-dir", "git-file"] {
+            let dir = tempfile::tempdir().unwrap();
+            match case {
+                "git-dir" => std::fs::create_dir(dir.path().join(".git")).unwrap(),
+                "git-file" => std::fs::write(dir.path().join(".git"), b"gitdir: /x\n").unwrap(),
+                _ => {}
+            }
+            let via_pool = slot_backend_name(dir.path());
+            let via_seam = vcs::destructive_backend_for_worktree(dir.path())
+                .map(|b| b.name().to_string())
+                .unwrap_or_default();
+            assert_eq!(via_pool, via_seam, "disagreement on {case}");
+        }
     }
 
     // ─── M-021 / M-012 / M-013: the reuse loop's fail-closed guards ─────────
@@ -2437,9 +3521,22 @@ mod tests {
         // what makes it "another clone's" rather than merely "unverifiable",
         // which is the distinction the test below asserts.
         let gitdir = std::fs::read_to_string(acquired.path.join(".git")).unwrap();
+        // Git writes this pointer with forward slashes on EVERY platform, and on a
+        // Windows runner it writes the LONG form of a temp path whose Rust side
+        // is the 8.3 short form (`RUNNER~1` vs `runneradmin`). Neither is a
+        // difference in what the path NAMES, so compare the resolved paths the
+        // same way the product does (`same_file`, pool.rs:2032) — that is also
+        // why this test failing here was never evidence of a product bug.
+        let gitdir_path = Path::new(gitdir.trim().strip_prefix("gitdir:").unwrap().trim());
+        let gitdir_real = std::fs::canonicalize(gitdir_path).unwrap_or_else(|_| {
+            panic!("the slot's gitdir pointer must name a real directory: {gitdir}")
+        });
+        let clone_a_real = std::fs::canonicalize(&clone_a).unwrap();
         assert!(
-            gitdir.contains(clone_a.to_str().unwrap()),
-            "clone A must own the slot, got gitdir: {gitdir}"
+            gitdir_real.starts_with(&clone_a_real),
+            "clone A must own the slot: gitdir {:?} is not inside {:?}",
+            gitdir_real,
+            clone_a_real
         );
 
         // Clone B, with the pool at max_trees: the only way forward would be to
@@ -2593,17 +3690,16 @@ mod tests {
                 ..Default::default()
             })
             .expect_err("--branch must refuse an existing branch");
-        assert!(
-            err.to_string().contains("already exists"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("already exists"), "got: {err}");
     }
 
     /// A branch name git would refuse must be rejected BEFORE anything is
     /// created — `-b ../evil` would otherwise become a ref outside the repo.
     #[test]
     fn invalid_branch_names_are_refused_before_acquiring() {
-        for bad in ["", "../evil", "-x", "a..b", "a b", "a~1", "x.lock", ".hidden"] {
+        for bad in [
+            "", "../evil", "-x", "a..b", "a b", "a~1", "x.lock", ".hidden",
+        ] {
             let err = validate_branch_name(bad);
             assert!(err.is_err(), "branch name {bad:?} must be refused");
         }
@@ -2723,10 +3819,10 @@ mod tests {
     #[test]
     fn a_bad_template_is_refused_before_anything_is_created() {
         for bad in [
-            "{pool}/nope",              // no {slot}: every slot collides
-            "{repo}/{slot}/../x",       // '..' cancels {slot}
-            "{bogus}/{slot}",           // unknown placeholder
-            "{repo_parent}/{slot}",     // not repository-scoped
+            "{pool}/nope",          // no {slot}: every slot collides
+            "{repo}/{slot}/../x",   // '..' cancels {slot}
+            "{bogus}/{slot}",       // unknown placeholder
+            "{repo_parent}/{slot}", // not repository-scoped
         ] {
             let err = validate_worktree_path_template(bad);
             assert!(err.is_err(), "template {bad:?} must be refused");
@@ -2735,39 +3831,46 @@ mod tests {
         assert!(validate_worktree_path_template("").is_ok());
     }
 
+    /// An absolute root for the fake paths below. `/pool` has a root but no
+    /// volume, so it is absolute on unix and drive-RELATIVE on Windows, where
+    /// `is_absolute` also requires a prefix — the resolver would refuse its own
+    /// template. Never touched on disk: `resolve_worktree_path` is pure string
+    /// expansion.
+    fn fake_abs_root(unix: &str, windows: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(windows)
+        } else {
+            PathBuf::from(unix)
+        }
+    }
+
     /// `resolve_worktree_path` must expand each placeholder to its own meaning,
     /// and a relative result must be refused rather than created.
     #[test]
     fn worktree_path_expands_every_placeholder() {
-        let repo = Path::new("/src/myrepo");
-        let pool_dir = Path::new("/pool");
+        let repo = fake_abs_root("/src/myrepo", r"C:\src\myrepo");
+        let pool_dir = fake_abs_root("/pool", r"C:\pool");
         assert_eq!(
-            resolve_worktree_path(repo, pool_dir, "3", "", false).unwrap(),
-            PathBuf::from("/pool/3/myrepo"),
+            resolve_worktree_path(&repo, &pool_dir, "3", "", false).unwrap(),
+            pool_dir.join("3").join("myrepo"),
             "the built-in layout must be unchanged"
         );
         assert_eq!(
-            resolve_worktree_path(repo, pool_dir, "3", "", true).unwrap(),
-            PathBuf::from("/pool/3/myrepo-3"),
+            resolve_worktree_path(&repo, &pool_dir, "3", "", true).unwrap(),
+            pool_dir.join("3").join("myrepo-3"),
             "--unique-leaf appends the slot"
         );
         assert_eq!(
-            resolve_worktree_path(repo, pool_dir, "3", "{pool}/{slot}/{repo}", false).unwrap(),
-            PathBuf::from("/pool/3/myrepo")
+            resolve_worktree_path(&repo, &pool_dir, "3", "{pool}/{slot}/{repo}", false).unwrap(),
+            pool_dir.join("3").join("myrepo")
         );
         // `{repo_parent}` IS a valid placeholder to expand, but on its own it is not
-// enough: two sibling repositories expand it identically, so it cannot tell
-// their slots apart. It only works alongside a repository-scoped placeholder.
+        // enough: two sibling repositories expand it identically, so it cannot tell
+        // their slots apart. It only works alongside a repository-scoped placeholder.
         assert_eq!(
-            resolve_worktree_path(
-                repo,
-                pool_dir,
-                "3",
-                "{repo_parent}/{repo}/{slot}",
-                false
-            )
-            .unwrap(),
-            PathBuf::from("/src/myrepo/3")
+            resolve_worktree_path(&repo, &pool_dir, "3", "{repo_parent}/{repo}/{slot}", false)
+                .unwrap(),
+            repo.join("3")
         );
         // Relative templates are refused: a worktree must land where the caller
         // named, not wherever the process happens to be running.
@@ -2782,11 +3885,11 @@ mod tests {
     /// this out loud rather than resolving silently (pool.go:391-394).
     #[test]
     fn a_template_supersedes_unique_leaf() {
-        let repo = Path::new("/src/myrepo");
-        let pool_dir = Path::new("/pool");
+        let repo = fake_abs_root("/src/myrepo", r"C:\src\myrepo");
+        let pool_dir = fake_abs_root("/pool", r"C:\pool");
         assert_eq!(
-            resolve_worktree_path(repo, pool_dir, "2", "{pool}/{slot}/{repo}-x", true).unwrap(),
-            PathBuf::from("/pool/2/myrepo-x"),
+            resolve_worktree_path(&repo, &pool_dir, "2", "{pool}/{slot}/{repo}-x", true).unwrap(),
+            pool_dir.join("2").join("myrepo-x"),
             "the template names the leaf, so unique_leaf adds nothing"
         );
     }

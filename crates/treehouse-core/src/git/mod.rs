@@ -7,6 +7,12 @@
 //! MSVC CRT rules handle spaces).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+// The safety check and the reset it authorizes must be named together or not
+// at all — see [`ResetGuard`]. Re-exported so an implementor can write the
+// signature without also importing the seam module.
+pub use crate::vcs::ResetGuard;
 
 /// A git repository, split into its common (main) dir and optional linked
 /// worktree dir.
@@ -59,6 +65,12 @@ impl GitError {
 ///
 /// Every method uses the exact git invocation from the Go baseline and
 /// interprets exit codes identically.
+///
+/// The tail of the trait — [`Self::name`], [`Self::resolve_for_worktree`], the
+/// guarded-reset pair, and the seeding hooks — is the SEAM: it is what lets a
+/// second backend answer for its own worktrees without any call site changing.
+/// All of it defaults, so this trait is complete for the one backend that
+/// ships today and open for the one that does not.
 pub trait GitBackend: Send + Sync {
     /// Root of the repository containing `start` (Go `FindRepoRootFrom`).
     fn repo_root(&self, start: &Path) -> Result<PathBuf, GitError>;
@@ -153,6 +165,171 @@ pub trait GitBackend: Send + Sync {
     /// The ref to check out for `branch` (Go `branchRef`): strictly-ahead
     /// ref wins, origin on divergence, whichever exists otherwise.
     fn branch_ref(&self, repo: &GitRepo, branch: &str) -> String;
+
+    // ─── Backend identity ───────────────────────────────────────────────────
+    //
+    // Everything below is declared here with a default that either delegates
+    // to the seam or refuses, so adding a backend never requires editing this
+    // trait — and therefore never risks colliding with whoever else is editing
+    // a dispatch site. Defaults are NOT "and that is fine": each one names the
+    // backend that MUST override it.
+
+    /// This backend's name (Go `Backend.Name`), matching the name it is
+    /// registered under in [`crate::vcs::BackendRegistry`].
+    ///
+    /// Defaults to `"git"`, which is correct for the only backend this port
+    /// ships today and WRONG for any other. A backend that forgets to override
+    /// it cannot be found under its own marker, so its worktrees are refused
+    /// loudly rather than answered by git — a failure that is annoying rather
+    /// than silent, which is the safe direction for a wrong name.
+    fn name(&self) -> &'static str {
+        "git"
+    }
+
+    /// The backend that owns `path` for operations that REWRITE its checkout
+    /// (Go `destructiveBackendForWorktree`).
+    ///
+    /// Dispatches on the path's OWN marker, never on which backend was asked:
+    /// the configured backend must not answer for a slot of the other flavor.
+    /// A path with no marker is REFUSED, never answered by the enclosing
+    /// repository — in the supported in-project pool layout that repository is
+    /// the user's working tree, and rewriting it is irreversible.
+    ///
+    /// Returns a shared handle rather than an owned backend: dispatch is a
+    /// registry lookup, so handing out a clone per call would both cost more
+    /// and risk the caller acting on a different instance than everyone else.
+    ///
+    /// The default routes through
+    /// [`crate::vcs::destructive_backend_for_worktree`], so every backend gets
+    /// registry dispatch for free. Override only to restrict the answer; do
+    /// not re-implement the marker rule.
+    fn resolve_for_worktree(&self, path: &Path) -> Result<Arc<dyn GitBackend>, GitError> {
+        crate::vcs::destructive_backend_for_worktree(path)
+    }
+
+    // ─── The guarded-reset pair ─────────────────────────────────────────────
+
+    /// Reports whether `worktree` can be reset to `branch` without discarding
+    /// committed work, and captures BOTH the immutable reset target and the
+    /// HEAD the ancestry check ran against (Go `IsWorktreeSafeToReset`).
+    ///
+    /// The two travel together in a [`ResetGuard`] because they are only
+    /// meaningful together: the caller must hand both to
+    /// [`Self::reset_worktree_to_ref`] so the check and the reset share one
+    /// target and a HEAD that moved in between is refused.
+    ///
+    /// Fails CLOSED — an unresolvable ref, an unreadable HEAD, or a git
+    /// failure is an `Err`, and callers treat that as "not safe". `guard.safe
+    /// == false` is a real answer the caller may weigh; `Err` means the
+    /// question could not be answered at all.
+    ///
+    /// The logic lives in [`crate::vcs::is_worktree_safe_to_reset`] because it
+    /// needs the git binary, which only a concrete backend holds. The git
+    /// implementation forwards to it with `self.git_bin()`.
+    fn is_worktree_safe_to_reset(
+        &self,
+        worktree: &Path,
+        branch: &str,
+    ) -> Result<ResetGuard, GitError> {
+        let _ = (worktree, branch); // Refuses by design; see the default's contract.
+        Err(crate::vcs::unsupported(
+            self.name(),
+            "is_worktree_safe_to_reset",
+        ))
+    }
+
+    /// Resets `worktree` to an ALREADY RESOLVED commit, re-verifying first (Go
+    /// `ResetWorktreeToRef`).
+    ///
+    /// `expected_head` is the HEAD [`Self::is_worktree_safe_to_reset`] recorded.
+    /// The re-read and the destructive update both run while holding git's own
+    /// `HEAD.lock` (created `O_CREAT|O_EXCL`), so a concurrent commit,
+    /// checkout, merge, or rebase cannot slip a new commit in after the
+    /// comparison. When `require_clean` is set, dirtiness is re-checked under
+    /// that same lock before the tree is touched.
+    ///
+    /// REFUSES — before touching anything — if the marker is gone, if either
+    /// argument is not a commit id, if HEAD moved, or if `require_clean` and
+    /// the tree is dirty. A plain reset without that re-read is WORSE than no
+    /// reset: callers believe the guards and the reset shared one target, so a
+    /// commit landing in the gap is discarded while every check reports success.
+    ///
+    /// The logic lives in [`crate::vcs::reset_worktree_to_ref`]; the git
+    /// implementation forwards to it with `self.git_bin()`.
+    fn reset_worktree_to_ref(
+        &self,
+        worktree: &Path,
+        reset_ref: &str,
+        expected_head: &str,
+        require_clean: bool,
+    ) -> Result<(), GitError> {
+        let _ = (worktree, reset_ref, expected_head, require_clean);
+        Err(crate::vcs::unsupported(
+            self.name(),
+            "reset_worktree_to_ref",
+        ))
+    }
+
+    // ─── Capabilities the later agents implement ────────────────────────────
+    //
+    // Declared NOW, defaulting to a refusal, so the jj and seeding agents never
+    // have to edit this trait. Each default says which backend must override it.
+
+    /// The shared git metadata directory for `start` (Go `CommonGitDir`): where
+    /// the repo-local, untracked `.git/info/exclude` lives.
+    ///
+    /// Backends with no usable git dir return an error and callers degrade
+    /// gracefully — an absent exclude file is normal, not a failure.
+    fn common_git_dir(&self, start: &Path) -> Result<PathBuf, GitError> {
+        let _ = start;
+        Err(crate::vcs::unsupported(self.name(), "common_git_dir"))
+    }
+
+    /// Copies backend-specific ignored files into a new or recycled worktree
+    /// and returns THEIR PATHS (Go `SeedWorktree`).
+    ///
+    /// The returned inventory is what cleanup trusts later, rather than
+    /// re-reading mutable worktree metadata — so it is only as trustworthy as
+    /// this function's honesty about what it wrote.
+    ///
+    /// `manifest` is `None` to use the committed `.worktreeinclude` at the
+    /// DESTINATION HEAD, and `Some` to supply the manifest bytes directly; an
+    /// empty `Some(&[])` selects nothing.
+    fn seed_worktree(
+        &self,
+        repo: &GitRepo,
+        worktree: &Path,
+        manifest: Option<&[u8]>,
+    ) -> Result<Vec<String>, GitError> {
+        let _ = (repo, worktree, manifest);
+        Err(crate::vcs::unsupported(self.name(), "seed_worktree"))
+    }
+
+    /// Resets a worktree after removing its trusted seed inventory (Go
+    /// `ResetWorktreeWithSeededPaths`).
+    ///
+    /// `seeded` is validated by [`crate::vcs::validate_seed_inventory`] before
+    /// anything is deleted on its word. **A `None` or empty inventory must NOT
+    /// authorize ignored-file deletion**: it means the caller lost its
+    /// bookkeeping, and honoring it converts a lost record into silent data
+    /// loss. Every implementation must call the validator first.
+    fn reset_worktree_with_seeded_paths(
+        &self,
+        worktree: &Path,
+        branch: &str,
+        seeded: &[String],
+    ) -> Result<(), GitError> {
+        let _ = (worktree, branch);
+        // Validate BEFORE the capability refusal. An empty inventory is
+        // refused on its own terms — not as "unsupported" — so the log says the
+        // caller lost its bookkeeping, which is a different bug from the
+        // backend lacking the capability.
+        crate::vcs::validate_seed_inventory(seeded)?;
+        Err(crate::vcs::unsupported(
+            self.name(),
+            "reset_worktree_with_seeded_paths",
+        ))
+    }
 }
 
 /// 6-hex sha256 of a string (Go `ShortHash`), used for pool dir naming.

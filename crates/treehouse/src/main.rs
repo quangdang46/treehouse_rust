@@ -26,31 +26,68 @@ use treehouse_core::result::SweepScope;
 /// cleaned stays dirty — `get` skips it and `prune` will not reclaim it — until
 /// someone cleans it or passes `--force`.
 ///
-/// **Opt-in.** Go shipped this as a v3.0.0 BREAKING CHANGE, while
-/// `docs/rust-port-plan.md` Appendix B records exit 0 as this port's contract,
-/// so flipping the default would break every existing script. It is gated
-/// behind `TREEHOUSE_EXIT_STRICT=1` until a major release says otherwise.
+/// **This is the default.** Go shipped exit 3 as a v3.0.0 BREAKING CHANGE
+/// because a caller reading exit 0 as "the slot was released" was reading a
+/// bug; this port had held exit 0 behind `TREEHOUSE_EXIT_STRICT=1` while the
+/// contract was still settling. It now matches Go, and the environment variable
+/// is the migration path in the other direction: `TREEHOUSE_EXIT_STRICT=0`
+/// restores exit 0 for scripts running under `set -e`, for one minor release.
 const EXIT_NOT_RETURNED: i32 = 3;
 
-/// A worktree left exactly as it was found, with two messages: Go's exit-3
-/// wording (strict mode) and the port's pre-strict wording (default).
+/// A worktree left exactly as it was found, carrying the message for EACH exit
+/// status it can produce.
+///
+/// Both messages name the remedy and say the slot is still held; they differ
+/// only in how blunt they are. The exit-3 wording is Go's and is now the
+/// default. The exit-0 wording is what this port printed before the flip and
+/// survives solely behind `TREEHOUSE_EXIT_STRICT=0`, so the escape hatch
+/// produces byte-identical output to the release a script was written against.
 #[derive(Debug)]
 struct NotReturned {
-    strict: String,
-    default: String,
+    /// Printed with [`EXIT_NOT_RETURNED`]. The default path.
+    not_returned: String,
+    /// Printed with exit 0, reachable only via `TREEHOUSE_EXIT_STRICT=0`.
+    legacy: String,
 }
 
 impl std::fmt::Display for NotReturned {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.strict)
+        f.write_str(&self.not_returned)
     }
 }
 
 impl std::error::Error for NotReturned {}
 
-/// Whether `TREEHOUSE_EXIT_STRICT=1` is set.
-fn exit_strict() -> bool {
-    std::env::var("TREEHOUSE_EXIT_STRICT").as_deref() == Ok("1")
+/// Whether the user has opted OUT of exit 3 via `TREEHOUSE_EXIT_STRICT=0`.
+///
+/// This used to be an opt-IN and is now an opt-OUT, so the polarity of an
+/// unrecognised value inverts. Unset means exit 3. Only a value Go's
+/// `strconv.ParseBool` reads as FALSE (`0`, `f`, `false`, `off`, `n`, `no`)
+/// restores exit 0 — matching the `env_flag` reader in `cli.rs` so one spelling
+/// works everywhere in the binary.
+///
+/// An unparseable value is deliberately NOT the opt-out. `TREEHOUSE_EXIT_STRICT=1`
+/// from the previous release is not false, and neither is a typo: both keep the
+/// exit-3 default. Treating garbage as "user wants the old behaviour" would
+/// hand the escape hatch to anyone who fat-fingers the variable name, which is
+/// the one direction that can silently under-report a slot that was never
+/// released.
+fn exit_legacy_zero() -> bool {
+    match std::env::var("TREEHOUSE_EXIT_STRICT") {
+        Ok(v) => parses_as_false(&v),
+        Err(_) => false,
+    }
+}
+
+/// Whether `value` is one of the spellings Go's `strconv.ParseBool` reads as
+/// FALSE. Split out from [`exit_legacy_zero`] so it can be asserted directly:
+/// the env read is process-global, and a test that mutated it would race every
+/// other test in this binary.
+fn parses_as_false(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "f" | "false" | "off" | "n" | "no"
+    )
 }
 
 fn main() {
@@ -106,15 +143,15 @@ fn main() {
 
     if let Err(e) = run(cli) {
         if let Some(not_returned) = e.downcast_ref::<NotReturned>() {
-            // An unreturned worktree is not a failure. Default keeps this
-            // port's documented exit 0; strict mode adopts Go's exit 3 and
-            // its explanation.
-            if exit_strict() {
-                eprintln!("{not_returned}");
-                std::process::exit(EXIT_NOT_RETURNED);
+            // An unreturned worktree is not a failure, but it IS a status the
+            // caller must see: exit 3 is the default, matching Go, and only
+            // `TREEHOUSE_EXIT_STRICT=0` restores this port's original exit 0.
+            if exit_legacy_zero() {
+                eprintln!("{}", not_returned.legacy);
+                return;
             }
-            eprintln!("{}", not_returned.default);
-            return;
+            eprintln!("{}", not_returned.not_returned);
+            std::process::exit(EXIT_NOT_RETURNED);
         }
         eprintln!("{e:#}");
         std::process::exit(1);
@@ -278,20 +315,7 @@ fn open_pool_for_cli(cli: &Cli) -> Result<treehouse_core::pool::Pool> {
 fn run(cli: Cli) -> Result<()> {
     // --update-check is intercepted before clap in main (handled above).
     match &cli.command {
-        None => cmd_get(
-            &cli,
-            &cli::GetArgs {
-                lease: false,
-                lease_holder: None,
-                ttl: None,
-                json: false,
-                base: None,
-                no_fetch: false,
-                branch: None,
-                unique_leaf: false,
-                worktree_path: None,
-            },
-        ),
+        None => cmd_get(&cli, &cli::GetArgs::default()),
         Some(Command::Get(args)) => cmd_get(&cli, args),
         Some(Command::Enter(args)) => cmd_enter(&cli, args),
         Some(Command::Return(args)) => cmd_return(&cli, args),
@@ -314,7 +338,14 @@ fn cmd_get(cli: &Cli, args: &cli::GetArgs) -> Result<()> {
     let format = resolve_format(cli, args.json, args.lease)?;
     let _ = format;
 
-    let pool = open_pool_for_cli(cli)?;
+    // Resolved once and reused for both the backend check and the pool, so the
+    // repository cannot change identity between the two. The jj refusal runs
+    // BEFORE the lease/interactive split: Go places it before `getLeaseRunE`
+    // (cmd/get.go:147-150) so `--lease` cannot become a way to slip a git
+    // branch request past it.
+    let ctx = cli::resolve_repo_ctx()?;
+    cli::require_git_backend_for_branch(&ctx.repo_root, args.branch.as_deref())?;
+    let pool = cli::open_pool_with_root(&ctx, cli.root.as_deref())?;
 
     if args.lease {
         // Lease mode: path-only on stdout, or JSON/TOON object.
@@ -413,11 +444,11 @@ fn cmd_get(cli: &Cli, args: &cli::GetArgs) -> Result<()> {
         match confirm("Clean worktree and return to pool? [Y/n]")? {
             Confirm::No | Confirm::Unanswered => {
                 return Err(NotReturned {
-                    strict: format!(
+                    not_returned: format!(
                         "🌳 worktree left dirty and not returned to the pool; prune will not reclaim this slot. Use treehouse return --force {} to clean it later",
                         quote_path(&path)
                     ),
-                    default:
+                    legacy:
                         "Worktree left dirty. Use 'treehouse return --force' to clean it later."
                             .to_string(),
                 }
@@ -652,11 +683,11 @@ fn cmd_return_all(cli: &Cli, args: &cli::ReturnArgs) -> Result<()> {
     }
     if !aborted.is_empty() {
         return Err(NotReturned {
-            strict: format!(
+            not_returned: format!(
                 "🌳 worktree(s) {} not returned: they have uncommitted changes and cleaning was declined or could not be confirmed; prune will not reclaim those slots. Use treehouse return --all --force to clean and return them",
                 aborted.join(", ")
             ),
-            default: "Aborted.".to_string(),
+            legacy: "Aborted.".to_string(),
         }
         .into());
     }
@@ -1015,8 +1046,10 @@ fn release_one(
 ///
 /// `unanswered` and a decline are kept distinct because they demand different
 /// responses, but BOTH mean the slot stays held — and a caller reading exit 0
-/// as "the slot was released" was reading a bug (Go's v3.0.0 rationale). The
-/// strict message names which one it was.
+/// as "the slot was released" was reading a bug (Go's v3.0.0 rationale, and the
+/// reason this port now exits 3 by default). The exit-3 message names which one
+/// it was; the exit-0 opt-out message never did, and stays that way so
+/// `TREEHOUSE_EXIT_STRICT=0` reproduces the pre-flip output exactly.
 fn not_returned_abort(path: &str, answer: Confirm) -> anyhow::Error {
     let reason = match answer {
         Confirm::Unanswered => {
@@ -1025,11 +1058,11 @@ fn not_returned_abort(path: &str, answer: Confirm) -> anyhow::Error {
         _ => "cleaning declined, so its uncommitted changes remain",
     };
     NotReturned {
-        strict: format!(
+        not_returned: format!(
             "🌳 worktree not returned: {reason}; prune will not reclaim this slot. Use treehouse return --force {} to clean and return it",
             quote_path(Path::new(path))
         ),
-        default: "Aborted.".to_string(),
+        legacy: "Aborted.".to_string(),
     }
     .into()
 }
@@ -2305,39 +2338,105 @@ mod tests {
         }
     }
 
-    // ─── M-019: the unreturned signal is opt-in, never silent ───────────────
+    // ─── M-019: the unreturned signal is never silent ─────────────────────────
 
     #[test]
-    fn an_abort_carries_both_the_strict_and_the_backward_compatible_message() {
+    fn an_abort_carries_both_the_exit_three_and_the_backward_compatible_message() {
         let e = not_returned_abort("/pool/1/repo", Confirm::Unanswered);
         let text = format!("{e:#}");
         assert!(
             text.contains("stdin reached EOF"),
-            "strict mode must say the confirmation was unanswerable: {text}"
+            "the default exit-3 message must say the confirmation was unanswerable: {text}"
         );
         assert!(text.contains("prune will not reclaim"), "{text}");
+        // The remedy must be pasteable into the user's own shell, so it has to
+        // use THAT platform's quoting — cmd.exe groups on double quotes.
+        let remedy = if cfg!(windows) {
+            "treehouse return --force \"/pool/1/repo\""
+        } else {
+            "treehouse return --force '/pool/1/repo'"
+        };
         assert!(
-            text.contains("treehouse return --force '/pool/1/repo'"),
+            text.contains(remedy),
             "the remedy must be pasteable: {text}"
         );
         let n = e.downcast_ref::<NotReturned>().unwrap();
         assert_eq!(
-            n.default, "Aborted.",
-            "the default keeps this port's exit-0 contract"
+            n.legacy, "Aborted.",
+            "the opt-out path keeps this port's pre-flip exit-0 wording"
         );
 
         let declined = not_returned_abort("/pool/1/repo", Confirm::No);
         assert!(format!("{declined:#}").contains("cleaning declined"));
     }
 
+    /// The flip itself. Exit 3 is the DEFAULT and `TREEHOUSE_EXIT_STRICT=0` is
+    /// the escape hatch, so an unset variable and a leftover `=1` from the
+    /// opt-in era must BOTH land on the strict path — only an explicit falsy
+    /// value may restore exit 0.
+    ///
+    /// Env vars are process-global and tests share a process, so this asserts
+    /// the pure reader rather than mutating the environment: setting it here
+    /// would race every other test that shells out to `main`'s subprocesses.
+    #[test]
+    fn legacy_zero_is_opted_in_only_by_an_explicit_false() {
+        for value in ["0", "false", "off", "n", "no", "f", " FALSE ", "off "] {
+            assert!(parses_as_false(value), "{value:?} must restore exit 0");
+        }
+        // The dangerous cases: a stale opt-in, a typo, and the empty string a
+        // shell exports when a variable is declared but never assigned.
+        for value in ["1", "true", "on", "yes", "y", "", "  ", "maybe", "2"] {
+            assert!(
+                !parses_as_false(value),
+                "{value:?} must keep the exit-3 default"
+            );
+        }
+    }
+
+    /// The three construction sites must all populate the exit-3 message, so a
+    /// new call site cannot accidentally ship Go's wording only to the opt-out
+    /// (or vice versa).
+    #[test]
+    fn every_not_returned_site_populates_both_messages() {
+        for n in [
+            not_returned_abort("/pool/1/repo", Confirm::Unanswered),
+            not_returned_abort("/pool/1/repo", Confirm::No),
+        ] {
+            let n = n.downcast_ref::<NotReturned>().unwrap();
+            assert!(
+                !n.not_returned.is_empty(),
+                "the exit-3 message must never be blank"
+            );
+            assert_eq!(n.legacy, "Aborted.", "the opt-out wording is fixed");
+        }
+    }
+
     #[test]
     fn quote_path_neutralises_shell_metacharacters() {
-        assert_eq!(quote_path(Path::new("/pool/1/repo")), "'/pool/1/repo'");
-        assert_eq!(
-            quote_path(Path::new("/it's here")),
-            r"'/it'\''s here'",
-            "an embedded quote must not terminate the quoted string"
-        );
+        // `quote_path` is platform-branched (main.rs:1815): POSIX shells
+        // single-quote, cmd.exe double-quotes. Assert each platform's real
+        // form rather than pinning the POSIX one everywhere.
+        if cfg!(windows) {
+            assert_eq!(quote_path(Path::new("/pool/1/repo")), "\"/pool/1/repo\"");
+            assert_eq!(
+                quote_path(Path::new("/it's here")),
+                "\"/it's here\"",
+                "cmd.exe has no escape inside double quotes, but `'` is not \
+                 special there — the doubled `\"` is the escape it does honour"
+            );
+            assert_eq!(
+                quote_path(Path::new("/say \"hi\"")),
+                "\"/say \"\"hi\"\"\"",
+                "an embedded quote must be doubled so it cannot close the group"
+            );
+        } else {
+            assert_eq!(quote_path(Path::new("/pool/1/repo")), "'/pool/1/repo'");
+            assert_eq!(
+                quote_path(Path::new("/it's here")),
+                r"'/it'\''s here'",
+                "an embedded quote must not terminate the quoted string"
+            );
+        }
     }
 
     // ─── M-023: `--root` and its Go precedence ──────────────────────────────

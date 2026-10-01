@@ -57,7 +57,42 @@ jobs:
       # Build the binary the e2e harness spawns BEFORE running tests.
       - name: build treehouse binary
         run: cargo build --bin treehouse
+      # --no-fail-fast is load-bearing, not a preference. cargo otherwise aborts
+      # at the FIRST failing test target, so a failure in an early target hides
+      # every later one. That is not hypothetical: the 2 failures in the
+      # `treehouse` bin target meant treehouse-core's 17 lib tests never ran on
+      # Windows at all, and the 2 lib failures meant the update_e2e integration
+      # tests never ran on Linux — all of it green-looking for months. Every
+      # target must run before this job can be called green.
       - name: test workspace
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
       - name: test with hardening feature
-        run: cargo test -p treehouse-core --features hardening
+        run: cargo test -p treehouse-core --features hardening --no-fail-fast
+
+  # `toon` is feature-gated and OFF by default, so no job above compiles the
+  # TOON encoder — release.yml's `--features toon` build is the only place it is
+  # compiled today, and finding out it is broken by pushing a tag is far too
+  # late. Single runner on purpose: the encoder is portable Rust with no
+  # platform-specific code, so macOS/Windows buys no signal over one compile,
+  # and its feature set is disjoint from every other job's (hence no `needs:`).
+  #
+  # This job needs network and gets it for the same reason checkout does:
+  # `tru` is a git dependency (Cargo.lock:2597 pins it to an immutable rev of
+  # Dicklesworthstone/toon_rust), fetched by cargo from github.com.
+  toon:
+    name: build + test with toon encoder
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build workspace with toon
+        run: cargo build --workspace --features toon
+      # The e2e suites spawn target/debug/treehouse (tests/e2e/common.rs
+      # `treehouse_bin` asserts it exists), and the release binary is the one
+      # that has to carry the encoder — so build it here, before the tests,
+      # rather than letting them pick up a default-feature build.
+      - name: build treehouse binary with toon
+        run: cargo build --bin treehouse --features toon
+      - name: test workspace with toon
+        run: cargo test --workspace --features toon --no-fail-fast

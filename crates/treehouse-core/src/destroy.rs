@@ -169,7 +169,8 @@ impl Pool {
                     context_error: Some("could not resolve the worktree's repository".into()),
                 })
             };
-            let target = self.classify_for_destroy(wt, context.default_ref.as_deref().unwrap_or(""));
+            let target =
+                self.classify_for_destroy(wt, context.default_ref.as_deref().unwrap_or(""));
             let mut t = target;
             t.bytes = self.measure_size(&t.path);
             match self.allows(&t, allow_leased, opts) {
@@ -185,8 +186,7 @@ impl Pool {
         }
 
         // Execute: two-phase.
-        let (destroyed, exec_skips) =
-            self.execute_destroy(&removable, allow_leased, opts)?;
+        let (destroyed, exec_skips) = self.execute_destroy(&removable, allow_leased, opts)?;
         result.destroyed = destroyed.clone();
         result.freed_bytes = destroyed.iter().map(|t| t.bytes).sum();
         result.skipped.extend(exec_skips);
@@ -313,11 +313,13 @@ impl Pool {
         if removable.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
-        let planned_by_path: std::collections::HashMap<String, (DestroyTarget, crate::prune::PruneContext)> =
-            removable
-                .iter()
-                .map(|(t, ctx)| (t.path.clone(), (t.clone(), ctx.clone())))
-                .collect();
+        let planned_by_path: std::collections::HashMap<
+            String,
+            (DestroyTarget, crate::prune::PruneContext),
+        > = removable
+            .iter()
+            .map(|(t, ctx)| (t.path.clone(), (t.clone(), ctx.clone())))
+            .collect();
 
         // Phase 1: reserve Destroying + fresh owner under the lock.
         //

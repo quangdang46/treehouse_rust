@@ -127,22 +127,79 @@ pub struct WorktreeEntry {
     /// makes a damaged slot visible instead of reading as an ordinary lease.
     #[serde(default, skip_serializing_if = "is_empty_str")]
     pub recovery_error: String,
-    /// Fields this build does not understand, preserved verbatim.
+    /// Fields this build does not model as struct fields, preserved verbatim.
     ///
-    /// Go's entry carries acquisition metadata the port has not implemented
-    /// yet (`base_branch`, `seeded_paths`, `seed_inventory_*`, `seed_backend`,
+    /// Go's entry carries acquisition metadata that has no dedicated field
+    /// here (`base_branch`, `seeded_paths`, `seed_inventory_*`, `seed_backend`,
     /// `seed_auth_identity`, `recovery_reason`). Every state write is a
     /// read-modify-write of the whole file, so without this map a single
     /// read/write cycle silently deletes all of it — metadata loss on a wire
     /// format the module is contractually required to reproduce. Keeping
     /// unknown keys means a pool written by a newer treehouse can still be
-    /// listed, returned and destroyed by this build without damage, and
-    /// nothing is lost while the fields above are being ported.
+    /// listed, returned and destroyed by this build without damage.
     ///
-    /// Populated on read, emitted on write, never interpreted here.
+    /// Populated on read, emitted on write. Unmodelled keys are never
+    /// interpreted. The seed-inventory and base-branch keys ARE interpreted,
+    /// but only through the typed accessors above
+    /// ([`Self::seed_inventory`], [`Self::set_seed_inventory`],
+    /// [`Self::base_branch`], [`Self::set_base_branch`]), never by poking at
+    /// this map from a caller: the accessors own Go's key names and `omitempty`
+    /// shape, and a caller that hand-rolls either re-introduces the
+    /// silent-deletion bug this map exists to prevent.
     #[serde(flatten)]
     pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
+
+/// Go's five seed-inventory fields, read and written as one value.
+///
+/// Upstream splits `SeededPaths`, `SeedInventoryKnown`, `SeedInventoryDigest`,
+/// `SeedBackend` and `SeedAuthIdentity` across a `WorktreeEntry` (state.go:52-58).
+/// They are split on the wire because that is what JSON is, but they are a
+/// single fact — "these ignored files exist because this pool copied them" — and
+/// every one of them is only meaningful alongside `SeedInventoryKnown`. Reading
+/// them independently is how a caller ends up treating "nobody recorded what was
+/// copied" as the claim "nothing was copied", which authorizes deletions nobody
+/// approved.
+///
+/// [`Self::authorized_paths`] is the one method callers should reach for: it is
+/// the only thing standing between a state file and an arbitrary path deletion.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SeedInventory {
+    /// The paths this pool copied into the worktree.
+    pub paths: Vec<String>,
+    /// Whether `paths` is a verified record rather than lost bookkeeping.
+    pub known: bool,
+    /// The backend that performed the seeding (`git`, `jj`).
+    pub backend: String,
+    /// Go's seed-authentication identity. Empty unless a backend records one;
+    /// this port has no jj seed authentication, so it stays empty for git.
+    pub auth_identity: String,
+}
+
+impl SeedInventory {
+    /// The paths a reset is authorized to delete, or `None` when nothing is.
+    ///
+    /// `None` covers both "no inventory was ever recorded" and "the recorded
+    /// inventory is empty". Neither authorizes a deletion:
+    /// [`crate::vcs::validate_seed_inventory`] refuses an empty list outright,
+    /// and a missing record is a caller that lost its bookkeeping. Turning that
+    /// loss into deletion would make a bookkeeping bug look like a feature.
+    pub fn authorized_paths(&self) -> Option<&[String]> {
+        if self.known && !self.paths.is_empty() {
+            Some(&self.paths)
+        } else {
+            None
+        }
+    }
+}
+
+/// Wire keys for the seed-inventory fields (Go `WorktreeEntry` JSON tags).
+const K_SEEDED_PATHS: &str = "seeded_paths";
+const K_SEED_INVENTORY_KNOWN: &str = "seed_inventory_known";
+const K_SEED_BACKEND: &str = "seed_backend";
+const K_SEED_AUTH_IDENTITY: &str = "seed_auth_identity";
+/// Go's `base_branch` (state.go:48).
+const K_BASE_BRANCH: &str = "base_branch";
 
 impl WorktreeEntry {
     /// A lease that has passed its TTL. Permanent leases (zero `expires_at`)
@@ -155,6 +212,145 @@ impl WorktreeEntry {
     pub fn is_valid_lease(&self, now: DateTime<Utc>) -> bool {
         self.leased && (self.expires_at == ZERO_TIME || now < self.expires_at)
     }
+
+    /// The seed inventory recorded for this slot (Go's five seed fields).
+    ///
+    /// Total by construction: every key that is absent, `null`, or of the wrong
+    /// JSON type reads as its zero value rather than failing the whole state
+    /// read. A state file written by another build is data to be preserved, not
+    /// a parse error — and one malformed field must not make an entire pool
+    /// unreadable, which would turn a recoverable metadata problem into an
+    /// acquisition failure.
+    pub fn seed_inventory(&self) -> SeedInventory {
+        SeedInventory {
+            paths: string_list(self.extra.get(K_SEEDED_PATHS)),
+            known: self
+                .extra
+                .get(K_SEED_INVENTORY_KNOWN)
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            backend: string_field(self.extra.get(K_SEED_BACKEND)),
+            auth_identity: string_field(self.extra.get(K_SEED_AUTH_IDENTITY)),
+        }
+    }
+
+    /// Records `inventory` as this slot's trusted seed inventory.
+    ///
+    /// Written through [`Self::extra`] under Go's own JSON keys, and written
+    /// with Go's `omitempty` shape: a field at its zero value is REMOVED rather
+    /// than written as an empty value. Removing (not overwriting) is what stops
+    /// a cleared inventory from leaving a stale list behind for the next reader
+    /// — the difference between "seed nothing" and "seed whatever that was".
+    ///
+    /// Storage is the flatten map rather than a dedicated struct field because
+    /// that map is the module's load-bearing wire contract: it is what keeps
+    /// every field a newer treehouse wrote from being silently deleted by the
+    /// read-modify-write this type performs on each acquisition. Adding a
+    /// derived serde field named `seeded_paths` would move that key out of
+    /// `extra` and into a struct field — which reads as typed access but
+    /// silently narrows what round-trips.
+    pub fn set_seed_inventory(&mut self, inventory: SeedInventory) {
+        if inventory.paths.is_empty() {
+            self.extra.remove(K_SEEDED_PATHS);
+        } else {
+            self.extra.insert(
+                K_SEEDED_PATHS.to_string(),
+                serde_json::to_value(&inventory.paths).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        set_omitempty(
+            &mut self.extra,
+            K_SEED_INVENTORY_KNOWN,
+            inventory.known.then_some(serde_json::Value::Bool(true)),
+        );
+        set_omitempty(
+            &mut self.extra,
+            K_SEED_BACKEND,
+            nonempty_value(&inventory.backend),
+        );
+        set_omitempty(
+            &mut self.extra,
+            K_SEED_AUTH_IDENTITY,
+            nonempty_value(&inventory.auth_identity),
+        );
+    }
+
+    /// Drops this slot's seed inventory, leaving an empty, *known* one.
+    ///
+    /// Mirrors Go's `setSeedInventory(wt, nil, true)`: a VERIFIED empty
+    /// inventory, not a lost one. The distinction is the difference between
+    /// "this slot has nothing in it that we put there" and "we no longer know",
+    /// and only the first is a claim cleanup may act on.
+    pub fn clear_seed_inventory(&mut self) {
+        self.set_seed_inventory(SeedInventory {
+            known: true,
+            ..Default::default()
+        });
+    }
+
+    /// The EXPLICIT base this slot was last cut from (Go `BaseBranch`).
+    ///
+    /// `None` when absent or non-string — distinct from `Some("")`, which Go
+    /// uses for "cut from the inferred default" and which therefore means
+    /// something a later acquisition may weigh.
+    pub fn base_branch(&self) -> Option<&str> {
+        self.extra
+            .get(K_BASE_BRANCH)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Records the base this slot was cut from (Go `BaseBranch`).
+    pub fn set_base_branch(&mut self, branch: &str) {
+        set_omitempty(&mut self.extra, K_BASE_BRANCH, nonempty_value(branch));
+    }
+}
+
+/// Writes `value` under `key`, or removes `key` when there is no value.
+///
+/// Go's `omitempty` in one place, so "clear this field" and "this field has no
+/// value" cannot drift into two different wire shapes.
+fn set_omitempty(
+    extra: &mut std::collections::BTreeMap<String, serde_json::Value>,
+    key: &str,
+    value: Option<serde_json::Value>,
+) {
+    match value {
+        Some(v) => {
+            extra.insert(key.to_string(), v);
+        }
+        None => {
+            extra.remove(key);
+        }
+    }
+}
+
+fn nonempty_value(s: &str) -> Option<serde_json::Value> {
+    if s.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::String(s.to_string()))
+    }
+}
+
+/// Reads a JSON string field, treating absent, `null` and non-string as empty.
+fn string_field(v: Option<&serde_json::Value>) -> String {
+    v.and_then(|v| v.as_str()).unwrap_or_default().to_string()
+}
+
+/// Reads a JSON string list, keeping only the entries that are strings.
+///
+/// A list with a non-string entry is not a claim about paths, so it degrades to
+/// "nothing was seeded" rather than to a partially-trusted list that a reset
+/// would act on.
+fn string_list(v: Option<&serde_json::Value>) -> Vec<String> {
+    v.and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| e.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The pool state file: an ordered list of managed worktrees.
@@ -899,7 +1095,12 @@ mod tests {
         assert!(e.leased, "adopted entry must be quarantined as leased");
         assert_eq!(e.lease_holder, RECOVERED_LEASE_HOLDER);
         assert_eq!(e.recovery_error, "");
-        assert!(e.path.ends_with("1/myrepo"), "got {}", e.path);
+        // `Path::ends_with` compares whole path components, so this holds on
+        // both `/` and `\` platforms. `String::ends_with("1/myrepo")` is a
+        // substring test and hardcodes the POSIX separator: `quarantine_entry`
+        // renders the path from a joined PathBuf, which is `1\myrepo` on
+        // Windows, so the assertion could never pass there.
+        assert!(Path::new(&e.path).ends_with("1/myrepo"), "got {}", e.path);
     }
 
     #[test]
@@ -975,10 +1176,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         seed_worktree(dir.path(), "1");
         let spelled = format!("{}/./1/myrepo/", dir.path().to_string_lossy());
-        let json = format!(
-            r#"{{"worktrees":[{{"name":"1","path":"{spelled}","created_at":"2026-08-14T12:00:00Z"}}]}}"#
-        );
-        std::fs::write(State::state_file_path(dir.path()), json).unwrap();
+        // Serialize rather than hand-format: a raw Windows pool path contains
+        // backslashes, and `\` is a JSON escape character, so an interpolated
+        // literal would not parse. The parse error routed this read into
+        // corrupt-state recovery, which quarantined the very entry the state
+        // file names — a failure of the fixture, not of adoption.
+        let recorded = State {
+            worktrees: vec![WorktreeEntry {
+                name: "1".into(),
+                path: spelled,
+                created_at: dt("2026-08-14T12:00:00Z"),
+                ..WorktreeEntry::default()
+            }],
+            ..Default::default()
+        };
+        std::fs::write(
+            State::state_file_path(dir.path()),
+            serde_json::to_vec_pretty(&recorded).unwrap(),
+        )
+        .unwrap();
 
         let s = State::read_state(dir.path()).unwrap();
         assert_eq!(
@@ -1154,6 +1370,148 @@ mod tests {
     }
 
     // ─── Wire format: unknown Go fields must survive a read-modify-write ────
+
+    // ─── the typed seed-inventory layer ──────────────────────────────────────
+
+    /// A Go-written entry must read back through the typed accessors with the
+    /// exact values Go wrote, and write back in Go's shape.
+    ///
+    /// This is the round trip that matters: a pool written by an upstream build
+    /// is opened by this one, seeded-path removal has to act on what Go
+    /// recorded, and every write must leave a file the next reader — of either
+    /// build — still understands.
+    #[test]
+    fn a_go_written_seed_inventory_reads_and_writes_back_identically() {
+        let json = r#"{
+  "worktrees": [{
+    "name": "1",
+    "path": "/pool/1/repo",
+    "created_at": "2026-08-14T12:00:00Z",
+    "leased": false,
+    "base_branch": "main",
+    "seeded_paths": [".env", "vendor/"],
+    "seed_inventory_known": true,
+    "seed_backend": "git",
+    "seed_auth_identity": "auth-abc"
+  }]
+}"#;
+        let s: State = serde_json::from_str(json).unwrap();
+        let inventory = s.worktrees[0].seed_inventory();
+        assert!(inventory.known);
+        assert_eq!(inventory.paths, vec![".env", "vendor/"]);
+        assert_eq!(inventory.backend, "git");
+        assert_eq!(inventory.auth_identity, "auth-abc");
+        assert_eq!(s.worktrees[0].base_branch(), Some("main"));
+        assert_eq!(
+            inventory.authorized_paths(),
+            Some([".env".to_string(), "vendor/".to_string()].as_slice())
+        );
+
+        // And back out, with Go's `omitempty` shape preserved exactly.
+        let out = serde_json::to_string(&s).unwrap();
+        for key in [
+            "base_branch",
+            "seeded_paths",
+            "seed_inventory_known",
+            "seed_backend",
+            "seed_auth_identity",
+        ] {
+            assert!(out.contains(&format!("\"{key}\"")), "{key} lost: {out}");
+        }
+    }
+
+    /// A malformed or absent key must degrade to its zero value, never fail the
+    /// whole state read.
+    ///
+    /// One bad field must not make an entire pool unreadable: that would turn a
+    /// recoverable metadata problem into an acquisition failure for every slot
+    /// in it, which is a far worse outcome than ignoring the field.
+    #[test]
+    fn an_absent_or_malformed_seed_key_reads_as_zero_not_as_an_error() {
+        let json = r#"{
+  "worktrees": [
+    {"name":"1","path":"/p/1","created_at":"2026-08-14T12:00:00Z"},
+    {"name":"2","path":"/p/2","created_at":"2026-08-14T12:00:00Z",
+     "seeded_paths": ["ok.env", 42, null],
+     "seed_inventory_known": "yes",
+     "seed_backend": 7}
+  ]
+}"#;
+        let s: State = serde_json::from_str(json).expect("a bad field must not fail the read");
+
+        let absent = s.worktrees[0].seed_inventory();
+        assert!(!absent.known);
+        assert!(absent.paths.is_empty());
+        assert!(
+            absent.authorized_paths().is_none(),
+            "no record is not the same claim as 'nothing was seeded'"
+        );
+
+        let malformed = s.worktrees[1].seed_inventory();
+        assert!(
+            !malformed.known,
+            "a non-boolean seed_inventory_known cannot authorize anything"
+        );
+        assert_eq!(
+            malformed.paths,
+            vec!["ok.env".to_string()],
+            "non-string entries are dropped rather than trusted"
+        );
+        assert!(malformed.backend.is_empty());
+        assert!(
+            malformed.authorized_paths().is_none(),
+            "an unknown inventory authorizes no deletion however long the list is"
+        );
+    }
+
+    /// `known == true` with nothing in it is a real, different claim from
+    /// `known == false`. Collapsing them is how a cleared inventory turns into a
+    /// stale one.
+    #[test]
+    fn a_known_empty_inventory_differs_from_a_lost_one() {
+        let mut cleared = WorktreeEntry::default();
+        cleared.clear_seed_inventory();
+        assert!(cleared.seed_inventory().known);
+        assert!(cleared.seed_inventory().authorized_paths().is_none());
+
+        let never = WorktreeEntry::default();
+        assert!(!never.seed_inventory().known);
+
+        // Both authorize no deletion, but only one of them is a statement about
+        // the slot rather than an absence of one.
+        let cleared_json = serde_json::to_string(&cleared).unwrap();
+        assert!(
+            cleared_json.contains(r#""seed_inventory_known":true"#),
+            "a verified empty inventory must record that it is verified: {cleared_json}"
+        );
+        assert!(
+            !cleared_json.contains("seeded_paths"),
+            "an empty list must be omitted, not written as []: {cleared_json}"
+        );
+    }
+
+    /// Setting then clearing must REMOVE the keys, not overwrite them with
+    /// empty values — otherwise a later reader resurrects a stale list.
+    #[test]
+    fn clearing_removes_the_keys_rather_than_blanking_them() {
+        let mut wt = WorktreeEntry::default();
+        wt.set_seed_inventory(SeedInventory {
+            paths: vec![".env".into()],
+            known: true,
+            backend: "git".into(),
+            auth_identity: String::new(),
+        });
+        wt.set_base_branch("main");
+        assert!(wt.seed_inventory().authorized_paths().is_some());
+
+        wt.clear_seed_inventory();
+        wt.set_base_branch("");
+        assert!(wt.base_branch().is_none());
+        let json = serde_json::to_string(&wt).unwrap();
+        assert!(!json.contains("seeded_paths"), "{json}");
+        assert!(!json.contains("seed_backend"), "{json}");
+        assert!(!json.contains("base_branch"), "{json}");
+    }
 
     #[test]
     fn unknown_go_fields_round_trip() {

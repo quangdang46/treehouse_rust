@@ -32,6 +32,12 @@ tru = { workspace = true, optional = true }
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", features = ["signal", "process"] }
 
+# APFS clonefile sharing, which is macOS-only and opt-in (src/fileclone/mod.rs).
+# Gated here rather than at the workspace so a Linux/Windows build does not
+# compile a Darwin syscall surface it can never call.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win32_System_Threading"] }
 

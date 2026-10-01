@@ -28,6 +28,49 @@ pub fn treehouse_bin() -> PathBuf {
     exe
 }
 
+/// Spawn attempts tolerated while a staged binary reports ETXTBSY.
+///
+/// 200 x 10 ms = 2 s: far longer than a write teardown, far shorter than a CI
+/// job's patience.
+const ETXTBSY_RETRIES: u32 = 200;
+const ETXTBSY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// `cmd.output()`, retrying only while the spawn fails with ETXTBSY.
+///
+/// On Linux `execve(2)` refuses a file that is still open for writing anywhere
+/// on the box, so a suite that stages a binary by copying it and immediately
+/// executes that copy can lose the race against the copy's own write teardown.
+/// Only the suites that stage are exposed: `update_e2e.rs::install_target`
+/// writes into a temp dir and execs the result, whereas `e2e.rs` and
+/// `bulk_ops_e2e.rs` exec `target/debug/treehouse` straight off disk and never
+/// come near this path. Nothing about the treehouse binary is wrong in that
+/// failure, so the retry belongs to the harness and nowhere else -- the product
+/// installs by renaming (`updater.rs::atomic_replace`), which has no such
+/// window.
+///
+/// Every other error returns on the first attempt, so a genuinely missing or
+/// non-executable binary still fails immediately and still names itself.
+/// `ErrorKind::ExecutableFileBusy` is stable since Rust 1.83, under this
+/// workspace's 1.88 MSRV, and needs no new dependency.
+pub fn output_tolerating_etxtbsy(cmd: &mut Command) -> std::io::Result<std::process::Output> {
+    let mut attempt = 0;
+    loop {
+        match cmd.output() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                assert!(
+                    attempt < ETXTBSY_RETRIES,
+                    "the binary at {:?} stayed executable-file-busy across {ETXTBSY_RETRIES} \
+                     spawn attempts",
+                    cmd.get_program()
+                );
+                attempt += 1;
+                std::thread::sleep(ETXTBSY_BACKOFF);
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Runs the treehouse binary as a subprocess with isolated HOME.
 pub fn run(
     bin: &Path,

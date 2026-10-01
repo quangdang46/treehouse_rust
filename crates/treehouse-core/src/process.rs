@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, RefreshKind, System};
 
 /// A process found running inside a worktree. Display is `name (pid)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +122,36 @@ impl ProcessTable {
         let mut result = Vec::new();
         let system = self.system.lock().unwrap();
         for (pid, process) in system.processes() {
+            // A zombie has already terminated — it holds no cwd, runs no
+            // instructions, and cannot block `git worktree remove`. It must
+            // never read as "a process is still using this worktree".
+            //
+            // This check is load-bearing, not defensive. sysinfo refreshes
+            // `cwd` as `UpdateKind::OnlyIfNotSet` (system.rs:2478), so once a
+            // pid's cwd is cached it is NEVER re-read: `needs_update` returns
+            // `p.cwd.is_none()` (system.rs:2336). When Linux SIGKILLs a child
+            // the pid survives as a zombie, `/proc/<pid>/cwd` disappears — and
+            // sysinfo keeps the stale cached path. Without this filter the
+            // post-kill survivor scan in `destroy` sees the dead pid, and
+            // `--include-in-use` skipped with "worktree processes still
+            // running after termination" even though nothing was running.
+            // `status` IS re-read on every refresh, so it is the fresh signal.
+            //
+            // That is true on unix and FALSE on Windows: sysinfo's Windows
+            // backend assigns `status` exactly once, as
+            // `ProcessStatus::Run` in `ProcessInner::new`, and `update()`
+            // never reassigns it — so this comparison alone can never be true
+            // there. A Windows process killed by `TerminateProcess` also
+            // lingers in the `CreateToolhelp32Snapshot` listing until the
+            // last handle to it closes, and because cwd is
+            // `UpdateKind::OnlyIfNotSet` it is read back with its stale
+            // worktree path. Same symptom as the unix case: the post-kill
+            // survivor scan in `destroy` saw the dead pid and `--include-in-use`
+            // skipped with "worktree processes still running after
+            // termination" even though nothing was running.
+            if process.status() == ProcessStatus::Zombie || has_terminated(pid.as_u32()) {
+                continue;
+            }
             let cwd = match process.cwd() {
                 Some(c) => c.to_path_buf(),
                 None => continue, // exited or permission-restricted: skip
@@ -329,6 +359,46 @@ fn terminate_process_windows(pid: i32) -> std::io::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Whether `pid` names a process that has already exited, so a scan must not
+/// report it as still running inside a worktree.
+///
+/// Windows keeps a terminated process in the process table until every handle
+/// to it is closed, so `CreateToolhelp32Snapshot` still lists it and sysinfo
+/// still hands back its cached cwd. `GetExitCodeProcess` is the authoritative
+/// signal: it returns `STILL_ACTIVE` only while the process is actually
+/// running, and the real exit code once it has terminated. Go needs none of
+/// this because gopsutil re-reads cwd live per process and skips on read
+/// failure; sysinfo caches cwd, so liveness has to be asked for explicitly.
+///
+/// Fails CLOSED: a process we cannot open is reported as still running, so a
+/// permission error can never be mistaken for "safe to delete".
+#[cfg(windows)]
+fn has_terminated(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    /// `GetExitCodeProcess` reports this while the process has not exited.
+    const STILL_ACTIVE: u32 = 259;
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut exit_code = 0u32;
+        let ok = GetExitCodeProcess(handle, &mut exit_code) != 0;
+        CloseHandle(handle);
+        ok && exit_code != STILL_ACTIVE
+    }
+}
+
+/// unix: a zombie is reported through `ProcessStatus::Zombie` and caught by the
+/// status check in `find_in_worktree`, so there is nothing extra to do here.
+#[cfg(not(windows))]
+fn has_terminated(_pid: u32) -> bool {
+    false
 }
 
 /// Absolute + symlink-resolved path (Go `resolvePath`): returns the canonical

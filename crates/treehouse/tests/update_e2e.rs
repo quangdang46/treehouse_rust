@@ -25,6 +25,12 @@ use std::process::Command;
 /// never replaced cannot be confused with one that was.
 const NEW_BINARY: &[u8] = b"#!/bin/sh\n# treehouse 9.9.9 fixture payload\n";
 
+/// The version the binary under test reports as its own — i.e. the workspace
+/// version this suite was compiled against. Kept in sync with the bump by
+/// construction rather than by hand, so releasing never breaks the assertions
+/// about which version the success line names.
+const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Builds a release fixture: the archive, its checksum sidecar, and the
 /// GitHub-shaped `latest.json` pointing at both over `file://`.
 struct ReleaseFixture {
@@ -57,14 +63,15 @@ impl ReleaseFixture {
         let digest = checksum
             .map(str::to_string)
             .unwrap_or_else(|| sha256(&archive));
-        let sidecar = dir.join(format!("{asset}.sha256"));
+        let sidecar_name = checksum_sidecar_name(&asset);
+        let sidecar = dir.join(&sidecar_name);
         std::fs::write(&sidecar, format!("{digest}  {asset}\n")).unwrap();
 
         let latest_json = dir.join("latest.json");
         let body = format!(
             r#"{{"tag_name":"{tag}","assets":[
                  {{"name":"{asset}","browser_download_url":"file://{archive}"}},
-                 {{"name":"{asset}.sha256","browser_download_url":"file://{sidecar}"}}]}}"#,
+                 {{"name":"{sidecar_name}","browser_download_url":"file://{sidecar}"}}]}}"#,
             tag = tag,
             asset = asset,
             archive = archive.display(),
@@ -91,10 +98,7 @@ fn run_update(fixture: &ReleaseFixture, home: &Path, target: &Path) -> (String, 
         ("TREEHOUSE_UPDATE_API_URL", fixture.url()),
         ("TREEHOUSE_UPDATE_TARGET", target.display().to_string()),
     ];
-    let out = Command::new(target)
-        .arg("update")
-        .envs(env)
-        .output()
+    let out = common::output_tolerating_etxtbsy(Command::new(target).arg("update").envs(env))
         .expect("failed to run treehouse update");
     (
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -105,6 +109,13 @@ fn run_update(fixture: &ReleaseFixture, home: &Path, target: &Path) -> (String, 
 
 /// A fresh copy of the built binary standing in for an installed release.
 /// Leaked like `common::setup` does, so it outlives the assertion helpers.
+///
+/// The copy is deliberate and must NOT be collapsed into the shared
+/// `target/debug/treehouse`: it is what `TREEHOUSE_UPDATE_TARGET` points at, so
+/// a passing update replaces THIS file and leaves the one every other suite
+/// execs untouched. It is also why this suite alone writes an executable and
+/// execs it in the same breath, which is what the two exec sites below guard
+/// with [`common::output_tolerating_etxtbsy`]. Do not "simplify" it away.
 fn install_target(name: &str) -> PathBuf {
     let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
     let target = dir.path().join(name);
@@ -118,6 +129,32 @@ fn os() -> &'static str {
 
 fn arch() -> &'static str {
     std::env::consts::ARCH
+}
+
+/// The checksum sidecar's FILENAME for `asset`: the archive's extension is
+/// dropped, giving `treehouse-vX-macos-aarch64.sha256`.
+///
+/// Not `format!("{asset}.sha256")`. release.yml's Package step writes
+/// `treehouse-${TAG}-${{ matrix.suffix }}.sha256` (release.yml:106 and :111) —
+/// no `.tar.gz`, no `.zip` — so the extension-stripped name is what a real
+/// release publishes and therefore the only spelling worth proving end to end.
+/// Building the other one left the updater's fallback carrying the whole e2e:
+/// a regression that broke the name a real release uses would still have
+/// passed here. Every assertion below now runs against the real spelling.
+///
+/// The sidecar's CONTENTS are the other half and are NOT stripped: release.yml
+/// writes `printf '%s  %s\n' <hash> "…tar.gz"`, naming the full archive, which
+/// is what [`ReleaseFixture::build`] still writes.
+///
+/// Panics rather than falling back if `asset` stops being a `.tar.gz`: a silent
+/// no-op here would put the fixture back on the wrong spelling.
+fn checksum_sidecar_name(asset: &str) -> String {
+    const ARCHIVE_EXT: &str = ".tar.gz";
+    asset
+        .strip_suffix(ARCHIVE_EXT)
+        .unwrap_or_else(|| panic!("fixture asset {asset:?} must end in {ARCHIVE_EXT}"))
+        .to_owned()
+        + ".sha256"
 }
 
 fn sha256(path: &Path) -> String {
@@ -177,8 +214,13 @@ fn e2e_update_reports_the_versions_it_actually_installed() {
     let target = install_target("treehouse");
     let (out, _err, code) = run_update(&fixture, home.path(), &target);
     assert_eq!(code, 0);
+    // The "from" side is the version THIS build carries, so it is read from the
+    // crate rather than spelled out. A literal went stale on every release bump
+    // and failed for a reason that had nothing to do with the property under
+    // test; deriving it keeps the assertion exactly as strict and lets a
+    // version bump land without touching this file.
     assert!(
-        out.contains("0.1.2 -> v9.9.9"),
+        out.contains(&format!("{CURRENT_VERSION} -> v9.9.9")),
         "the success line must name both versions, got {out:?}"
     );
 }
@@ -189,7 +231,7 @@ fn e2e_update_reports_up_to_date_without_touching_the_binary() {
     let home = Box::leak(Box::new(tempfile::tempdir().unwrap()));
     let fixture_dir = home.path().join("release");
     std::fs::create_dir_all(&fixture_dir).unwrap();
-    // 0.0.1 is below the 0.1.2 this suite builds, so there is nothing to do.
+    // 0.0.1 is below the version this suite builds, so there is nothing to do.
     let fixture = ReleaseFixture::build(&fixture_dir, "v0.0.1", NEW_BINARY, None);
 
     let target = install_target("treehouse");
@@ -228,10 +270,7 @@ fn e2e_update_fails_loudly_when_the_release_cannot_be_reached() {
         ),
         ("TREEHOUSE_UPDATE_TARGET", target.display().to_string()),
     ];
-    let out = Command::new(&target)
-        .arg("update")
-        .envs(env)
-        .output()
+    let out = common::output_tolerating_etxtbsy(Command::new(&target).arg("update").envs(env))
         .expect("failed to run treehouse update");
 
     assert_ne!(
@@ -287,4 +326,41 @@ fn fixture_dir_is_the_release_directory() {
     let fixture = ReleaseFixture::build(dir.path(), "v9.9.9", NEW_BINARY, None);
     assert!(fixture.dir.join("latest.json").exists());
     assert!(fixture.url().starts_with("file://"));
+}
+
+/// The sidecar the fixture writes must carry the name a real release publishes.
+///
+/// The updater accepts both spellings, which is the whole reason this needed
+/// pinning: without it, a fixture that reverted to `….tar.gz.sha256` would
+/// still pass every e2e above while proving only the fallback path. Pinned
+/// against literals on both sides — comparing the helper to itself would prove
+/// nothing.
+#[test]
+fn the_fixture_uses_the_sidecar_name_release_yml_publishes() {
+    assert_eq!(
+        checksum_sidecar_name("treehouse-v9.9.9-macos-aarch64.tar.gz"),
+        "treehouse-v9.9.9-macos-aarch64.sha256",
+        "release.yml:111 writes the extension-stripped sidecar name"
+    );
+    assert_eq!(
+        checksum_sidecar_name("treehouse-v9.9.9-windows-x86_64.tar.gz"),
+        "treehouse-v9.9.9-windows-x86_64.sha256"
+    );
+
+    // And the fixture actually puts it on disk under that name.
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = ReleaseFixture::build(dir.path(), "v9.9.9", NEW_BINARY, None);
+    let sidecars: Vec<String> = std::fs::read_dir(&fixture.dir)
+        .unwrap()
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().to_string_lossy().into_owned();
+            name.ends_with(".sha256").then_some(name)
+        })
+        .collect();
+    let asset = format!("treehouse-v9.9.9-{}-{}.tar.gz", os(), arch());
+    assert_eq!(
+        sidecars,
+        vec![checksum_sidecar_name(&asset)],
+        "the fixture must write exactly one sidecar, under the name release.yml writes"
+    );
 }
