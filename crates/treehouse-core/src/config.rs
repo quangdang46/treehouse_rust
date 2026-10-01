@@ -398,7 +398,10 @@ pub enum ConfigError {
 /// For backward compatibility, a pre-existing entry in the tracked `.gitignore`
 /// is left alone and treated as sufficient — an upgrading user is not
 /// surprised by a moved ignore rule.
-pub fn ensure_excluded(treehouse_dir: &Path, git: &dyn crate::git::GitBackend) -> Result<(), ConfigError> {
+pub fn ensure_excluded(
+    treehouse_dir: &Path,
+    git: &dyn crate::git::GitBackend,
+) -> Result<(), ConfigError> {
     let self_ignored = write_self_ignore(treehouse_dir).is_ok();
 
     // The directory itself may not exist yet, so walk up to an existing
@@ -460,9 +463,9 @@ pub fn ensure_excluded(treehouse_dir: &Path, git: &dyn crate::git::GitBackend) -
     }
 
     std::fs::create_dir_all(
-        exclude_path
-            .parent()
-            .ok_or_else(|| ConfigError::Invalid(exclude_path.display().to_string(), String::new()))?,
+        exclude_path.parent().ok_or_else(|| {
+            ConfigError::Invalid(exclude_path.display().to_string(), String::new())
+        })?,
     )
     .map_err(|e| ConfigError::Io(exclude_path.display().to_string(), e))?;
 
@@ -597,9 +600,8 @@ const HOOK_KEYS: [&str; 2] = ["post_create", "pre_destroy"];
 /// Dedupes the ignored-hooks warning per config file: a single command loads
 /// config repeatedly, and the warning is for a human, once.
 fn warned_repo_hooks() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
-    static LOCKED: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashSet<PathBuf>>,
-    > = std::sync::OnceLock::new();
+    static LOCKED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
     LOCKED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
 }
 
@@ -1100,7 +1102,12 @@ mod tests {
             );
         };
         std::process::Command::new("git")
-            .args(["init", "-q", "--initial-branch=main", repo.to_str().unwrap()])
+            .args([
+                "init",
+                "-q",
+                "--initial-branch=main",
+                repo.to_str().unwrap(),
+            ])
             .output()
             .expect("git must be installed");
         must(&["config", "user.email", "test@test.com"]);
@@ -1329,12 +1336,7 @@ mod tests {
     /// whose config happens to be invalid would bury the real message.
     #[test]
     fn the_ignored_hooks_warning_is_silent_when_there_is_nothing_to_ignore() {
-        for contents in [
-            "max_trees = 4\n",
-            "[hooks]\n",
-            "invalid toml <<<\n",
-            "",
-        ] {
+        for contents in ["max_trees = 4\n", "[hooks]\n", "invalid toml <<<\n", ""] {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join("treehouse.toml"), contents).unwrap();
             assert!(

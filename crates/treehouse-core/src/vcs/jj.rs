@@ -217,7 +217,9 @@ pub fn workspace_name_for(path: &Path) -> String {
 /// (`@ & commit_id("...")`), where a truncated or padded value is not a commit
 /// id at all but a silent no-match.
 fn is_commit_id(s: &str) -> bool {
-    (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    (s.len() == 40 || s.len() == 64)
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Whether `s` may be embedded in a revset expression.
@@ -241,8 +243,7 @@ fn revset_atom(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 255
         && s.as_bytes()[0].is_ascii_alphanumeric()
-        && s
-            .bytes()
+        && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/' | b'@'))
 }
 
@@ -460,9 +461,12 @@ impl JjBackend {
     /// revset must not abort a decision the caller can safely make the other
     /// way.
     fn revset_non_empty(&self, dir: &Path, revset: &str) -> bool {
-        self.out(dir, &["log", "-r", revset, "--no-graph", "-T", COMMIT_ID_TEMPLATE])
-            .map(|o| !o.is_empty())
-            .unwrap_or(false)
+        self.out(
+            dir,
+            &["log", "-r", revset, "--no-graph", "-T", COMMIT_ID_TEMPLATE],
+        )
+        .map(|o| !o.is_empty())
+        .unwrap_or(false)
     }
 
     /// Whether `a` is an ancestor of (or equal to) `b` (Go `isAncestor`).
@@ -496,13 +500,22 @@ impl JjBackend {
         if reference.is_empty() {
             return Err(GitError::new(
                 "jj workspace reset",
-                format!("cannot resolve bookmark {branch:?}: the name cannot be expressed as a jj revset"),
+                format!(
+                    "cannot resolve bookmark {branch:?}: the name cannot be expressed as a jj revset"
+                ),
                 GitErrorKind::MergeRefUnresolvable,
             ));
         }
         let out = self.out(
             worktree,
-            &["log", "-r", &reference, "--no-graph", "-T", COMMIT_ID_TEMPLATE],
+            &[
+                "log",
+                "-r",
+                &reference,
+                "--no-graph",
+                "-T",
+                COMMIT_ID_TEMPLATE,
+            ],
         )?;
         first_commit_id(&out, &format!("bookmark {branch:?} to a commit"))
     }
@@ -620,7 +633,12 @@ impl JjBackend {
     /// concurrent commit that made the pinned revset non-empty again, or left
     /// the workspace dirty or unmerged, stops the reset instead of being
     /// discarded.
-    fn reset_dirty(&self, worktree: &Path, reset_ref: &str, expected_head: &str) -> Result<(), GitError> {
+    fn reset_dirty(
+        &self,
+        worktree: &Path,
+        reset_ref: &str,
+        expected_head: &str,
+    ) -> Result<(), GitError> {
         let revset = Self::pinned_revset(expected_head);
         self.out(worktree, &["abandon", "-r", &revset])?;
         // `@` still matches the pinned commit: it moved, or never was what the
@@ -687,7 +705,9 @@ impl GitBackend for JjBackend {
     fn repo_root(&self, start: &Path) -> Result<PathBuf, GitError> {
         // jj prints a physical path today, but its output form is not
         // contractual; canonicalize so every root-resolution route agrees.
-        Ok(canonicalize(&PathBuf::from(self.out(start, &["workspace", "root"])?)))
+        Ok(canonicalize(&PathBuf::from(
+            self.out(start, &["workspace", "root"])?,
+        )))
     }
 
     fn main_repo_root(&self, start: &Path) -> Result<PathBuf, GitError> {
@@ -722,7 +742,8 @@ impl GitBackend for JjBackend {
     }
 
     fn has_remote(&self, repo: &GitRepo, name: &str) -> bool {
-        self.remotes(repo).is_some_and(|r| r.iter().any(|(n, _)| n == name))
+        self.remotes(repo)
+            .is_some_and(|r| r.iter().any(|(n, _)| n == name))
     }
 
     fn remote_url(&self, repo: &GitRepo, name: &str) -> Option<String> {
@@ -1135,7 +1156,9 @@ mod tests {
 
         /// Whether any recorded call starts with `prefix`.
         fn called(&self, prefix: &[&str]) -> bool {
-            self.calls().iter().any(|c| c.len() >= prefix.len() && &c[..prefix.len()] == prefix)
+            self.calls()
+                .iter()
+                .any(|c| c.len() >= prefix.len() && &c[..prefix.len()] == prefix)
         }
     }
 
@@ -1168,9 +1191,7 @@ mod tests {
     }
 
     fn backend(fake: Arc<FakeJj>) -> JjBackend {
-        JjBackend {
-            runner: fake,
-        }
+        JjBackend { runner: fake }
     }
 
     /// A directory carrying a `.jj` marker, so the fail-closed marker check
@@ -1235,7 +1256,10 @@ mod tests {
         // `.jj/repo` is a DIRECTORY here: the store lives in this workspace.
         let (_d, root) = jj_dir();
         std::fs::create_dir(root.join(".jj").join("repo")).unwrap();
-        assert_eq!(main_root_from_workspace_root(&root).unwrap(), canonicalize(&root));
+        assert_eq!(
+            main_root_from_workspace_root(&root).unwrap(),
+            canonicalize(&root)
+        );
     }
 
     #[test]
@@ -1273,7 +1297,11 @@ mod tests {
         let (_d, root) = jj_dir();
         let err = main_root_from_workspace_root(&root)
             .expect_err("a .jj directory with no repo pointer is damaged, not a main workspace");
-        assert!(err.message.contains("cannot inspect"), "got: {}", err.message);
+        assert!(
+            err.message.contains("cannot inspect"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -1285,7 +1313,10 @@ mod tests {
         let written = std::fs::read_to_string(ws.join(".jj").join("repo")).unwrap();
         let written = PathBuf::from(written.trim());
         assert!(written.is_absolute(), "got: {written:?}");
-        assert_eq!(main_root_from_workspace_root(&ws).unwrap(), canonicalize(&main));
+        assert_eq!(
+            main_root_from_workspace_root(&ws).unwrap(),
+            canonicalize(&main)
+        );
     }
 
     #[test]
@@ -1294,11 +1325,18 @@ mod tests {
         let main = d.path().join("main");
         std::fs::create_dir_all(main.join(".jj").join("repo")).unwrap();
         let pointer = main.join(".jj").join("repo");
-        std::fs::write(ws.join(".jj").join("repo"), pointer.to_string_lossy().as_bytes()).unwrap();
+        std::fs::write(
+            ws.join(".jj").join("repo"),
+            pointer.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
 
         make_repo_pointer_absolute(&ws).unwrap();
 
-        assert_eq!(std::fs::read_to_string(ws.join(".jj").join("repo")).unwrap(), pointer.to_string_lossy());
+        assert_eq!(
+            std::fs::read_to_string(ws.join(".jj").join("repo")).unwrap(),
+            pointer.to_string_lossy()
+        );
     }
 
     // ── markerless fail-closed (upstream #110) ───────────────────────────────
@@ -1317,8 +1355,15 @@ mod tests {
         let err = b
             .reset_worktree_to_ref(&slot, SHA, SHA, false)
             .expect_err("a markerless path must be refused");
-        assert!(err.message.contains("no .git or .jj marker"), "got: {}", err.message);
-        assert!(fake.calls().is_empty(), "the refusal must precede every jj call");
+        assert!(
+            err.message.contains("no .git or .jj marker"),
+            "got: {}",
+            err.message
+        );
+        assert!(
+            fake.calls().is_empty(),
+            "the refusal must precede every jj call"
+        );
     }
 
     #[test]
@@ -1329,7 +1374,9 @@ mod tests {
         std::fs::create_dir(dir.path().join(".git")).unwrap();
         let b = backend(Arc::new(FakeJj::new().then_default(Ok(""))));
 
-        let err = b.detach_worktree(dir.path()).expect_err("a git worktree is not a jj workspace");
+        let err = b
+            .detach_worktree(dir.path())
+            .expect_err("a git worktree is not a jj workspace");
         assert!(err.message.contains("git worktree"), "got: {}", err.message);
     }
 
@@ -1354,14 +1401,17 @@ mod tests {
         let (_d, root) = jj_dir();
         let fake = Arc::new(FakeJj::new().then_default(Ok("clean")));
         backend(fake.clone()).is_dirty(&root).unwrap();
-        assert_eq!(fake.calls(), vec![vec![
-            "log".to_string(),
-            "-r".to_string(),
-            "@".to_string(),
-            "--no-graph".to_string(),
-            "-T".to_string(),
-            DIRTY_TEMPLATE.to_string(),
-        ]]);
+        assert_eq!(
+            fake.calls(),
+            vec![vec![
+                "log".to_string(),
+                "-r".to_string(),
+                "@".to_string(),
+                "--no-graph".to_string(),
+                "-T".to_string(),
+                DIRTY_TEMPLATE.to_string(),
+            ]]
+        );
     }
 
     #[test]
@@ -1393,16 +1443,19 @@ mod tests {
     #[test]
     fn a_remote_listing_is_parsed_by_column() {
         let (_d, root) = jj_dir();
-        let fake = Arc::new(
-            FakeJj::new().then_default(Ok("origin git@github.com:o/r.git\nupstream git@github.com:o/u.git")),
-        );
+        let fake = Arc::new(FakeJj::new().then_default(Ok(
+            "origin git@github.com:o/r.git\nupstream git@github.com:o/u.git",
+        )));
         let repo = JjRepo::at(&root);
         let b = backend(fake.clone());
 
         assert!(b.has_remote(&repo, "origin"));
         assert!(b.has_remote(&repo, "upstream"));
         assert!(!b.has_remote(&repo, "fork"));
-        assert_eq!(b.remote_url(&repo, "origin").as_deref(), Some("git@github.com:o/r.git"));
+        assert_eq!(
+            b.remote_url(&repo, "origin").as_deref(),
+            Some("git@github.com:o/r.git")
+        );
         assert_eq!(b.remote_url(&repo, "fork"), None);
         assert!(fake.called(&["git", "remote", "list"]));
     }
@@ -1424,18 +1477,36 @@ mod tests {
         b.worktree_add(&JjRepo::at(&main), &target, "main").unwrap();
 
         let calls = fake.calls();
-        assert_eq!(calls[0], vec!["workspace", "forget", &name], "the stale same-path registration must be forgotten first");
+        assert_eq!(
+            calls[0],
+            vec!["workspace", "forget", &name],
+            "the stale same-path registration must be forgotten first"
+        );
         let add = calls
             .iter()
-            .find(|c| c.first().map(String::as_str) == Some("workspace") && c.get(1).map(String::as_str) == Some("add"))
+            .find(|c| {
+                c.first().map(String::as_str) == Some("workspace")
+                    && c.get(1).map(String::as_str) == Some("add")
+            })
             .expect("the workspace must have been added");
         assert_eq!(
             *add,
-            vec!["workspace", "add", "--name", &name, "--revision", "main", &target_arg],
+            vec![
+                "workspace",
+                "add",
+                "--name",
+                &name,
+                "--revision",
+                "main",
+                &target_arg
+            ],
             "the workspace is named by path digest so two paths never collide"
         );
         let pointer = std::fs::read_to_string(target.join(".jj").join("repo")).unwrap();
-        assert!(PathBuf::from(pointer.trim()).is_absolute(), "got: {pointer:?}");
+        assert!(
+            PathBuf::from(pointer.trim()).is_absolute(),
+            "got: {pointer:?}"
+        );
     }
 
     // ── revset safety ────────────────────────────────────────────────────────
@@ -1462,7 +1533,11 @@ mod tests {
                 !revset_atom(hostile),
                 "{hostile:?} must not be embeddable in a revset"
             );
-            assert_eq!(b.branch_ref(&repo, hostile), "", "{hostile:?} must yield no reference at all");
+            assert_eq!(
+                b.branch_ref(&repo, hostile),
+                "",
+                "{hostile:?} must yield no reference at all"
+            );
             assert!(!b.local_branch_exists(&repo, hostile));
             assert!(b.is_head_merged_into_ref(&root, hostile).is_err());
         }
@@ -1472,7 +1547,14 @@ mod tests {
     fn ordinary_bookmark_names_stay_embeddable() {
         // Including the remote-tracking form jj itself uses, which is the whole
         // reason `@` has to stay in the allowlist.
-        for ok in ["main", "main@origin", "release/2.0", "fix_login", "a.b.c", "v1_2-3"] {
+        for ok in [
+            "main",
+            "main@origin",
+            "release/2.0",
+            "fix_login",
+            "a.b.c",
+            "v1_2-3",
+        ] {
             assert!(revset_atom(ok), "{ok:?} must be embeddable");
         }
     }
@@ -1489,8 +1571,16 @@ mod tests {
             why: &'static str,
         }
         let cases = [
-            Case { script: vec![Ok(SHA), Ok("")], want: "main", why: "local only" },
-            Case { script: vec![Ok(""), Ok(SHA)], want: "main@origin", why: "origin only" },
+            Case {
+                script: vec![Ok(SHA), Ok("")],
+                want: "main",
+                why: "local only",
+            },
+            Case {
+                script: vec![Ok(""), Ok(SHA)],
+                want: "main@origin",
+                why: "origin only",
+            },
             Case {
                 script: vec![Ok(SHA), Ok(SHA), Ok(SHA)],
                 want: "main@origin",
@@ -1535,24 +1625,28 @@ mod tests {
 
         // origin present, but none of the candidates is on it: fall through to
         // the local scan, which finds `trunk`.
-        let fake = Arc::new(
-            FakeJj::new().then(&[
-                Ok("origin git@host:o/r.git"),
-                Ok(""),
-                Ok(""),
-                Ok(""),
-                Ok(""),
-                Ok(""),
-                Ok(SHA),
-            ]),
-        );
+        let fake = Arc::new(FakeJj::new().then(&[
+            Ok("origin git@host:o/r.git"),
+            Ok(""),
+            Ok(""),
+            Ok(""),
+            Ok(""),
+            Ok(""),
+            Ok(SHA),
+        ]));
         assert_eq!(backend(fake).default_branch(&repo).unwrap(), "trunk");
 
         // Nothing anywhere: an error naming the candidates, never a guess.
         let fake = Arc::new(FakeJj::new().then_default(Ok("")));
-        let err = backend(fake).default_branch(&repo).expect_err("must fail closed");
+        let err = backend(fake)
+            .default_branch(&repo)
+            .expect_err("must fail closed");
         assert_eq!(err.kind, GitErrorKind::DefaultBranchUnresolvable);
-        assert!(err.message.contains("main, master, trunk"), "got: {}", err.message);
+        assert!(
+            err.message.contains("main, master, trunk"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -1561,15 +1655,16 @@ mod tests {
         let repo = JjRepo::at(&root);
         // default_branch: remote list -> present(main@origin) -> "main";
         // then default_branch_merge_ref: remote list -> present(main@origin).
-        let fake = Arc::new(
-            FakeJj::new().then(&[
-                Ok("origin git@host:o/r.git"),
-                Ok(SHA),
-                Ok("origin git@host:o/r.git"),
-                Ok(SHA),
-            ]),
+        let fake = Arc::new(FakeJj::new().then(&[
+            Ok("origin git@host:o/r.git"),
+            Ok(SHA),
+            Ok("origin git@host:o/r.git"),
+            Ok(SHA),
+        ]));
+        assert_eq!(
+            backend(fake).default_branch_merge_ref(&repo).unwrap(),
+            "main@origin"
         );
-        assert_eq!(backend(fake).default_branch_merge_ref(&repo).unwrap(), "main@origin");
     }
 
     #[test]
@@ -1583,7 +1678,11 @@ mod tests {
             .default_branch_merge_ref(&repo)
             .expect_err("an unresolvable merge ref must fail closed");
         assert_eq!(err.kind, GitErrorKind::MergeRefUnresolvable);
-        assert!(err.message.contains("main is unavailable"), "got: {}", err.message);
+        assert!(
+            err.message.contains("main is unavailable"),
+            "got: {}",
+            err.message
+        );
     }
 
     // ── fetch classification ─────────────────────────────────────────────────
@@ -1612,7 +1711,9 @@ mod tests {
         assert_eq!(fake.calls().len(), 1, "no origin means no fetch");
 
         let fake = Arc::new(FakeJj::new().then(&[Ok("origin u"), Err("operation failed")]));
-        let err = backend(fake).fetch(&repo).expect_err("a real jj failure must surface");
+        let err = backend(fake)
+            .fetch(&repo)
+            .expect_err("a real jj failure must surface");
         assert_eq!(
             err.kind,
             GitErrorKind::Other,
@@ -1630,10 +1731,16 @@ mod tests {
             "Could not resolve host: example.invalid",
             "Could not find repository at 'file:///nope'",
         ] {
-            assert!(is_origin_access_error(detail), "{detail:?} must classify as unreachable");
+            assert!(
+                is_origin_access_error(detail),
+                "{detail:?} must classify as unreachable"
+            );
         }
         for detail in ["operation failed", "bookmark main not found", ""] {
-            assert!(!is_origin_access_error(detail), "{detail:?} must not classify as unreachable");
+            assert!(
+                !is_origin_access_error(detail),
+                "{detail:?} must not classify as unreachable"
+            );
         }
     }
 
@@ -1646,14 +1753,16 @@ mod tests {
         // only meaningful together.
         let (_d, root) = jj_dir();
         let fake = Arc::new(FakeJj::new().then(&[
-            Ok(""),           // workspace update-stale
-            Ok(SHA),          // present(main)
-            Ok(""),           // present(main@origin) — local only
-            Ok(SHA),          // log -r main -> the pinned reset target
-            Ok(SHA_B),        // log -r @       -> the head the check observed
-            Ok(""),           // @- & ~::(main) -> every parent is an ancestor
+            Ok(""),    // workspace update-stale
+            Ok(SHA),   // present(main)
+            Ok(""),    // present(main@origin) — local only
+            Ok(SHA),   // log -r main -> the pinned reset target
+            Ok(SHA_B), // log -r @       -> the head the check observed
+            Ok(""),    // @- & ~::(main) -> every parent is an ancestor
         ]));
-        let guard = backend(fake).is_worktree_safe_to_reset(&root, "main").unwrap();
+        let guard = backend(fake)
+            .is_worktree_safe_to_reset(&root, "main")
+            .unwrap();
 
         assert!(guard.safe);
         assert_eq!(guard.reset_ref, SHA);
@@ -1667,11 +1776,13 @@ mod tests {
             Ok(""),
             Ok(SHA),
             Ok(""),
-            Ok(SHA),           // reset target
-            Ok(SHA_B),         // head
+            Ok(SHA),               // reset target
+            Ok(SHA_B),             // head
             Ok("unmerged-parent"), // @- is not an ancestor of main
         ]));
-        let guard = backend(fake).is_worktree_safe_to_reset(&root, "main").unwrap();
+        let guard = backend(fake)
+            .is_worktree_safe_to_reset(&root, "main")
+            .unwrap();
         assert!(!guard.safe, "unlanded work must never read as safe");
         // The pair is still returned: a caller may weigh other evidence.
         assert_eq!(guard.reset_ref, SHA);
@@ -1685,7 +1796,11 @@ mod tests {
         let err = backend(fake)
             .is_worktree_safe_to_reset(&root, "main")
             .expect_err("an unresolvable bookmark is not safe, it is unknown");
-        assert!(err.message.contains("cannot resolve"), "got: {}", err.message);
+        assert!(
+            err.message.contains("cannot resolve"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -1714,18 +1829,24 @@ mod tests {
         // rebase that did NOT move @ must be caught, not reported as success.
         let (_d, root) = jj_dir();
         let fake = Arc::new(FakeJj::new().then(&[
-            Ok(""),       // workspace update-stale
-            Ok("clean"),  // is_dirty
-            Ok(""),       // jj rebase -d <ref> -r @ & commit_id(head)
-            Ok("clean"),  // parked_on_ref -> is_dirty
-            Ok(SHA),      // parked_on_ref -> log -r @-
+            Ok(""),      // workspace update-stale
+            Ok("clean"), // is_dirty
+            Ok(""),      // jj rebase -d <ref> -r @ & commit_id(head)
+            Ok("clean"), // parked_on_ref -> is_dirty
+            Ok(SHA),     // parked_on_ref -> log -r @-
         ]));
         backend(fake.clone())
             .reset_worktree_to_ref(&root, SHA, SHA_B, true)
             .unwrap();
 
         assert!(
-            fake.called(&["rebase", "-d", SHA, "-r", &format!("@ & commit_id(\"{SHA_B}\")")]),
+            fake.called(&[
+                "rebase",
+                "-d",
+                SHA,
+                "-r",
+                &format!("@ & commit_id(\"{SHA_B}\")")
+            ]),
             "the rebase must pin @ by the commit the check observed: {:?}",
             fake.calls()
         );
@@ -1740,14 +1861,18 @@ mod tests {
         let fake = Arc::new(FakeJj::new().then(&[
             Ok(""),
             Ok("clean"),
-            Ok(""),       // rebase "succeeded"
-            Ok("clean"),  // parked_on_ref -> is_dirty
-            Ok(SHA_B),    // @- is still the OLD commit, not the reset target
+            Ok(""),      // rebase "succeeded"
+            Ok("clean"), // parked_on_ref -> is_dirty
+            Ok(SHA_B),   // @- is still the OLD commit, not the reset target
         ]));
         let err = backend(fake)
             .reset_worktree_to_ref(&root, SHA, SHA_B, true)
             .expect_err("a workspace that did not move must be refused");
-        assert!(err.message.contains("HEAD changed since safety check"), "got: {}", err.message);
+        assert!(
+            err.message.contains("HEAD changed since safety check"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -1779,7 +1904,9 @@ mod tests {
             Ok("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
         ]));
         assert!(
-            backend(moved).reset_worktree_to_ref(&root, SHA, SHA_B, true).is_err(),
+            backend(moved)
+                .reset_worktree_to_ref(&root, SHA, SHA_B, true)
+                .is_err(),
             "a rebase error is only survivable while @ is provably unchanged"
         );
     }
@@ -1794,7 +1921,10 @@ mod tests {
             .reset_worktree_to_ref(&root, SHA, SHA_B, true)
             .expect_err("uncommitted work must not be discarded");
         assert!(err.message.contains("became dirty"), "got: {}", err.message);
-        assert!(!fake.called(&["abandon"]), "the refusal must precede the abandon");
+        assert!(
+            !fake.called(&["abandon"]),
+            "the refusal must precede the abandon"
+        );
         assert!(!fake.called(&["rebase"]));
     }
 
@@ -1802,20 +1932,26 @@ mod tests {
     fn a_dirty_workspace_is_abandoned_and_reparked_only_after_every_check() {
         let (_d, root) = jj_dir();
         let fake = Arc::new(FakeJj::new().then(&[
-            Ok(""),                          // update-stale
-            Ok("dirty"),                     // is_dirty
-            Ok(""),                          // jj abandon -r @ & commit_id(head)
-            Ok(""),                          // the pinned revset is now empty
-            Ok("clean"),                     // still clean
-            Ok(""),                          // merged into the reset target
-            Ok(""),                          // jj new <ref>
+            Ok(""),      // update-stale
+            Ok("dirty"), // is_dirty
+            Ok(""),      // jj abandon -r @ & commit_id(head)
+            Ok(""),      // the pinned revset is now empty
+            Ok("clean"), // still clean
+            Ok(""),      // merged into the reset target
+            Ok(""),      // jj new <ref>
         ]));
         let b = backend(fake.clone());
         b.reset_worktree_to_ref(&root, SHA, SHA_B, false).unwrap();
 
         let calls = fake.calls();
-        assert_eq!(calls[2], vec!["abandon", "-r", &format!("@ & commit_id(\"{SHA_B}\")")]);
-        assert_eq!(calls.last().unwrap(), &vec!["new".to_string(), SHA.to_string()]);
+        assert_eq!(
+            calls[2],
+            vec!["abandon", "-r", &format!("@ & commit_id(\"{SHA_B}\")")]
+        );
+        assert_eq!(
+            calls.last().unwrap(),
+            &vec!["new".to_string(), SHA.to_string()]
+        );
     }
 
     #[test]
@@ -1847,7 +1983,10 @@ mod tests {
                 "{label}: got {}",
                 err.message
             );
-            assert!(!fake.called(&["new"]), "{label}: must not rebuild the workspace");
+            assert!(
+                !fake.called(&["new"]),
+                "{label}: must not rebuild the workspace"
+            );
         }
     }
 
@@ -1855,16 +1994,16 @@ mod tests {
     fn reset_worktree_resolves_the_bookmark_once_and_hands_the_pair_over() {
         let (_d, root) = jj_dir();
         let fake = Arc::new(FakeJj::new().then(&[
-            Ok(""),       // resolve_reset_ref: update-stale
-            Ok(SHA),      // present(main)
-            Ok(""),       // present(main@origin)
-            Ok(SHA),      // log -r main -> the pinned target
-            Ok(SHA_B),    // log -r @    -> head
-            Ok(""),       // reset_worktree_to_ref: update-stale
-            Ok("clean"),  // is_dirty
-            Ok(""),       // rebase
-            Ok("clean"),  // parked check
-            Ok(SHA),      // @- == the target
+            Ok(""),      // resolve_reset_ref: update-stale
+            Ok(SHA),     // present(main)
+            Ok(""),      // present(main@origin)
+            Ok(SHA),     // log -r main -> the pinned target
+            Ok(SHA_B),   // log -r @    -> head
+            Ok(""),      // reset_worktree_to_ref: update-stale
+            Ok("clean"), // is_dirty
+            Ok(""),      // rebase
+            Ok("clean"), // parked check
+            Ok(SHA),     // @- == the target
         ]));
         backend(fake.clone()).reset_worktree(&root, "main").unwrap();
 
@@ -1892,8 +2031,15 @@ mod tests {
         let err = backend(fake.clone())
             .worktree_remove(&JjRepo::at(&root), &slot)
             .expect_err("a git worktree must not be deleted through the jj backend");
-        assert!(err.message.contains("not a jj workspace"), "got: {}", err.message);
-        assert!(slot.join("data.txt").exists(), "the refusal must precede any deletion");
+        assert!(
+            err.message.contains("not a jj workspace"),
+            "got: {}",
+            err.message
+        );
+        assert!(
+            slot.join("data.txt").exists(),
+            "the refusal must precede any deletion"
+        );
         assert!(fake.calls().is_empty());
     }
 
@@ -1910,7 +2056,11 @@ mod tests {
         let err = backend(fake.clone())
             .worktree_remove(&JjRepo::at(&root), &root)
             .expect_err("the main workspace must be refused");
-        assert!(err.message.contains("main jj workspace"), "got: {}", err.message);
+        assert!(
+            err.message.contains("main jj workspace"),
+            "got: {}",
+            err.message
+        );
         assert!(root.join("README.md").exists());
         assert!(fake.calls().is_empty());
     }
@@ -1944,7 +2094,11 @@ mod tests {
         let err = backend(fake.clone())
             .remove_clean_worktree(&JjRepo::at(&root), &slot)
             .expect_err("a dirty workspace must be kept");
-        assert!(err.message.contains("has local changes"), "got: {}", err.message);
+        assert!(
+            err.message.contains("has local changes"),
+            "got: {}",
+            err.message
+        );
         assert!(slot.exists());
         assert!(!fake.called(&["workspace", "forget"]));
     }
@@ -1953,13 +2107,20 @@ mod tests {
     fn branch_creation_is_refused_and_says_which_marker_was_found() {
         let (_d, root) = jj_dir();
         let b = backend(Arc::new(FakeJj::new().then_default(Ok(""))));
-        let err = b.create_branch(&root, "feature").expect_err("jj bookmarks are not git branches");
+        let err = b
+            .create_branch(&root, "feature")
+            .expect_err("jj bookmarks are not git branches");
         assert!(
-            err.message.contains("only supported by") || err.message.contains("requires a git worktree"),
+            err.message.contains("only supported by")
+                || err.message.contains("requires a git worktree"),
             "got: {}",
             err.message
         );
-        assert!(err.message.contains("jj"), "the operator must learn the slot's flavor: got: {}", err.message);
+        assert!(
+            err.message.contains("jj"),
+            "the operator must learn the slot's flavor: got: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -1988,7 +2149,11 @@ mod tests {
         let err = backend(fake)
             .common_git_dir(&ws)
             .expect_err("a non-colocated jj repo has no .git to point at");
-        assert!(err.message.contains("not colocated"), "got: {}", err.message);
+        assert!(
+            err.message.contains("not colocated"),
+            "got: {}",
+            err.message
+        );
     }
 
     // ── no jj binary ─────────────────────────────────────────────────────────
@@ -2003,12 +2168,22 @@ mod tests {
         if find_jj_binary().is_some() {
             return; // jj IS installed here; the fake-path test below still ran.
         }
-        assert_eq!(b.name(), BACKEND_JJ, "identity is what dispatch looks the backend up by");
+        assert_eq!(
+            b.name(),
+            BACKEND_JJ,
+            "identity is what dispatch looks the backend up by"
+        );
 
         let (_d, root) = jj_dir();
-        let err = b.is_dirty(&root).expect_err("jj is not installed, so this cannot succeed");
+        let err = b
+            .is_dirty(&root)
+            .expect_err("jj is not installed, so this cannot succeed");
         assert_eq!(err.kind, GitErrorKind::NotFound);
-        assert!(err.message.contains("jj binary not found"), "got: {}", err.message);
+        assert!(
+            err.message.contains("jj binary not found"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -2017,9 +2192,14 @@ mod tests {
         // here so a rename cannot silently break the refusal above.
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(".git")).unwrap();
-        assert_eq!(crate::vcs::worktree_backend_name(dir.path()).unwrap(), Some(BACKEND_GIT));
+        assert_eq!(
+            crate::vcs::worktree_backend_name(dir.path()).unwrap(),
+            Some(BACKEND_GIT)
+        );
         assert!(
-            backend(Arc::new(FakeJj::new())).detach_worktree(dir.path()).is_err(),
+            backend(Arc::new(FakeJj::new()))
+                .detach_worktree(dir.path())
+                .is_err(),
             "a slot marked git must never be answered by the jj backend"
         );
     }

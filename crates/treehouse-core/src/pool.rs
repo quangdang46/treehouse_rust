@@ -186,7 +186,10 @@ pub(crate) fn resolve_worktree_path(
         .replace(PLACEHOLDER_POOL, &pool_dir.to_string_lossy())
         .replace(PLACEHOLDER_SLOT, slot)
         .replace(PLACEHOLDER_REPO, &repo_name)
-        .replace(PLACEHOLDER_REPO_PARENT, &repo_root.parent().unwrap_or(repo_root).to_string_lossy());
+        .replace(
+            PLACEHOLDER_REPO_PARENT,
+            &repo_root.parent().unwrap_or(repo_root).to_string_lossy(),
+        );
 
     let resolved = PathBuf::from(clean_slash_path(&replaced));
     if !resolved.is_absolute() {
@@ -668,13 +671,13 @@ impl Pool {
             validate_branch_name(new_branch)?;
             // Fails if the branch ALREADY exists: `-b` creates, it never
             // adopts (Go pool.go:412-418).
-            if self.git.local_branch_exists(&repo_for_branch(&self.root), new_branch) {
+            if self
+                .git
+                .local_branch_exists(&repo_for_branch(&self.root), new_branch)
+            {
                 return Err(PoolError::Io(
                     format!("branch {new_branch:?} already exists"),
-                    std::io::Error::new(
-                        std::io::ErrorKind::AlreadyExists,
-                        "branch already exists",
-                    ),
+                    std::io::Error::new(std::io::ErrorKind::AlreadyExists, "branch already exists"),
                 ));
             }
         }
@@ -1432,9 +1435,7 @@ fn reset_for_acquisition(
     };
 
     let Some(git_bin) = guarded else {
-        return backend
-            .reset_worktree(slot, branch)
-            .map_err(PoolError::Git);
+        return backend.reset_worktree(slot, branch).map_err(PoolError::Git);
     };
 
     // The guard is taken BEFORE anything is deleted, so a refusal leaves the
@@ -1560,7 +1561,10 @@ fn share_slot_files(repo_root: &Path, slot: &Path, err: &mut dyn std::io::Write)
         return;
     }
     let Some(git_bin) = resolved_git_bin() else {
-        let _ = writeln!(err, "APFS sharing skipped: no git binary to enumerate tracked paths");
+        let _ = writeln!(
+            err,
+            "APFS sharing skipped: no git binary to enumerate tracked paths"
+        );
         return;
     };
 
@@ -1643,7 +1647,11 @@ fn git_out(git_bin: &Path, cwd: &Path, args: &[&str]) -> Result<Vec<u8>, GitErro
 /// ordinary case — and which a caller must be able to tell apart from a real
 /// failure. Collapsing both into one `Err` makes the common case look like an
 /// unverifiable one.
-fn raw_git(git_bin: &Path, cwd: &Path, args: &[&str]) -> Result<(bool, Vec<u8>, Vec<u8>), GitError> {
+fn raw_git(
+    git_bin: &Path,
+    cwd: &Path,
+    args: &[&str],
+) -> Result<(bool, Vec<u8>, Vec<u8>), GitError> {
     let out = std::process::Command::new(git_bin)
         .args(args)
         .current_dir(cwd)
@@ -1697,11 +1705,7 @@ fn concurrent_writer_reason(repo_root: &Path, git_bin: &Path) -> Option<&'static
 }
 
 /// Whether `hook` is installed AND executable at the repository root.
-fn hook_may_have_started_a_writer(
-    root: &Path,
-    git_bin: &Path,
-    hook: &str,
-) -> Option<&'static str> {
+fn hook_may_have_started_a_writer(root: &Path, git_bin: &Path, hook: &str) -> Option<&'static str> {
     let out = git_out(
         git_bin,
         root,
@@ -2787,7 +2791,13 @@ mod tests {
 
     /// Builds a linked worktree at `main` and returns the pool's reset
     /// function bound to it, so a test can stage a race and then reset.
-    fn reset_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, Arc<dyn GitBackend>, PathBuf) {
+    fn reset_fixture() -> (
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        Arc<dyn GitBackend>,
+        PathBuf,
+    ) {
         let (dir, repo) = init_repo();
         let slot = dir.path().join("slot");
         let git: Arc<dyn GitBackend> = Arc::new(crate::git::ShellGitBackend::discover().unwrap());
@@ -2833,7 +2843,9 @@ mod tests {
             .current_dir(&slot)
             .output()
             .unwrap();
-        let moved_head = String::from_utf8_lossy(&moved_head.stdout).trim().to_string();
+        let moved_head = String::from_utf8_lossy(&moved_head.stdout)
+            .trim()
+            .to_string();
 
         let err = vcs::reset_worktree_to_ref(
             &bin,
@@ -2904,103 +2916,103 @@ mod tests {
 
     #[test]
     fn a_recycled_slot_is_reset_under_the_clean_tree_the_reuse_rules_require() {
-    // The no-race counterpart: when the checks pass, the guarded reset does
-    // exactly what the plain reset did. The reuse rules in `acquire_locked`
-    // already refuse a dirty slot, so a recycled slot arrives here clean and
-    // this is the ordinary production shape.
-    let (_d, _repo, slot, git, _bin) = reset_fixture();
-    let head_before = head_of(&slot);
+        // The no-race counterpart: when the checks pass, the guarded reset does
+        // exactly what the plain reset did. The reuse rules in `acquire_locked`
+        // already refuse a dirty slot, so a recycled slot arrives here clean and
+        // this is the ordinary production shape.
+        let (_d, _repo, slot, git, _bin) = reset_fixture();
+        let head_before = head_of(&slot);
 
-    reset_for_acquisition(
-        &git,
-        &slot,
-        "main",
-        &SeedInventory::default(),
-        SlotOrigin::Recycled,
-    )
-    .unwrap();
-
-    assert_eq!(
-        head_of(&slot),
-        head_before,
-        "a safe reset lands the slot on exactly the commit it already held"
-    );
-    assert_eq!(
-        std::fs::read_to_string(slot.join("README.md")).unwrap(),
-        "hi\n",
-        "tracked content is untouched by a reset of a clean tree"
-    );
-}
-
-#[test]
-fn a_fresh_slot_reset_restores_content_and_sweeps_untracked_files() {
-    // `require_clean` is false for a FRESH slot, matching Go, which never
-    // requires a clean tree on the creation path. That is the one case where
-    // the reset actually has work to do — a checkout filter may have left an
-    // untracked file — and where the pre-seam `reset_worktree` restored the
-    // tracked tree and swept the rest.
-    let (_d, _repo, slot, git, _bin) = reset_fixture();
-    std::fs::write(slot.join("README.md"), "clobbered\n").unwrap();
-    std::fs::write(slot.join("junk.txt"), "untracked\n").unwrap();
-
-    reset_for_acquisition(
-        &git,
-        &slot,
-        "main",
-        &SeedInventory::default(),
-        SlotOrigin::Fresh,
-    )
-    .unwrap();
-
-    assert_eq!(
-        std::fs::read_to_string(slot.join("README.md")).unwrap(),
-        "hi\n",
-        "read-tree --reset -u must restore tracked content"
-    );
-    assert!(
-        !slot.join("junk.txt").exists(),
-        "clean -fd must still sweep untracked files"
-    );
-}
-
-#[test]
-fn a_recycled_slot_that_became_dirty_is_refused_not_overwritten() {
-    // The other race the guard closes. `acquire_locked` proved the tree clean
-    // before releasing the lock; something changed it afterwards. Wiping that
-    // would discard the change while every check reported success.
-    let (_d, _repo, slot, git, _bin) = reset_fixture();
-    std::fs::write(slot.join("README.md"), "edited after the reuse check\n").unwrap();
-
-    let err = reset_for_acquisition(
-        &git,
-        &slot,
-        "main",
-        &SeedInventory::default(),
-        SlotOrigin::Recycled,
-    )
-    .expect_err("a tree that went dirty after the check must refuse the reset");
-
-    assert!(
-        matches!(&err, PoolError::Git(e) if e.message.contains("dirty after safety check")),
-        "got: {err}"
-    );
-    assert_eq!(
-        std::fs::read_to_string(slot.join("README.md")).unwrap(),
-        "edited after the reuse check\n",
-        "a refused reset must not overwrite what it refused to trust"
-    );
-}
-
-/// `git rev-parse HEAD` in `slot`.
-fn head_of(slot: &Path) -> String {
-    let out = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(slot)
-        .output()
+        reset_for_acquisition(
+            &git,
+            &slot,
+            "main",
+            &SeedInventory::default(),
+            SlotOrigin::Recycled,
+        )
         .unwrap();
-    assert!(out.status.success(), "git rev-parse failed in {slot:?}");
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
+
+        assert_eq!(
+            head_of(&slot),
+            head_before,
+            "a safe reset lands the slot on exactly the commit it already held"
+        );
+        assert_eq!(
+            std::fs::read_to_string(slot.join("README.md")).unwrap(),
+            "hi\n",
+            "tracked content is untouched by a reset of a clean tree"
+        );
+    }
+
+    #[test]
+    fn a_fresh_slot_reset_restores_content_and_sweeps_untracked_files() {
+        // `require_clean` is false for a FRESH slot, matching Go, which never
+        // requires a clean tree on the creation path. That is the one case where
+        // the reset actually has work to do — a checkout filter may have left an
+        // untracked file — and where the pre-seam `reset_worktree` restored the
+        // tracked tree and swept the rest.
+        let (_d, _repo, slot, git, _bin) = reset_fixture();
+        std::fs::write(slot.join("README.md"), "clobbered\n").unwrap();
+        std::fs::write(slot.join("junk.txt"), "untracked\n").unwrap();
+
+        reset_for_acquisition(
+            &git,
+            &slot,
+            "main",
+            &SeedInventory::default(),
+            SlotOrigin::Fresh,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(slot.join("README.md")).unwrap(),
+            "hi\n",
+            "read-tree --reset -u must restore tracked content"
+        );
+        assert!(
+            !slot.join("junk.txt").exists(),
+            "clean -fd must still sweep untracked files"
+        );
+    }
+
+    #[test]
+    fn a_recycled_slot_that_became_dirty_is_refused_not_overwritten() {
+        // The other race the guard closes. `acquire_locked` proved the tree clean
+        // before releasing the lock; something changed it afterwards. Wiping that
+        // would discard the change while every check reported success.
+        let (_d, _repo, slot, git, _bin) = reset_fixture();
+        std::fs::write(slot.join("README.md"), "edited after the reuse check\n").unwrap();
+
+        let err = reset_for_acquisition(
+            &git,
+            &slot,
+            "main",
+            &SeedInventory::default(),
+            SlotOrigin::Recycled,
+        )
+        .expect_err("a tree that went dirty after the check must refuse the reset");
+
+        assert!(
+            matches!(&err, PoolError::Git(e) if e.message.contains("dirty after safety check")),
+            "got: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(slot.join("README.md")).unwrap(),
+            "edited after the reuse check\n",
+            "a refused reset must not overwrite what it refused to trust"
+        );
+    }
+
+    /// `git rev-parse HEAD` in `slot`.
+    fn head_of(slot: &Path) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(slot)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git rev-parse failed in {slot:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
 
     // ─── the seed-removal contract ───────────────────────────────────────────
 
@@ -3031,17 +3043,11 @@ fn head_of(slot: &Path) -> String {
         // The first entry is benign; the second escapes. Validation covers the
         // WHOLE list before the first delete, or a traversal in position two
         // would be preceded by an unvalidated removal in position one.
-        let err = remove_seeded_paths(
-            &slot,
-            &["a.env".to_string(), "../precious".to_string()],
-        )
-        .expect_err("a traversing path must be refused");
+        let err = remove_seeded_paths(&slot, &["a.env".to_string(), "../precious".to_string()])
+            .expect_err("a traversing path must be refused");
         assert!(matches!(&err, PoolError::Git(e) if e.message.contains("invalid seeded path")));
         assert!(slot.join("a.env").exists(), "nothing may be deleted");
-        assert_eq!(
-            std::fs::read_to_string(&outside).unwrap(),
-            "DO NOT TOUCH\n"
-        );
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "DO NOT TOUCH\n");
     }
 
     #[test]
@@ -3053,11 +3059,7 @@ fn head_of(slot: &Path) -> String {
         std::fs::write(slot.join("b.env"), "b\n").unwrap();
         std::fs::write(slot.join("nested/c.env"), "c\n").unwrap();
 
-        remove_seeded_paths(
-            &slot,
-            &["a.env".to_string(), "nested/c.env".to_string()],
-        )
-        .unwrap();
+        remove_seeded_paths(&slot, &["a.env".to_string(), "nested/c.env".to_string()]).unwrap();
 
         assert!(!slot.join("a.env").exists());
         assert!(!slot.join("nested/c.env").exists());
@@ -3669,17 +3671,16 @@ fn head_of(slot: &Path) -> String {
                 ..Default::default()
             })
             .expect_err("--branch must refuse an existing branch");
-        assert!(
-            err.to_string().contains("already exists"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("already exists"), "got: {err}");
     }
 
     /// A branch name git would refuse must be rejected BEFORE anything is
     /// created — `-b ../evil` would otherwise become a ref outside the repo.
     #[test]
     fn invalid_branch_names_are_refused_before_acquiring() {
-        for bad in ["", "../evil", "-x", "a..b", "a b", "a~1", "x.lock", ".hidden"] {
+        for bad in [
+            "", "../evil", "-x", "a..b", "a b", "a~1", "x.lock", ".hidden",
+        ] {
             let err = validate_branch_name(bad);
             assert!(err.is_err(), "branch name {bad:?} must be refused");
         }
@@ -3799,10 +3800,10 @@ fn head_of(slot: &Path) -> String {
     #[test]
     fn a_bad_template_is_refused_before_anything_is_created() {
         for bad in [
-            "{pool}/nope",              // no {slot}: every slot collides
-            "{repo}/{slot}/../x",       // '..' cancels {slot}
-            "{bogus}/{slot}",           // unknown placeholder
-            "{repo_parent}/{slot}",     // not repository-scoped
+            "{pool}/nope",          // no {slot}: every slot collides
+            "{repo}/{slot}/../x",   // '..' cancels {slot}
+            "{bogus}/{slot}",       // unknown placeholder
+            "{repo_parent}/{slot}", // not repository-scoped
         ] {
             let err = validate_worktree_path_template(bad);
             assert!(err.is_err(), "template {bad:?} must be refused");
@@ -3832,17 +3833,11 @@ fn head_of(slot: &Path) -> String {
             PathBuf::from("/pool/3/myrepo")
         );
         // `{repo_parent}` IS a valid placeholder to expand, but on its own it is not
-// enough: two sibling repositories expand it identically, so it cannot tell
-// their slots apart. It only works alongside a repository-scoped placeholder.
+        // enough: two sibling repositories expand it identically, so it cannot tell
+        // their slots apart. It only works alongside a repository-scoped placeholder.
         assert_eq!(
-            resolve_worktree_path(
-                repo,
-                pool_dir,
-                "3",
-                "{repo_parent}/{repo}/{slot}",
-                false
-            )
-            .unwrap(),
+            resolve_worktree_path(repo, pool_dir, "3", "{repo_parent}/{repo}/{slot}", false)
+                .unwrap(),
             PathBuf::from("/src/myrepo/3")
         );
         // Relative templates are refused: a worktree must land where the caller

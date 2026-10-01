@@ -322,12 +322,7 @@ mod tests {
         // A second acquisition takes the slot we just gave back.
         let second = acquire_leased(&pool, "run:second");
         assert_eq!(second.path, path, "the released slot should be reused");
-        let second_lease = second
-            .lease
-            .as_ref()
-            .expect("a lease was taken")
-            .id
-            .clone();
+        let second_lease = second.lease.as_ref().expect("a lease was taken").id.clone();
         assert_ne!(second_lease, first_lease, "each lease gets its own id");
 
         // The repeat pass must refuse, not reset. Pin the REASON too: a

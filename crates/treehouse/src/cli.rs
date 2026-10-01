@@ -503,8 +503,10 @@ pub fn require_git_backend_for_branch(
     // so a damaged checkout is never quietly classified; collapsing the two
     // here would let `--branch {branch}` proceed in a repository whose backend
     // could not be identified, which is the exact case the check exists for.
-    let selected = treehouse_core::vcs::configured_backend_name(repo_root, override_name)
-        .map_err(|e| anyhow::anyhow!("resolving the vcs backend for {}: {e}", repo_root.display()))?;
+    let selected =
+        treehouse_core::vcs::configured_backend_name(repo_root, override_name).map_err(|e| {
+            anyhow::anyhow!("resolving the vcs backend for {}: {e}", repo_root.display())
+        })?;
 
     // Selection is not the same question as readability, and this gate must not
     // collapse them. `configured_backend_name` answers "which backend would
@@ -549,9 +551,8 @@ fn jj_marker_readable(path: &Path) -> anyhow::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => anyhow::bail!("reading .jj marker in {}: {e}", path.display()),
     }
-    std::fs::metadata(&marker).map_err(|e| {
-        anyhow::anyhow!("resolving .jj marker in {}: {e}", path.display())
-    })?;
+    std::fs::metadata(&marker)
+        .map_err(|e| anyhow::anyhow!("resolving .jj marker in {}: {e}", path.display()))?;
     Ok(())
 }
 
@@ -694,7 +695,10 @@ mod tests {
     #[test]
     fn no_include_file_leaves_the_manifest_unset() {
         assert_eq!(
-            parse_get(&["treehouse", "get"]).acquire_options().unwrap().include_manifest,
+            parse_get(&["treehouse", "get"])
+                .acquire_options()
+                .unwrap()
+                .include_manifest,
             None
         );
     }
@@ -710,7 +714,9 @@ mod tests {
             "--include-file",
             dir.path().join("nope.txt").to_str().unwrap(),
         ]);
-        let err = a.acquire_options().expect_err("a missing manifest must fail");
+        let err = a
+            .acquire_options()
+            .expect_err("a missing manifest must fail");
         assert!(
             err.to_string().contains("failed to read include file"),
             "got: {err}"
@@ -728,11 +734,10 @@ mod tests {
         assert!(!a.acquire_options().unwrap().apfs_sharing);
 
         let a = parse_get(&["treehouse", "get", "--apfs-sharing", "sometimes"]);
-        let err = a.acquire_options().expect_err("a bogus mode must be refused");
-        assert!(
-            err.to_string().contains("use off or fresh"),
-            "got: {err}"
-        );
+        let err = a
+            .acquire_options()
+            .expect_err("a bogus mode must be refused");
+        assert!(err.to_string().contains("use off or fresh"), "got: {err}");
 
         assert!(
             !parse_get(&["treehouse", "get"])
@@ -815,7 +820,8 @@ mod tests {
         let err = require_git_backend_for_branch(dir.path(), Some("feat/x"))
             .expect_err("a colocated jj workspace is still a jj workspace");
         assert!(
-            err.to_string().contains("only supported by the git backend"),
+            err.to_string()
+                .contains("only supported by the git backend"),
             "got: {err}"
         );
     }
@@ -853,10 +859,7 @@ mod tests {
             // SAFETY: the lock makes this the only thread reading or writing the
             // variable for as long as the guard lives.
             unsafe { std::env::set_var(TREEHOUSE_VCS_VAR, value) };
-            VcsEnv {
-                prior,
-                _lock: lock,
-            }
+            VcsEnv { prior, _lock: lock }
         }
     }
 
@@ -876,7 +879,8 @@ mod tests {
         let err = require_git_backend_for_branch(dir.path(), Some("feat/x"))
             .expect_err("a git branch cannot be created in a jj workspace");
         assert!(
-            err.to_string().contains("only supported by the git backend"),
+            err.to_string()
+                .contains("only supported by the git backend"),
             "got: {err}"
         );
     }
@@ -926,10 +930,7 @@ mod tests {
         let _env = VcsEnv::set("jj");
         let err = require_git_backend_for_branch(dir.path(), Some("feat/x"))
             .expect_err("an unreadable marker must not read as 'not jj'");
-        assert!(
-            err.to_string().contains(".jj marker"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains(".jj marker"), "got: {err}");
     }
 
     /// The backend name normaliser is Go's: only `git` and `jj` mean anything,

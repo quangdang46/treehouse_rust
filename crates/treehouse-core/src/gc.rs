@@ -142,12 +142,8 @@ impl Pool {
                     }
                 }
             };
-            let (candidate, skipped) = self.analyze_gc_candidate(
-                wt,
-                context.default_ref.as_deref(),
-                opts,
-                now,
-            );
+            let (candidate, skipped) =
+                self.analyze_gc_candidate(wt, context.default_ref.as_deref(), opts, now);
             if let Some(skip) = skipped {
                 result.skipped.push(skip);
                 continue;
@@ -837,6 +833,17 @@ mod tests {
             "must resolve the worktree's own repository, got: {:?}",
             context.repo_root
         );
-        assert!(!context.repo_root.starts_with(&pool.root));
+        // `Pool::root` IS the owning repository (`Pool::open` sets it to
+        // `repo_root`), so asserting against it just re-derived the same path
+        // and could only ever fail by symlink aliasing: on macOS git resolves
+        // `/var` → `/private/var` so the two strings differ and the assertion
+        // held, while on Linux `/tmp` is not a symlink and they matched.
+        // The mistake this test must actually catch is the repo collapsing to
+        // the pool directory, so compare against that.
+        assert!(
+            !context.repo_root.starts_with(pool.pool_dir()),
+            "the owning repository must not collapse to the pool directory, got: {:?}",
+            context.repo_root
+        );
     }
 }

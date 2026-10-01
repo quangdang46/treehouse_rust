@@ -302,11 +302,7 @@ impl WorktreeEntry {
 
     /// Records the base this slot was cut from (Go `BaseBranch`).
     pub fn set_base_branch(&mut self, branch: &str) {
-        set_omitempty(
-            &mut self.extra,
-            K_BASE_BRANCH,
-            nonempty_value(branch),
-        );
+        set_omitempty(&mut self.extra, K_BASE_BRANCH, nonempty_value(branch));
     }
 }
 
@@ -339,9 +335,7 @@ fn nonempty_value(s: &str) -> Option<serde_json::Value> {
 
 /// Reads a JSON string field, treating absent, `null` and non-string as empty.
 fn string_field(v: Option<&serde_json::Value>) -> String {
-    v.and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string()
+    v.and_then(|v| v.as_str()).unwrap_or_default().to_string()
 }
 
 /// Reads a JSON string list, keeping only the entries that are strings.

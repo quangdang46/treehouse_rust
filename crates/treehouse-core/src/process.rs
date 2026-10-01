@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, RefreshKind, System};
 
 /// A process found running inside a worktree. Display is `name (pid)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +122,23 @@ impl ProcessTable {
         let mut result = Vec::new();
         let system = self.system.lock().unwrap();
         for (pid, process) in system.processes() {
+            // A zombie has already terminated — it holds no cwd, runs no
+            // instructions, and cannot block `git worktree remove`. It must
+            // never read as "a process is still using this worktree".
+            //
+            // This check is load-bearing, not defensive. sysinfo refreshes
+            // `cwd` as `UpdateKind::OnlyIfNotSet` (system.rs:2478), so once a
+            // pid's cwd is cached it is NEVER re-read: `needs_update` returns
+            // `p.cwd.is_none()` (system.rs:2336). When Linux SIGKILLs a child
+            // the pid survives as a zombie, `/proc/<pid>/cwd` disappears — and
+            // sysinfo keeps the stale cached path. Without this filter the
+            // post-kill survivor scan in `destroy` sees the dead pid, and
+            // `--include-in-use` skipped with "worktree processes still
+            // running after termination" even though nothing was running.
+            // `status` IS re-read on every refresh, so it is the fresh signal.
+            if process.status() == ProcessStatus::Zombie {
+                continue;
+            }
             let cwd = match process.cwd() {
                 Some(c) => c.to_path_buf(),
                 None => continue, // exited or permission-restricted: skip

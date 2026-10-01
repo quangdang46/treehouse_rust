@@ -383,7 +383,10 @@ pub struct MarkerRoot {
 /// instead; see [`backend_for_worktree`] and
 /// [`destructive_backend_for_worktree`]. The two deliberately disagree for a
 /// colocated repository, and that is the mechanism behind `TestJJColocatedWithoutOptInKeepsGitWorktrees`.
-pub fn configured_backend_name(path: &Path, override_name: Option<&str>) -> Result<&'static str, GitError> {
+pub fn configured_backend_name(
+    path: &Path,
+    override_name: Option<&str>,
+) -> Result<&'static str, GitError> {
     // An unrecognized value is IGNORED, not an error: a typo in a config file
     // must not break every command in the repository.
     let git_forced = override_name == Some(BACKEND_GIT);
@@ -396,7 +399,11 @@ pub fn configured_backend_name(path: &Path, override_name: Option<&str>) -> Resu
         return Ok(BACKEND_GIT);
     }
     if jj_forced {
-        return Ok(if found.has_jj { BACKEND_JJ } else { BACKEND_GIT });
+        return Ok(if found.has_jj {
+            BACKEND_JJ
+        } else {
+            BACKEND_GIT
+        });
     }
     // A `.jj`-only tree: its own checkout cannot hold the opt-in, so the main
     // repository root gets the same `override_name` Go would have re-read for
@@ -562,7 +569,8 @@ pub struct ResetGuard {
 fn is_commit_id(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
-        && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// The `command` half of a [`GitError`] raised by a git invocation.
@@ -589,13 +597,7 @@ fn git_out(git_bin: &Path, worktree: &Path, args: &[&str]) -> Result<String, Git
         .args(args)
         .current_dir(worktree)
         .output()
-        .map_err(|e| {
-            GitError::new(
-                git_label(args),
-                e.to_string(),
-                GitErrorKind::Other,
-            )
-        })?;
+        .map_err(|e| GitError::new(git_label(args), e.to_string(), GitErrorKind::Other))?;
     if !output.status.success() {
         return Err(GitError::new(
             git_label(args),
@@ -681,7 +683,9 @@ pub fn is_worktree_safe_to_reset(
     // a commit. Pinning the SHA is what makes the reset target immutable: a ref
     // that moved between check and reset would be reset to something that was
     // never verified.
-    let repo_root = git.repo_root(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+    let repo_root = git
+        .repo_root(worktree)
+        .unwrap_or_else(|_| worktree.to_path_buf());
     let reference = git.branch_ref(
         &GitRepo {
             common_dir: repo_root,
@@ -790,15 +794,18 @@ pub fn reset_worktree_to_ref(
     // read-tree/clean update the working tree without needing HEAD.lock, so
     // they are safe to run under it. HEAD itself is committed last, by
     // renaming the lock file onto HEAD — the same protocol git uses.
-    git_run(git_bin, worktree, &["read-tree", "--reset", "-u", reset_ref])?;
+    git_run(
+        git_bin,
+        worktree,
+        &["read-tree", "--reset", "-u", reset_ref],
+    )?;
     git_run(git_bin, worktree, &["clean", "-fd"])?;
 
     {
         use std::io::Write;
         let mut file = &release.lock_file;
-        writeln!(file, "{reset_ref}").map_err(|e| {
-            GitError::new("worktree reset", e.to_string(), GitErrorKind::Other)
-        })?;
+        writeln!(file, "{reset_ref}")
+            .map_err(|e| GitError::new("worktree reset", e.to_string(), GitErrorKind::Other))?;
         file.sync_all()
             .map_err(|e| GitError::new("worktree reset", e.to_string(), GitErrorKind::Other))?;
     }
@@ -1011,7 +1018,8 @@ mod tests {
         #[cfg(windows)]
         std::os::windows::fs::symlink_file(&target, &link).unwrap();
 
-        let err = worktree_backend_name(dir.path()).expect_err("dangling marker must be a read error");
+        let err =
+            worktree_backend_name(dir.path()).expect_err("dangling marker must be a read error");
         assert!(
             err.message.contains("resolving .git marker"),
             "got: {}",
@@ -1084,7 +1092,11 @@ mod tests {
             .resolve_or_default(Some(BACKEND_JJ))
             .err()
             .expect("a name with no registered backend must be refused");
-        assert!(err.message.contains("no backend is registered"), "got: {}", err.message);
+        assert!(
+            err.message.contains("no backend is registered"),
+            "got: {}",
+            err.message
+        );
 
         // And the same rule through the public entry point: the global registry
         // DOES answer a `.jj` marker, with jj.
@@ -1103,7 +1115,10 @@ mod tests {
         // into the global registry must leave every git path exactly as it was.
         let (_d, root) = repo();
         assert_eq!(backend_for_worktree(&root).unwrap().name(), BACKEND_GIT);
-        assert_eq!(destructive_backend_for_worktree(&root).unwrap().name(), BACKEND_GIT);
+        assert_eq!(
+            destructive_backend_for_worktree(&root).unwrap().name(),
+            BACKEND_GIT
+        );
         // A colocated repository stays on git worktrees — `.git` is checked
         // before `.jj`, so the colocated case cannot silently flip flavor.
         std::fs::create_dir_all(root.join(".jj")).unwrap();
@@ -1158,7 +1173,8 @@ mod tests {
         let git = git_backend();
         for err in [
             git.is_worktree_safe_to_reset(&root, "main").err(),
-            git.reset_worktree_to_ref(&root, "deadbeef", "cafebabe", false).err(),
+            git.reset_worktree_to_ref(&root, "deadbeef", "cafebabe", false)
+                .err(),
         ] {
             let err = err.expect("a backend that does not implement this must refuse");
             assert!(
@@ -1178,7 +1194,11 @@ mod tests {
         let err = git
             .reset_worktree_with_seeded_paths(&root, "main", &[])
             .expect_err("an empty inventory must refuse");
-        assert!(err.message.contains("seed inventory"), "got: {}", err.message);
+        assert!(
+            err.message.contains("seed inventory"),
+            "got: {}",
+            err.message
+        );
     }
 
     // ── configured selection (the CLI's `--branch` refusal) ─────────────────
@@ -1233,13 +1253,19 @@ mod tests {
         let (_d, _main, ws) = jj_only_main();
         let found = marker_root(&ws).expect("a jj workspace is a marker root");
         assert!(found.has_jj);
-        assert!(!found.has_git, "a pooled jj workspace is .jj-only — it has no .git at all");
+        assert!(
+            !found.has_git,
+            "a pooled jj workspace is .jj-only — it has no .git at all"
+        );
     }
 
     #[test]
     fn an_explicit_git_opt_in_wins_even_where_a_jj_directory_exists() {
         let (_d, root) = colocated();
-        assert_eq!(configured_backend_name(&root, Some(BACKEND_GIT)).unwrap(), BACKEND_GIT);
+        assert_eq!(
+            configured_backend_name(&root, Some(BACKEND_GIT)).unwrap(),
+            BACKEND_GIT
+        );
     }
 
     #[test]
@@ -1247,7 +1273,10 @@ mod tests {
         // The rule that makes a shell-wide `TREEHOUSE_VCS=jj` harmless: in a
         // plain git repository the opt-in is silently ignored.
         let (_d, root) = repo();
-        assert_eq!(configured_backend_name(&root, Some(BACKEND_JJ)).unwrap(), BACKEND_GIT);
+        assert_eq!(
+            configured_backend_name(&root, Some(BACKEND_JJ)).unwrap(),
+            BACKEND_GIT
+        );
 
         let (_d, colocated_root) = colocated();
         assert_eq!(
@@ -1272,13 +1301,19 @@ mod tests {
         // untracked treehouse.toml, so the opt-in is read at the main root the
         // `.jj/repo` pointer names.
         let (_d, _main, ws) = jj_only_main();
-        assert_eq!(configured_backend_name(&ws, Some(BACKEND_JJ)).unwrap(), BACKEND_JJ);
+        assert_eq!(
+            configured_backend_name(&ws, Some(BACKEND_JJ)).unwrap(),
+            BACKEND_JJ
+        );
     }
 
     #[test]
     fn a_path_outside_any_repository_answers_git_so_errors_surface_unchanged() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(configured_backend_name(dir.path(), None).unwrap(), BACKEND_GIT);
+        assert_eq!(
+            configured_backend_name(dir.path(), None).unwrap(),
+            BACKEND_GIT
+        );
         assert_eq!(
             configured_backend_name(dir.path(), Some(BACKEND_JJ)).unwrap(),
             BACKEND_GIT
@@ -1412,7 +1447,11 @@ mod tests {
 
         let err = reset_worktree_to_ref(&bin, &git, &root, &guard.reset_ref, &guard.head, true)
             .expect_err("a moved HEAD must refuse");
-        assert!(err.message.contains("HEAD changed since safety check"), "got: {}", err.message);
+        assert!(
+            err.message.contains("HEAD changed since safety check"),
+            "got: {}",
+            err.message
+        );
 
         // And the commit is still there — the refusal, not a lost commit.
         assert!(root.join("b.txt").exists());
@@ -1477,7 +1516,11 @@ mod tests {
             true,
         )
         .expect_err("a markerless path must be refused");
-        assert!(err.message.contains("no .git or .jj marker"), "got: {}", err.message);
+        assert!(
+            err.message.contains("no .git or .jj marker"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -1526,11 +1569,10 @@ mod tests {
 
     #[test]
     fn ordinary_seed_paths_are_accepted() {
-        assert!(validate_seed_inventory(&[
-            ".env".to_string(),
-            ".vscode/settings.json".to_string()
-        ])
-        .is_ok());
+        assert!(
+            validate_seed_inventory(&[".env".to_string(), ".vscode/settings.json".to_string()])
+                .is_ok()
+        );
     }
 
     // ── backend selection for repository-root resolution ─────────────────────
@@ -1563,7 +1605,10 @@ mod tests {
 
     impl jj::JjRunner for RecordingJj {
         fn run(&self, cwd: &Path, args: &[&str]) -> Result<String, GitError> {
-            self.calls.lock().unwrap().push(args.iter().map(|s| s.to_string()).collect());
+            self.calls
+                .lock()
+                .unwrap()
+                .push(args.iter().map(|s| s.to_string()).collect());
             if let Some(message) = self.failure {
                 return Err(GitError::new("jj", message, GitErrorKind::NotFound));
             }
@@ -1605,10 +1650,12 @@ mod tests {
         // The whole point: dispatch reached jj. A git-rooted loader would have
         // shelled out to git and reported its fatal instead of answering.
         assert!(
-            runner.calls.lock().unwrap().iter().any(|c| c.ends_with(&[
-                "workspace".to_string(),
-                "root".to_string()
-            ])),
+            runner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.ends_with(&["workspace".to_string(), "root".to_string()])),
             "jj must have been asked for the workspace root, calls: {:?}",
             runner.calls.lock().unwrap()
         );
@@ -1632,8 +1679,14 @@ mod tests {
             .expect_err("a repository jj cannot serve must be refused");
 
         let rendered = err.to_string();
-        assert!(rendered.contains(BACKEND_JJ), "must name the backend: {rendered}");
-        assert!(rendered.contains("will not fall back"), "must fail closed: {rendered}");
+        assert!(
+            rendered.contains(BACKEND_JJ),
+            "must name the backend: {rendered}"
+        );
+        assert!(
+            rendered.contains("will not fall back"),
+            "must fail closed: {rendered}"
+        );
         // The cause is quoted, not swallowed: the operator still sees what jj
         // actually said, and this string is jj's, not ours.
         assert!(
@@ -1642,7 +1695,10 @@ mod tests {
         );
         // And the remedy is OURS — it names JJ_BIN, which the cause above does
         // not, so this can only have come from `backend_cannot_serve`.
-        assert!(rendered.contains("JJ_BIN"), "must give a remedy: {rendered}");
+        assert!(
+            rendered.contains("JJ_BIN"),
+            "must give a remedy: {rendered}"
+        );
         // The kind travels with the refusal, so callers classifying on it see
         // "the backend was missing", not a generic failure.
         assert_eq!(err.kind, GitErrorKind::NotFound);
@@ -1660,9 +1716,18 @@ mod tests {
             .expect_err("an unregistered jj must be refused");
 
         let rendered = err.to_string();
-        assert!(rendered.contains(BACKEND_JJ), "must name the backend: {rendered}");
-        assert!(rendered.contains("will not fall back"), "must fail closed: {rendered}");
-        assert!(rendered.contains("JJ_BIN"), "must give a remedy: {rendered}");
+        assert!(
+            rendered.contains(BACKEND_JJ),
+            "must name the backend: {rendered}"
+        );
+        assert!(
+            rendered.contains("will not fall back"),
+            "must fail closed: {rendered}"
+        );
+        assert!(
+            rendered.contains("JJ_BIN"),
+            "must give a remedy: {rendered}"
+        );
     }
 
     #[test]
@@ -1685,7 +1750,9 @@ mod tests {
         let registry = BackendRegistry::new();
         registry.register(
             BACKEND_JJ,
-            Arc::new(jj::JjBackend::with_runner(RecordingJj::serving(root.clone()))),
+            Arc::new(jj::JjBackend::with_runner(RecordingJj::serving(
+                root.clone(),
+            ))),
         );
         assert_eq!(
             registry.repo_root_for(&root, Some(BACKEND_JJ)).unwrap(),
@@ -1724,13 +1791,8 @@ mod tests {
         std::fs::write(dir.path().join(".git"), "gitdir: /gone\n").unwrap();
 
         let git = git_backend();
-        let err = is_worktree_safe_to_reset(
-            git.git_bin(),
-            &git,
-            dir.path(),
-            "main",
-        )
-        .expect_err("a non-repository carrying a .git marker must fail the check");
+        let err = is_worktree_safe_to_reset(git.git_bin(), &git, dir.path(), "main")
+            .expect_err("a non-repository carrying a .git marker must fail the check");
 
         let rendered = err.to_string();
         assert!(

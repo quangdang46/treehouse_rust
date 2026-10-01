@@ -233,7 +233,11 @@ impl ShellGitBackend {
         let output = self.run_os(cwd, args);
         if !output.status.success() {
             let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Err(GitError::new(format!("git {command}"), message, GitErrorKind::Other));
+            return Err(GitError::new(
+                format!("git {command}"),
+                message,
+                GitErrorKind::Other,
+            ));
         }
         Ok(output.stdout)
     }
@@ -372,42 +376,41 @@ impl ShellGitBackend {
     /// that selection with an uncommitted edit. A missing file is a no-op, not
     /// an error — most repos do not seed at all.
     fn committed_worktree_include(&self, worktree: &Path) -> Result<Option<Vec<u8>>, GitError> {
-    let listed = self.run_bytes(
-        Some(worktree),
-        &[
-            "ls-tree",
-            "-z",
-            "--name-only",
-            "--full-tree",
-            "HEAD",
-            "--",
-            WORKTREE_INCLUDE,
-        ],
-    )?;
-    if !split_nul(&listed).iter().any(|n| n == WORKTREE_INCLUDE) {
-        return Ok(None);
-    }
-    // A tree entry of the same name (a directory, say) must not be read as a
-    // manifest: `cat-file blob` would fail with a confusing message, and
-    // treating the failure as "no manifest" would hide a real misconfiguration.
-    let spec = format!("HEAD:{WORKTREE_INCLUDE}");
-    let kind = self.run_stdout(
-        Some(worktree),
-        &["cat-file", "-t", &spec],
-        GitErrorKind::Other,
-    )?;
-    if kind.trim() != "blob" {
-        return Err(GitError::new(
-            format!("git cat-file -t {spec}"),
-            format!("committed {WORKTREE_INCLUDE} is not a file"),
+        let listed = self.run_bytes(
+            Some(worktree),
+            &[
+                "ls-tree",
+                "-z",
+                "--name-only",
+                "--full-tree",
+                "HEAD",
+                "--",
+                WORKTREE_INCLUDE,
+            ],
+        )?;
+        if !split_nul(&listed).iter().any(|n| n == WORKTREE_INCLUDE) {
+            return Ok(None);
+        }
+        // A tree entry of the same name (a directory, say) must not be read as a
+        // manifest: `cat-file blob` would fail with a confusing message, and
+        // treating the failure as "no manifest" would hide a real misconfiguration.
+        let spec = format!("HEAD:{WORKTREE_INCLUDE}");
+        let kind = self.run_stdout(
+            Some(worktree),
+            &["cat-file", "-t", &spec],
             GitErrorKind::Other,
-        ));
+        )?;
+        if kind.trim() != "blob" {
+            return Err(GitError::new(
+                format!("git cat-file -t {spec}"),
+                format!("committed {WORKTREE_INCLUDE} is not a file"),
+                GitErrorKind::Other,
+            ));
+        }
+        Ok(Some(
+            self.run_bytes(Some(worktree), &["cat-file", "blob", &spec])?,
+        ))
     }
-    Ok(Some(self.run_bytes(
-        Some(worktree),
-        &["cat-file", "blob", &spec],
-    )?))
-}
 
     /// The ignored paths a manifest selects in `repo` (Go `selectedSeedPathsWithManifestEnv`).
     ///
@@ -427,49 +430,49 @@ impl ShellGitBackend {
         repo_root: &Path,
         manifest: &[u8],
     ) -> Result<Vec<String>, GitError> {
-    // The temp file must live and be written before `ls-files` reads it, and
-    // must not outlive the call: it holds repository-selection content in a
-    // predictable path, so it is removed on every path out.
-    let exclude = tempfile::NamedTempFile::new().map_err(|e| {
-        GitError::new(
-            "git ls-files --exclude-from",
-            format!("creating temporary exclude file: {e}"),
-            GitErrorKind::Other,
-        )
-    })?;
-    std::fs::write(exclude.path(), manifest).map_err(|e| {
-        GitError::new(
-            "git ls-files --exclude-from",
-            format!("writing temporary exclude file: {e}"),
-            GitErrorKind::Other,
-        )
-    })?;
+        // The temp file must live and be written before `ls-files` reads it, and
+        // must not outlive the call: it holds repository-selection content in a
+        // predictable path, so it is removed on every path out.
+        let exclude = tempfile::NamedTempFile::new().map_err(|e| {
+            GitError::new(
+                "git ls-files --exclude-from",
+                format!("creating temporary exclude file: {e}"),
+                GitErrorKind::Other,
+            )
+        })?;
+        std::fs::write(exclude.path(), manifest).map_err(|e| {
+            GitError::new(
+                "git ls-files --exclude-from",
+                format!("writing temporary exclude file: {e}"),
+                GitErrorKind::Other,
+            )
+        })?;
 
-    let exclude_from = format!("--exclude-from={}", exclude.path().display());
-    let selected = self.run_bytes(
-        Some(repo_root),
-        &["ls-files", "-z", "--others", "--ignored", &exclude_from],
-    )?;
-    if selected.is_empty() {
-        return Ok(Vec::new());
-    }
+        let exclude_from = format!("--exclude-from={}", exclude.path().display());
+        let selected = self.run_bytes(
+            Some(repo_root),
+            &["ls-files", "-z", "--others", "--ignored", &exclude_from],
+        )?;
+        if selected.is_empty() {
+            return Ok(Vec::new());
+        }
 
-    let ignored = self.run_bytes(
-        Some(repo_root),
-        &[
-            "ls-files",
-            "-z",
-            "--others",
-            "--ignored",
-            "--exclude-standard",
-        ],
-    )?;
-    let ignored: std::collections::HashSet<String> = split_nul(&ignored).into_iter().collect();
+        let ignored = self.run_bytes(
+            Some(repo_root),
+            &[
+                "ls-files",
+                "-z",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+            ],
+        )?;
+        let ignored: std::collections::HashSet<String> = split_nul(&ignored).into_iter().collect();
 
-    Ok(split_nul(&selected)
-        .into_iter()
-        .filter(|name| ignored.contains(name))
-        .collect())
+        Ok(split_nul(&selected)
+            .into_iter()
+            .filter(|name| ignored.contains(name))
+            .collect())
     }
 }
 
@@ -518,7 +521,10 @@ fn ensure_seed_parent_dir(worktree: &Path, rel: &str) -> Result<(), GitError> {
             Ok(_) => {
                 return Err(GitError::new(
                     "seed worktree",
-                    format!("refusing to replace existing seed ancestor {}", current.display()),
+                    format!(
+                        "refusing to replace existing seed ancestor {}",
+                        current.display()
+                    ),
                     GitErrorKind::Other,
                 ));
             }
@@ -960,7 +966,9 @@ impl GitBackend for ShellGitBackend {
         // manifest instead would copy files the caller excluded.
         let manifest: Vec<u8> = match manifest {
             Some(bytes) => bytes.to_vec(),
-            None => self.committed_worktree_include(worktree)?.unwrap_or_default(),
+            None => self
+                .committed_worktree_include(worktree)?
+                .unwrap_or_default(),
         };
         if manifest.is_empty() {
             return Ok(Vec::new());
@@ -1497,7 +1505,10 @@ mod tests {
         // -f: the manifest is itself ignored by `.gitignore` containing `*`,
         // and it still has to be committed — it is the one file seeding reads
         // from the OBJECT store, never the working tree.
-        must_git(Some(&repo), &["add", "-f", ".gitignore", ".worktreeinclude"]);
+        must_git(
+            Some(&repo),
+            &["add", "-f", ".gitignore", ".worktreeinclude"],
+        );
         must_git(Some(&repo), &["commit", "-m", "seed manifest"]);
         must_git(
             Some(&repo),
@@ -1596,11 +1607,11 @@ mod tests {
         write_under(&worktree, "user.env", "MINE=1\n");
 
         for bad in [
-            vec![],                              // lost bookkeeping
-            vec!["".to_string()],                // empty component
-            vec!["../escape.env".to_string()],   // climbs out of the worktree
-            vec!["/etc/passwd".to_string()],     // absolute
-            vec![".git/config".to_string()],     // the repository's own metadata
+            vec![],                               // lost bookkeeping
+            vec!["".to_string()],                 // empty component
+            vec!["../escape.env".to_string()],    // climbs out of the worktree
+            vec!["/etc/passwd".to_string()],      // absolute
+            vec![".git/config".to_string()],      // the repository's own metadata
             vec!["nested/../../out".to_string()], // traversal mid-path
         ] {
             backend
@@ -1619,7 +1630,11 @@ mod tests {
     fn integration_seed_honours_git_exclude_semantics() {
         for (manifest, want, unwanted) in [
             // Negation: a later pattern re-includes a file.
-            ("*.env\n!important.env\n", vec!["app.env"], vec!["important.env"]),
+            (
+                "*.env\n!important.env\n",
+                vec!["app.env"],
+                vec!["important.env"],
+            ),
             // Anchored: `/` binds to the repo root.
             ("/root.env\n", vec!["root.env"], vec!["nested/root.env"]),
             // `**` spanning directories.
@@ -1689,7 +1704,10 @@ mod tests {
         // one beneath a selected path. `-f` because `.gitignore` is `*`.
         write_under(&repo, "config/settings.env", "COMMITTED\n");
         write_under(&repo, "loose.env", "COMMITTED\n");
-        must_git(Some(&repo), &["add", "-f", "config/settings.env", "loose.env"]);
+        must_git(
+            Some(&repo),
+            &["add", "-f", "config/settings.env", "loose.env"],
+        );
         must_git(Some(&repo), &["commit", "-m", "tracked"]);
 
         // Change the SOURCE copy of the tracked file without committing it. If
@@ -1736,7 +1754,9 @@ mod tests {
             "a genuinely ignored file must still be seeded"
         );
         assert!(
-            !seeded.iter().any(|p| p == "loose.env" || p == "config/settings.env"),
+            !seeded
+                .iter()
+                .any(|p| p == "loose.env" || p == "config/settings.env"),
             "tracked paths must not reach the inventory, got {seeded:?}"
         );
     }
@@ -1790,7 +1810,10 @@ mod tests {
         let backend2 = ShellGitBackend::discover().unwrap();
         // The destination worktree was cut before the manifest was dropped, so
         // rebuild it to read the current HEAD.
-        must_git(Some(&repo2), &["worktree", "remove", "--force", worktree2.to_str().unwrap()]);
+        must_git(
+            Some(&repo2),
+            &["worktree", "remove", "--force", worktree2.to_str().unwrap()],
+        );
         must_git(
             Some(&repo2),
             &["worktree", "add", "--detach", worktree2.to_str().unwrap()],
@@ -1933,7 +1956,9 @@ mod tests {
             "seeded_paths".to_string(),
             serde_json::to_value(&seeded).unwrap(),
         );
-        entry.extra.insert("seed_inventory_known".to_string(), true.into());
+        entry
+            .extra
+            .insert("seed_inventory_known".to_string(), true.into());
         let state = State {
             worktrees: vec![entry],
             ..Default::default()
@@ -1945,10 +1970,9 @@ mod tests {
         );
 
         let read_back: State = serde_json::from_str(&json).unwrap();
-        let recovered: Vec<String> = serde_json::from_value(
-            read_back.worktrees[0].extra["seeded_paths"].clone(),
-        )
-        .expect("seeded_paths must read back as a path list");
+        let recovered: Vec<String> =
+            serde_json::from_value(read_back.worktrees[0].extra["seeded_paths"].clone())
+                .expect("seeded_paths must read back as a path list");
         assert_eq!(
             recovered, seeded,
             "an inventory that changes across a state write would either \

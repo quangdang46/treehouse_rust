@@ -98,6 +98,21 @@ own worktrees. An unrelated directory is refused instead of operated on, and a
 marker that cannot be read — a dangling symlink, a damaged checkout — is treated
 as a failure to verify, not as an absent marker.
 
+### Not data loss, but the same class of "the flag did nothing"
+
+**`destroy --include-in-use` now terminates on Linux.** After killing the
+processes in a worktree, the survivor re-scan still found the pid it had just
+killed, so destroy skipped with *"worktree processes still running after
+termination"* and `--include-in-use` was a no-op there.
+
+The cause was in the process table, not the kill: sysinfo refreshes a process's
+`cwd` only when that field is currently unset (`ProcessRefreshKind::everything()`
+uses `UpdateKind::OnlyIfNotSet`), so it never re-reads a cwd it already holds.
+On Linux a killed child survives as a zombie, its `/proc/<pid>/cwd` disappears,
+and the cached path — the worktree it died in — is what destroy saw. A zombie
+has already terminated: it runs nothing and blocks no removal. Zombies are now
+excluded from the scan.
+
 ---
 
 ## New capabilities

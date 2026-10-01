@@ -2349,8 +2349,15 @@ mod tests {
             "the default exit-3 message must say the confirmation was unanswerable: {text}"
         );
         assert!(text.contains("prune will not reclaim"), "{text}");
+        // The remedy must be pasteable into the user's own shell, so it has to
+        // use THAT platform's quoting — cmd.exe groups on double quotes.
+        let remedy = if cfg!(windows) {
+            "treehouse return --force \"/pool/1/repo\""
+        } else {
+            "treehouse return --force '/pool/1/repo'"
+        };
         assert!(
-            text.contains("treehouse return --force '/pool/1/repo'"),
+            text.contains(remedy),
             "the remedy must be pasteable: {text}"
         );
         let n = e.downcast_ref::<NotReturned>().unwrap();
@@ -2374,10 +2381,7 @@ mod tests {
     #[test]
     fn legacy_zero_is_opted_in_only_by_an_explicit_false() {
         for value in ["0", "false", "off", "n", "no", "f", " FALSE ", "off "] {
-            assert!(
-                parses_as_false(value),
-                "{value:?} must restore exit 0"
-            );
+            assert!(parses_as_false(value), "{value:?} must restore exit 0");
         }
         // The dangerous cases: a stale opt-in, a typo, and the empty string a
         // shell exports when a variable is declared but never assigned.
@@ -2409,12 +2413,30 @@ mod tests {
 
     #[test]
     fn quote_path_neutralises_shell_metacharacters() {
-        assert_eq!(quote_path(Path::new("/pool/1/repo")), "'/pool/1/repo'");
-        assert_eq!(
-            quote_path(Path::new("/it's here")),
-            r"'/it'\''s here'",
-            "an embedded quote must not terminate the quoted string"
-        );
+        // `quote_path` is platform-branched (main.rs:1815): POSIX shells
+        // single-quote, cmd.exe double-quotes. Assert each platform's real
+        // form rather than pinning the POSIX one everywhere.
+        if cfg!(windows) {
+            assert_eq!(quote_path(Path::new("/pool/1/repo")), "\"/pool/1/repo\"");
+            assert_eq!(
+                quote_path(Path::new("/it's here")),
+                "\"/it's here\"",
+                "cmd.exe has no escape inside double quotes, but `'` is not \
+                 special there — the doubled `\"` is the escape it does honour"
+            );
+            assert_eq!(
+                quote_path(Path::new("/say \"hi\"")),
+                "\"/say \"\"hi\"\"\"",
+                "an embedded quote must be doubled so it cannot close the group"
+            );
+        } else {
+            assert_eq!(quote_path(Path::new("/pool/1/repo")), "'/pool/1/repo'");
+            assert_eq!(
+                quote_path(Path::new("/it's here")),
+                r"'/it'\''s here'",
+                "an embedded quote must not terminate the quoted string"
+            );
+        }
     }
 
     // ─── M-023: `--root` and its Go precedence ──────────────────────────────

@@ -232,7 +232,10 @@ pub trait GitBackend: Send + Sync {
         branch: &str,
     ) -> Result<ResetGuard, GitError> {
         let _ = (worktree, branch); // Refuses by design; see the default's contract.
-        Err(crate::vcs::unsupported(self.name(), "is_worktree_safe_to_reset"))
+        Err(crate::vcs::unsupported(
+            self.name(),
+            "is_worktree_safe_to_reset",
+        ))
     }
 
     /// Resets `worktree` to an ALREADY RESOLVED commit, re-verifying first (Go
@@ -261,7 +264,10 @@ pub trait GitBackend: Send + Sync {
         require_clean: bool,
     ) -> Result<(), GitError> {
         let _ = (worktree, reset_ref, expected_head, require_clean);
-        Err(crate::vcs::unsupported(self.name(), "reset_worktree_to_ref"))
+        Err(crate::vcs::unsupported(
+            self.name(),
+            "reset_worktree_to_ref",
+        ))
     }
 
     // ─── Capabilities the later agents implement ────────────────────────────
@@ -319,7 +325,10 @@ pub trait GitBackend: Send + Sync {
         // caller lost its bookkeeping, which is a different bug from the
         // backend lacking the capability.
         crate::vcs::validate_seed_inventory(seeded)?;
-        Err(crate::vcs::unsupported(self.name(), "reset_worktree_with_seeded_paths"))
+        Err(crate::vcs::unsupported(
+            self.name(),
+            "reset_worktree_with_seeded_paths",
+        ))
     }
 }
 
