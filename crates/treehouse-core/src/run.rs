@@ -71,15 +71,21 @@ pub fn run(pool: &Pool, opts: &RunOptions) -> Result<RunResult, PoolError> {
     let lease_id = lease.id.clone();
     let lease_holder = lease.holder.clone();
 
-    // Spawn the child in the worktree with the lease env.
-    let child = spawn_child(pool, &worktree_path, &lease_id, opts)?;
-
-    // RAII cleanup guard: runs on every exit path (incl. panic unwinding).
+    // The guard is constructed IMMEDIATELY after the acquire, BEFORE the
+    // spawn. `spawn_child`'s `?` used to return past a guard that did not yet
+    // exist, so a command that could not be executed (typo, missing binary)
+    // left a durably leased slot behind for the whole TTL — with no owner to
+    // release it and nothing in `status` to explain why the pool shrank.
+    // From here on every exit path, including a failing spawn, unwinds
+    // through `Drop`.
     let cleanup = CleanupGuard {
         pool,
         worktree_path: &worktree_path,
         lease_id: &lease_id,
     };
+
+    // Spawn the child in the worktree with the lease env.
+    let child = spawn_child(&worktree_path, &lease_id, opts)?;
 
     // Wait for the child, forwarding signals (unix only; Windows uses
     // GenerateConsoleCtrlEvent in the signal handler below).
@@ -104,7 +110,6 @@ pub fn run(pool: &Pool, opts: &RunOptions) -> Result<RunResult, PoolError> {
 
 /// Spawns the child command inside the worktree.
 fn spawn_child(
-    pool: &Pool,
     worktree_path: &std::path::Path,
     lease_id: &str,
     opts: &RunOptions,
@@ -116,7 +121,6 @@ fn spawn_child(
     // return --if-lease-id).
     cmd.env("TREEHOUSE_DIR", worktree_path);
     cmd.env("TREEHOUSE_LEASE_ID", lease_id);
-    let _ = pool;
     // New process group so we can signal the whole group.
     #[cfg(unix)]
     {
@@ -174,11 +178,14 @@ impl CleanupGuard<'_> {
             .pool
             .process
             .terminate_with_grace(self.worktree_path, Duration::from_secs(2));
-        // 2. Reset the worktree to the default branch (detach HEAD + clean).
-        if let Err(e) = self.pool.git_is_dirty(self.worktree_path) {
-            let _ = e;
-        }
-        // 3. Release the lease (conditional on our lease id — ABA-safe).
+        // 2. Release the lease (conditional on our lease id — ABA-safe).
+        // This is also the reset: `release_conditional` runs `reset_worktree`
+        // (detach HEAD + `reset --hard` + `clean -fd`) between its two lock
+        // acquisitions, so the slot comes back clean without a separate step.
+        // A standalone reset here would either duplicate that destructive work
+        // or run it before the lease precondition has been checked — and
+        // discarding the agent's work is this verb's contract, not a decision
+        // this guard gets to make independently of the release.
         let pre = crate::pool::ReleasePreconditions {
             expected_lease_id: Some(self.lease_id.to_string()),
             ..Default::default()
@@ -195,6 +202,16 @@ impl Drop for CleanupGuard<'_> {
     fn drop(&mut self) {
         // Best-effort cleanup on every exit path. A panic unwinds and still
         // runs this.
+        //
+        // On the happy path this is a SECOND pass: `run` cleans up explicitly
+        // so it can report the outcome, then unwinds through here. That is
+        // deliberate, not an oversight — a pass that reported
+        // `CleanupFailed` because of a transient lock timeout gets retried
+        // here, and a pass that succeeded is inert on the retry because
+        // `release_conditional` refuses a slot that is no longer leased
+        // (pool.rs `expected_lease_id` -> "worktree is not leased") before it
+        // ever reaches `reset_worktree`. So the repeat can tighten the pool
+        // but can never reset a slot somebody else has since taken.
         let _ = self.run();
     }
 }
@@ -216,5 +233,124 @@ mod tests {
             CleanupOutcome::Cleaned => {}
             CleanupOutcome::CleanupFailed(_) => panic!(),
         }
+    }
+
+    // ─── The repeat cleanup pass must not touch a re-acquired slot ─────────
+
+    /// Builds a repo with one commit on `main`. Returns (tempdir, repo path);
+    /// the TempDir must be kept alive by the caller.
+    fn init_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let out = std::process::Command::new("git")
+            .args(["init", "--initial-branch=main", repo.to_str().unwrap()])
+            .current_dir(dir.path())
+            .output()
+            .expect("git must be installed");
+        assert!(out.status.success(), "git init failed");
+        let run_git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run_git(&["config", "user.email", "t@t.com"]);
+        run_git(&["config", "user.name", "T"]);
+        std::fs::write(repo.join("README.md"), b"hi\n").unwrap();
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "init"]);
+        (dir, repo)
+    }
+
+    fn pool_over(dir: &tempfile::TempDir, repo: &std::path::Path) -> Pool {
+        let opts = crate::OpenOptions {
+            config: crate::config::TreehouseConfig {
+                root: Some(dir.path().to_str().unwrap().to_string()),
+                ..crate::config::TreehouseConfig::default_config()
+            },
+            ..Default::default()
+        };
+        Pool::open(repo, None, &opts).unwrap()
+    }
+
+    /// Acquires a leased slot, pinned to `main` because `init_repo` builds a
+    /// repo with no remote to resolve a default branch from.
+    fn acquire_leased(pool: &Pool, holder: &str) -> crate::pool::Acquired {
+        pool.get(&AcquireOptions {
+            branch: Some("main".into()),
+            lease: Some(LeaseAcquireOptions {
+                holder: holder.to_string(),
+                ttl: Some(chrono::Duration::hours(1)),
+            }),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    /// `run` cleans up explicitly and then unwinds through `Drop`, so the
+    /// guard runs TWICE on the happy path. The second pass is only safe
+    /// because it is pinned to the lease it took: by then the slot may have
+    /// been handed to somebody else, and resetting it would discard their work
+    /// under them.
+    ///
+    /// This is the invariant the `Drop` comment asserts. If `release_conditional`
+    /// ever stopped refusing a slot that is no longer leased by us, this is the
+    /// test that would say so.
+    #[test]
+    fn repeat_cleanup_refuses_a_slot_someone_else_has_since_leased() {
+        let (dir, repo) = init_repo();
+        let pool = pool_over(&dir, &repo);
+
+        let first = acquire_leased(&pool, "run:first");
+        let path = first.path.clone();
+        let first_lease = first.lease.as_ref().expect("a lease was taken").id.clone();
+
+        let guard = CleanupGuard {
+            pool: &pool,
+            worktree_path: &path,
+            lease_id: &first_lease,
+        };
+        // First pass: the slot is ours, so it is ours to release.
+        assert!(matches!(guard.run(), CleanupOutcome::Cleaned));
+
+        // A second acquisition takes the slot we just gave back.
+        let second = acquire_leased(&pool, "run:second");
+        assert_eq!(second.path, path, "the released slot should be reused");
+        let second_lease = second
+            .lease
+            .as_ref()
+            .expect("a lease was taken")
+            .id
+            .clone();
+        assert_ne!(second_lease, first_lease, "each lease gets its own id");
+
+        // The repeat pass must refuse, not reset. Pin the REASON too: a
+        // refusal for anything else (slot vanished, pool renamed) would leave
+        // the new lease intact for the wrong reason and stop testing the
+        // identity check this invariant rests on.
+        match guard.run() {
+            CleanupOutcome::CleanupFailed(ref why) => assert!(
+                why.contains("lease"),
+                "expected a lease-identity refusal, got: {why}"
+            ),
+            CleanupOutcome::Cleaned => {
+                panic!("cleanup reset a slot that a different lease owns")
+            }
+        }
+
+        // ...and the new owner's lease survived untouched.
+        let status = pool.status().unwrap();
+        let wt = status
+            .iter()
+            .find(|w| w.path == path.to_string_lossy())
+            .expect("the slot is still tracked");
+        assert_eq!(wt.status, crate::pool::STATUS_LEASED);
+        assert_eq!(wt.lease_id, second_lease);
     }
 }

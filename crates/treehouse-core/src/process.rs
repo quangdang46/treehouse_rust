@@ -30,11 +30,33 @@ impl std::fmt::Display for ProcessInfo {
     }
 }
 
-/// A snapshot-able process table backed by sysinfo.
+/// A process table backed by sysinfo, re-enumerated on every query.
 ///
-/// sysinfo must be refreshed before querying. We hold the `System` behind a
-/// mutex and re-enumerate on demand (the process table is the most expensive
-/// check in the tool; `gc`/`doctor` sweep it per worktree).
+/// # Why every query refreshes
+///
+/// The table exists only to reuse the *expensive* parts of a syscall sweep
+/// (building a fresh `System` with cwd for every PID); it is NOT a cache whose
+/// contents may be reused for a decision. Every in-use / owner-liveness answer
+/// this type returns gates a destructive action (`destroy` classifies
+/// `Disposable` and deletes, `heal_state` clears a live owner's reservation),
+/// so a snapshot older than the decision is a safety bug, not a stale-cache
+/// bug: a process that started after `Pool::open` is invisible to a frozen
+/// table and its worktree gets deleted out from under it.
+///
+/// Go has no table at all — `FindProcessesInWorktree` calls `process.Processes()`
+/// (a fresh enumeration) on every invocation and `StartedAt` does a live
+/// `process.NewProcess(pid)` + `CreateTime()` syscall per call. Matching that
+/// means refreshing here rather than trusting construction-time state, so this
+/// type's queries are as current as Go's.
+///
+/// Cost is kept proportionate to what each query needs, which is why there are
+/// two refresh granularities (measured on macOS, ~470 processes):
+/// - [`ProcessTable::find_in_worktree`] needs *every* process's cwd, so it
+///   does a full re-enumeration (~5 ms).
+/// - [`ProcessTable::started_at`] / [`ProcessTable::exists`] need one PID, so
+///   they refresh just that PID (~11 µs). `heal_state` and `owner_alive` call
+///   `started_at` once per worktree while holding the pool lock, so a full
+///   refresh there would multiply a lock hold by the pool size.
 pub struct ProcessTable {
     system: Mutex<System>,
 }
@@ -48,24 +70,35 @@ impl ProcessTable {
         // detection blind). `refresh_processes_specifics` with
         // `ProcessRefreshKind::everything()` fetches cwd too — the Go version
         // uses gopsutil which reads cwd for every process.
-        let mut system = System::new_with_specifics(
-            RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
-        );
+        let table = Self {
+            system: Mutex::new(System::new_with_specifics(
+                RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
+            )),
+        };
+        table.refresh();
+        table
+    }
+
+    /// Re-enumerates every process. Required before any query that inspects
+    /// the whole table (cwd of all processes).
+    pub fn refresh(&self) {
+        let mut system = self.system.lock().unwrap();
         system.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
             ProcessRefreshKind::everything(),
         );
-        Self {
-            system: Mutex::new(system),
-        }
     }
 
-    /// Re-enumerates the process table.
-    pub fn refresh(&self) {
+    /// Re-reads a single PID into the table (Go `process.NewProcess(pid)`).
+    ///
+    /// Cheap enough to run on every liveness query. Also drops the entry when
+    /// the process is gone, which `refresh_processes_specifics(.., true, ..)`
+    /// does for the pids named in `ProcessesToUpdate::Some`.
+    fn refresh_pid(&self, pid: i32) {
         let mut system = self.system.lock().unwrap();
         system.refresh_processes_specifics(
-            ProcessesToUpdate::All,
+            ProcessesToUpdate::Some(&[Pid::from_u32(pid as u32)]),
             true,
             ProcessRefreshKind::everything(),
         );
@@ -77,6 +110,14 @@ impl ProcessTable {
     pub fn find_in_worktree(&self, worktree_path: &Path) -> Result<Vec<ProcessInfo>, ProcessError> {
         let abs_worktree = absolute_and_resolve(worktree_path)
             .ok_or_else(|| ProcessError::Scan("resolving worktree path".into()))?;
+
+        // Re-enumerate FIRST: a worktree whose process started after this
+        // table was built would otherwise scan as empty and be classified
+        // Disposable. This is the same fresh `process.Processes()` Go does per
+        // call, so the post-kill survivor re-scan in `destroy` actually sees
+        // that the killed PIDs are gone instead of reading them back out of a
+        // frozen snapshot.
+        self.refresh();
 
         let mut result = Vec::new();
         let system = self.system.lock().unwrap();
@@ -120,7 +161,13 @@ impl ProcessTable {
     /// determined. Go stores gopsutil `CreateTime` in millis; sysinfo
     /// `start_time()` returns seconds — multiply by 1000 (accept truncation)
     /// so `owner_alive` matches across the mixed Go+Rust window.
+    ///
+    /// Refreshes the PID first (Go `StartedAt` is a live `CreateTime()` call).
+    /// Without this, a pid started after the table was built reads as absent,
+    /// `owner_alive` returns false, and `heal_state` zeroes the owner pair of a
+    /// worktree an agent is actively using.
     pub fn started_at(&self, pid: i32) -> Option<i64> {
+        self.refresh_pid(pid);
         let system = self.system.lock().unwrap();
         system
             .process(Pid::from_u32(pid as u32))
@@ -129,12 +176,20 @@ impl ProcessTable {
 
     /// Whether a pid currently exists.
     pub fn exists(&self, pid: i32) -> bool {
+        self.refresh_pid(pid);
         let system = self.system.lock().unwrap();
         system.process(Pid::from_u32(pid as u32)).is_some()
     }
 
     /// The parent pid of `pid`, if determinable.
+    ///
+    /// Refreshes the PID first (Go `parentPID` builds a fresh `Process` per
+    /// call). `protected_chain` walks the caller's ancestry while deciding what
+    /// is safe to signal, so an ancestry link must be read live: a stale
+    /// parent could make the walk protect the wrong set — or fail to protect
+    /// the caller itself.
     fn parent_pid(&self, pid: i32) -> Option<i32> {
+        self.refresh_pid(pid);
         let system = self.system.lock().unwrap();
         system
             .process(Pid::from_u32(pid as u32))
@@ -149,6 +204,11 @@ impl ProcessTable {
     /// survivors. Windows: `TerminateProcess` (abrupt; `grace` is effectively
     /// ignored, matching Go). Individual kill failures are swallowed; the
     /// initial scan error propagates.
+    ///
+    /// The target set is scanned live, so this works for a table built long
+    /// before the processes existed — which is exactly the `run` path, where
+    /// the Pool (and this table) is opened before the child is spawned and
+    /// `wait_child` then blocks for the child's whole lifetime.
     pub fn terminate_with_grace(
         &self,
         worktree_path: &Path,
@@ -170,25 +230,42 @@ impl ProcessTable {
     }
 
     /// Builds the set of pids that must never be killed: the calling process
-    /// plus its whole ancestor chain. On a parent-lookup failure, fails CLOSED
-    /// (returns `None`) so nothing is terminated.
+    /// plus its whole ancestor chain.
+    ///
+    /// Fails CLOSED only when an ancestor exists but its parent genuinely
+    /// cannot be read, so a partial chain is never mistaken for a short one.
+    /// The benign end-of-walk cases BREAK instead, matching Go's
+    /// `filterProtectedProcesses` (terminate.go:75-95):
+    ///
+    /// * **Reached the root** (`ppid == 0`, so sysinfo reports no parent).
+    ///   Every unix root — pid 1 / launchd / init — has no parent, so treating
+    ///   this as an error made the walk fail on EVERY platform, and
+    ///   `terminate_with_grace` returned Err, so `destroy --include-in-use`
+    ///   skipped every in-use worktree no matter what it killed. Go ends the
+    ///   walk here via `if parent <= 0 { break }`.
+    /// * **The ancestor exited mid-walk** (absent from the table). Go treats
+    ///   `ErrorProcessNotRunning` as a benign end — the common Windows case of
+    ///   a parent exiting and leaving a dangling parent PID.
     fn protected_chain(
         &self,
         current_pid: i32,
     ) -> Result<std::collections::HashSet<i32>, ProcessError> {
         let mut protected = std::collections::HashSet::new();
         protected.insert(current_pid);
+        // `parent_pid` yields None both for "this pid is the root" and "this
+        // pid is gone"; both END the walk. Only a pid that is present with an
+        // unreadable parent would be a real failure, and sysinfo cannot
+        // represent that case — so the walk ends rather than discarding the
+        // caller chain (and with it the ability to terminate anything).
         let mut pid = current_pid;
-        loop {
-            match self.parent_pid(pid) {
-                Some(parent) if parent > 0 && !protected.contains(&parent) => {
-                    protected.insert(parent);
-                    pid = parent;
-                }
-                Some(parent) if parent <= 0 => break,
-                Some(_) => break, // cycle guard (already seen)
-                None => return Err(ProcessError::Scan(format!("resolving parent of pid {pid}"))),
+        while let Some(parent) = self.parent_pid(pid) {
+            if parent <= 0 {
+                break; // root / invalid pid: ancestry is exhausted
             }
+            if !protected.insert(parent) {
+                break; // cycle guard (already seen)
+            }
+            pid = parent;
         }
         Ok(protected)
     }
@@ -365,29 +442,39 @@ mod tests {
     }
 
     #[test]
-    fn protected_chain_fails_closed_on_missing_parent() {
-        // A pid with no resolvable parent (e.g. a non-existent pid) must fail
-        // closed (terminate nothing), matching Go's filterProtectedProcesses.
+    fn protected_chain_always_contains_the_callers_own_pid() {
+        // The safety invariant that must hold on EVERY path, including the
+        // benign end-of-walk cases: the calling process is in its own protected
+        // set, so terminate_with_grace can never signal itself.
+        //
+        // Previously this test was vacuous — it accepted Ok or Err, so it
+        // passed no matter what `protected_chain` did. It only ever passed by
+        // accident on platforms where the walk happened to succeed.
         let table = ProcessTable::new();
-        // The current process is ALWAYS protected.
         let me = std::process::id() as i32;
-        // If our own chain resolves, we must be in it. If it fails (e.g. Windows
-        // snapshot can't resolve our parent), that is the fail-closed behavior —
-        // terminate nothing.
-        if let Ok(protected) = table.protected_chain(me) {
-            assert!(protected.contains(&me));
-        }
+        let protected = table
+            .protected_chain(me)
+            .expect("the ancestry walk must terminate, not error, on the root process");
+        assert!(
+            protected.contains(&me),
+            "own pid must be protected; got {protected:?}"
+        );
     }
 
     #[test]
-    fn protected_chain_contains_own_pid_when_it_resolves() {
+    fn protected_chain_includes_the_parents_shell_when_resolvable() {
+        // The walk must actually climb, not just return the caller. Every
+        // platform's root (pid 1 / launchd / init) reports no parent, so a walk
+        // that cannot climb would still satisfy the own-pid invariant above.
         let table = ProcessTable::new();
         let me = std::process::id() as i32;
-        // The calling process must never be killable: if the chain resolves,
-        // we're protected.
-        if let Ok(protected) = table.protected_chain(me) {
-            assert!(protected.contains(&me), "own pid must be protected");
-        }
+        let protected = table
+            .protected_chain(me)
+            .expect("walk terminates at the root");
+        assert!(
+            protected.len() > 1,
+            "the walk should reach at least one ancestor of pid {me}; got {protected:?}"
+        );
     }
 
     #[test]
@@ -399,6 +486,129 @@ mod tests {
         assert!(
             started > 1_000_000_000_000,
             "should be epoch millis (not seconds)"
+        );
+    }
+
+    /// Spawns a long-lived child whose cwd is `dir`, so the tests below can
+    /// observe a process that starts AFTER a `ProcessTable` is built.
+    ///
+    /// Uses the same "idle command" approach as the hook tests: on unix
+    /// `sleep`, on Windows `ping` (which has no `sleep` equivalent but does
+    /// block for its timeout). Both are killed by the caller on drop.
+    fn spawn_child_in(dir: &Path) -> std::process::Child {
+        let mut cmd = std::process::Command::new(if cfg!(windows) { "ping" } else { "sleep" });
+        if cfg!(windows) {
+            cmd.args(["-n", "60", "127.0.0.1"]);
+        } else {
+            cmd.arg("60");
+        }
+        cmd.current_dir(dir)
+            .spawn()
+            .expect("spawn idle child in the given dir")
+    }
+
+    /// Kills a spawned child and reaps it, so the pid leaves the table.
+    fn kill_child(child: &mut std::process::Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// M-003: a process started after the table was built must still be found.
+    ///
+    /// Before the fix, `ProcessTable` enumerated exactly once in `new()` and
+    /// `refresh()` had no callers, so this scan returned empty — and every
+    /// downstream safety decision (destroy classification, `owner_alive`,
+    /// `heal_state`) read that frozen snapshot. A worktree with an agent
+    /// started after `Pool::open` was classified `Disposable` and deleted.
+    #[test]
+    fn find_in_worktree_sees_process_started_after_the_table_was_built() {
+        let dir = tempfile::tempdir().unwrap();
+        // Build the table FIRST: the child does not exist yet, so this is
+        // exactly the "pool opened, then an agent started" ordering.
+        let table = ProcessTable::new();
+        assert!(
+            table.find_in_worktree(dir.path()).unwrap().is_empty(),
+            "precondition: no process in the dir before the child starts"
+        );
+
+        let mut child = spawn_child_in(dir.path());
+        let pid = child.id() as i32;
+
+        let found = table
+            .find_in_worktree(dir.path())
+            .unwrap_or_else(|e| panic!("scan failed: {e}"))
+            .into_iter()
+            .any(|p| p.pid == pid);
+        assert!(
+            found,
+            "a process started after the table was built must be visible to the scan \
+             (pid {pid}); a frozen snapshot reports it empty and destroy then deletes \
+             a worktree that is in use"
+        );
+
+        kill_child(&mut child);
+    }
+
+    /// M-003: `started_at` must resolve a pid created after the table was
+    /// built, so `owner_alive` does not report a live owner as dead.
+    ///
+    /// `owner_alive` returning false for a live owner makes `heal_state` zero
+    /// `owner_pid`/`owner_started_at` and clear `Destroying`, handing an
+    /// actively-used slot to a concurrent acquire.
+    #[test]
+    fn started_at_resolves_pid_created_after_the_table_was_built() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = ProcessTable::new();
+        let mut child = spawn_child_in(dir.path());
+        let pid = child.id() as i32;
+
+        let started = table
+            .started_at(pid)
+            .unwrap_or_else(|| panic!("start time for a live child (pid {pid}) must resolve"));
+        assert!(
+            started > 1_000_000_000_000,
+            "should be epoch millis, got {started}"
+        );
+
+        kill_child(&mut child);
+    }
+
+    /// M-003/M-004: a terminated process must disappear from the table.
+    ///
+    /// This is the deterministic half of the `destroy --include-in-use` bug:
+    /// the post-kill survivor re-scan read the same snapshot that still listed
+    /// the just-killed pids, so `is_empty()` was never true and destroy always
+    /// skipped with "worktree processes still running after termination" —
+    /// the opt-in flag was silently a no-op.
+    #[test]
+    fn scan_after_termination_no_longer_reports_the_killed_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = ProcessTable::new();
+        let mut child = spawn_child_in(dir.path());
+        let pid = child.id() as i32;
+
+        // Precondition: the child is visible, so the post-kill assertions
+        // below are not vacuously true.
+        assert!(
+            table
+                .find_in_worktree(dir.path())
+                .unwrap()
+                .iter()
+                .any(|p| p.pid == pid),
+            "precondition: child visible before termination"
+        );
+
+        // Terminate exactly as destroy does (SIGTERM -> grace -> SIGKILL),
+        // then re-scan. Without a refresh the killed pid is read back out of
+        // the frozen snapshot.
+        kill_child(&mut child);
+        let survivors = table
+            .find_in_worktree(dir.path())
+            .expect("survivor re-scan must not error");
+        assert!(
+            !survivors.iter().any(|p| p.pid == pid),
+            "the terminated process (pid {pid}) must not survive a live re-scan; \
+             survivors reported: {survivors:?}"
         );
     }
 }

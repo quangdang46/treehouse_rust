@@ -7,11 +7,89 @@
 //! Binary discovery: `GIT_BIN` env override → `PATH` → Windows
 //! `Program Files\Git\bin\git.exe`.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use super::{GitBackend, GitError, GitErrorKind, GitRepo};
+
+/// One git argument that may carry a caller-supplied path.
+///
+/// `Command` accepts an `OsStr` on every platform, so a path can reach git
+/// byte-for-byte. Routing it through `Path::to_str()` first does not: that
+/// returns `None` for any path that is not valid UTF-8, and the tempting
+/// `unwrap_or("")` then hands git an EMPTY argument, which git resolves
+/// against its own cwd — a different directory than the caller named, on the
+/// exact subcommands (`worktree remove --force`) that delete one.
+enum Arg<'a> {
+    Lit(&'a str),
+    Path(&'a Path),
+}
+
+impl Arg<'_> {
+    fn to_os_string(&self) -> OsString {
+        match self {
+            Self::Lit(s) => OsString::from(s),
+            Self::Path(p) => p.as_os_str().to_os_string(),
+        }
+    }
+}
+
+/// Fail-closed precondition for every operation that REWRITES a worktree's
+/// checkout (reset, detach).
+///
+/// Go wraps all five destructive entry points in `destructiveBackendForWorktree`
+/// (`internal/vcs/vcs.go:513-525`, added in c88b53e / v2.3.0) for exactly this
+/// reason: it refuses a markerless path rather than falling back to the
+/// configured backend, because in an in-project pool — a supported layout,
+/// since a relative pool `root` nests `.treehouse` under the repo — that
+/// fallback resolves to the repository ENCLOSING the pool. `reset --hard`
+/// followed by `clean -fd` then discards the user's real uncommitted work in
+/// their real working tree.
+///
+/// The marker is checked with `symlink_metadata` (lstat) rather than
+/// `metadata` (stat), mirroring Go's `markerPresent`: a dangling symlink IS an
+/// entry that is present on disk, and its unresolvable target is a read
+/// failure for the caller to surface — not an absent marker. It is then
+/// followed once with `metadata` so a dangling link fails HERE, loudly, instead
+/// of surfacing three destructive git commands later. Both file and directory
+/// `.git` entries are accepted: a linked worktree has a `gitdir:` file, a
+/// primary checkout has a directory, and both are legitimately the thing the
+/// caller asked us to reset.
+///
+/// jj is not a backend in this port, so only the `.git` marker is consulted
+/// (Go's `slotMarkerBackend` accepts a `.jj` directory as the alternative).
+fn require_worktree_marker(worktree: &Path) -> Result<(), GitError> {
+    let marker = worktree.join(".git");
+    let present = match std::fs::symlink_metadata(&marker) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            return Err(GitError::new(
+                "lstat .git marker",
+                format!("reading .git marker in {}: {e}", worktree.display()),
+                GitErrorKind::Other,
+            ));
+        }
+    };
+    if !present {
+        return Err(GitError::new(
+            "lstat .git marker",
+            format!(
+                "refusing to modify {}: it holds no .git marker",
+                worktree.display()
+            ),
+            GitErrorKind::Other,
+        ));
+    }
+    std::fs::metadata(&marker).map(|_| ()).map_err(|e| {
+        GitError::new(
+            "stat .git marker",
+            format!("resolving .git marker in {}: {e}", worktree.display()),
+            GitErrorKind::Other,
+        )
+    })
+}
 
 /// Runs git by spawning the binary directly (no shell).
 #[derive(Debug, Clone)]
@@ -44,6 +122,11 @@ impl ShellGitBackend {
 
     /// Runs `git <args>` in `cwd`, returning the `Output` (no exit-code check).
     fn run(&self, cwd: Option<&Path>, args: &[&str]) -> Output {
+        self.run_os(cwd, args.iter().map(|s| OsString::from(*s)).collect())
+    }
+
+    /// The spawn itself, with arguments already converted to the OS form.
+    fn run_os(&self, cwd: Option<&Path>, args: Vec<OsString>) -> Output {
         let mut cmd = Command::new(&self.git_bin);
         cmd.args(args);
         if let Some(dir) = cwd {
@@ -70,12 +153,27 @@ impl ShellGitBackend {
         kind: GitErrorKind,
     ) -> Result<(), GitError> {
         let output = self.run(cwd, args);
-        if output.status.success() {
-            return Ok(());
-        }
-        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let command = format!("git {}", args.join(" "));
-        Err(GitError::new(command, message, kind))
+        checked(output, format!("git {}", args.join(" ")), kind)
+    }
+
+    /// [`Self::run_checked`] for argument lists that carry a caller-supplied
+    /// path. Only the `worktree` subcommands take one, and they are exactly
+    /// the ones where a degraded path argument reaches a destructive git
+    /// command — hence the separate entry point rather than a generic
+    /// conversion that would touch every call site.
+    fn run_checked_args(
+        &self,
+        cwd: Option<&Path>,
+        args: &[Arg<'_>],
+        kind: GitErrorKind,
+    ) -> Result<(), GitError> {
+        let command = args
+            .iter()
+            .map(|a| a.to_os_string().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let output = self.run_os(cwd, args.iter().map(Arg::to_os_string).collect());
+        checked(output, format!("git {command}"), kind)
     }
 
     /// Runs git and returns trimmed, UTF-8-lossy stdout, failing on nonzero
@@ -110,6 +208,17 @@ impl ShellGitBackend {
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
+}
+
+/// Shared exit-code check: success is `Ok`, anything else is the stderr text
+/// wrapped with the command line that produced it (the `command` half of a
+/// [`GitError`], so operators can see what actually ran).
+fn checked(output: Output, command: String, kind: GitErrorKind) -> Result<(), GitError> {
+    if output.status.success() {
+        return Ok(());
+    }
+    let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(GitError::new(command, message, kind))
 }
 
 /// Finds the git binary: `GIT_BIN` env → `PATH` → Windows Program Files.
@@ -288,33 +397,117 @@ impl GitBackend for ShellGitBackend {
 
     fn worktree_add(&self, repo: &GitRepo, path: &Path, branch: &str) -> Result<(), GitError> {
         let ref_ = self.branch_ref(repo, branch);
-        self.run_checked(
+        self.run_checked_args(
             Some(&repo.common_dir),
             &[
-                "worktree",
-                "add",
-                "--detach",
-                path.to_str().unwrap_or(""),
-                &ref_,
+                Arg::Lit("worktree"),
+                Arg::Lit("add"),
+                Arg::Lit("--detach"),
+                Arg::Path(path),
+                Arg::Lit(&ref_),
             ],
             GitErrorKind::Other,
         )
     }
 
     fn worktree_remove(&self, repo: &GitRepo, path: &Path) -> Result<(), GitError> {
-        self.run_checked(
+        self.run_checked_args(
             Some(&repo.common_dir),
-            &["worktree", "remove", "--force", path.to_str().unwrap_or("")],
+            &[
+                Arg::Lit("worktree"),
+                Arg::Lit("remove"),
+                Arg::Lit("--force"),
+                Arg::Path(path),
+            ],
             GitErrorKind::Other,
         )
     }
 
     fn remove_clean_worktree(&self, repo: &GitRepo, path: &Path) -> Result<(), GitError> {
-        self.run_checked(
+        self.run_checked_args(
             Some(&repo.common_dir),
-            &["worktree", "remove", path.to_str().unwrap_or("")],
+            &[Arg::Lit("worktree"), Arg::Lit("remove"), Arg::Path(path)],
             GitErrorKind::Other,
         )
+    }
+
+    fn create_branch(&self, worktree: &Path, branch: &str) -> Result<(), GitError> {
+        // Marker FIRST, before any dispatch on this path. `git branch` +
+        // `git checkout` are only ever meant for the checkout named by
+        // `worktree`; against a markerless path git walks UP to the enclosing
+        // repository and would create and switch a branch in the user's own
+        // working tree.
+        require_worktree_marker(worktree)?;
+
+        // Create at the worktree's CURRENT commit, verified first. Going
+        // through `rev-parse` means the branch is pinned to a known commit
+        // rather than to whatever HEAD reports between two commands.
+        let expected_head = self.run_stdout(
+            Some(worktree),
+            &["rev-parse", "--verify", "HEAD^{commit}"],
+            GitErrorKind::Other,
+        )?;
+
+        // `--` ends option parsing: a name beginning with `-` is then a branch,
+        // not a flag. Git refuses an existing ref, including one created
+        // concurrently, so this never adopts a caller's branch.
+        self.run_checked_args(
+            Some(worktree),
+            &[
+                Arg::Lit("branch"),
+                Arg::Lit("--"),
+                Arg::Lit(branch),
+                Arg::Lit(&expected_head),
+            ],
+            GitErrorKind::Other,
+        )?;
+
+        let checkout = self.run(Some(worktree), &["checkout", branch]);
+        if !checkout.status.success() {
+            return Err(GitError::new(
+                format!("git checkout {branch}"),
+                String::from_utf8_lossy(&checkout.stderr).trim().to_string(),
+                GitErrorKind::Other,
+            ));
+        }
+
+        // Exit status alone is not authoritative: a post-checkout hook can fail
+        // after checkout, or succeed after switching HEAD somewhere else. Both
+        // the branch NAME and the COMMIT must still match the acquisition.
+        let checked_out = self.run_stdout(
+            Some(worktree),
+            &["symbolic-ref", "-q", "--short", "HEAD"],
+            GitErrorKind::Other,
+        )?;
+        let head = self.run_stdout(
+            Some(worktree),
+            &["rev-parse", "--verify", "HEAD^{commit}"],
+            GitErrorKind::Other,
+        )?;
+        if checked_out != branch || head != expected_head {
+            return Err(GitError::new(
+                format!("git checkout {branch}"),
+                format!(
+                    "checkout did not leave HEAD on {branch:?} at commit {expected_head} \
+                     (on {checked_out:?} at {head})"
+                ),
+                GitErrorKind::Other,
+            ));
+        }
+        Ok(())
+    }
+
+    fn local_branch_exists(&self, repo: &GitRepo, branch: &str) -> bool {
+        let out = self.run(
+            Some(&repo.common_dir),
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ],
+        );
+        out.status.success()
     }
 
     fn is_dirty(&self, worktree: &Path) -> Result<bool, GitError> {
@@ -327,6 +520,12 @@ impl GitBackend for ShellGitBackend {
     }
 
     fn reset_worktree(&self, worktree: &Path, branch: &str) -> Result<(), GitError> {
+        // Precondition FIRST, before anything can resolve the path upward.
+        // `checkout --force` / `reset --hard` / `clean -fd` are only ever meant
+        // for the checkout named by `worktree`; with the marker gone, git
+        // walks up to the enclosing repository and these three commands destroy
+        // the user's real uncommitted work there.
+        require_worktree_marker(worktree)?;
         // Resolve the repo root; fall back to the worktree path.
         let repo_root = self
             .repo_root(worktree)
@@ -351,6 +550,9 @@ impl GitBackend for ShellGitBackend {
     }
 
     fn detach_worktree(&self, worktree: &Path) -> Result<(), GitError> {
+        // Same precondition as `reset_worktree`: `checkout --detach` on a
+        // markerless path detaches the ENCLOSING repository's HEAD.
+        require_worktree_marker(worktree)?;
         self.run_checked(
             Some(worktree),
             &["checkout", "--detach"],
@@ -647,5 +849,148 @@ mod tests {
         let merge_ref = backend.default_branch_merge_ref(&repo_ref).unwrap();
         assert_eq!(merge_ref, "refs/heads/main");
         assert!(backend.is_head_merged_into_ref(&wt, &merge_ref).unwrap());
+    }
+
+    // ---- M-002: fail closed on a pool slot that lost its .git marker ----
+    //
+    // The scenario these reproduce is an IN-PROJECT pool: a supported layout
+    // (config.rs nests `.treehouse` under the repo when `root` is relative),
+    // in which a slot whose `.git` marker was deleted sits INSIDE the user's
+    // real repository. Git then walks up from the slot, resolves against the
+    // enclosing repo, and `reset --hard` + `clean -fd` destroy the user's
+    // uncommitted work there. Go refuses this at vcs.go:513-525.
+
+    /// Creates a pool-slot-shaped directory INSIDE `repo`: a plain directory
+    /// with no `.git` marker at all, exactly what remains after the marker of
+    /// a torn-down worktree is deleted.
+    fn markerless_slot(repo: &Path) -> PathBuf {
+        let slot = repo.join(".treehouse").join("wt-1");
+        std::fs::create_dir_all(&slot).unwrap();
+        slot
+    }
+
+    #[test]
+    fn integration_reset_worktree_refuses_markerless_slot() {
+        let (_dir, repo) = temp_repo();
+        let slot = markerless_slot(&repo);
+        let backend = ShellGitBackend::discover().unwrap();
+
+        // The enclosing repo carries work that MUST survive the refusal.
+        std::fs::write(repo.join("README.md"), b"uncommitted edit\n").unwrap();
+        std::fs::write(repo.join("scratch.txt"), b"untracked\n").unwrap();
+
+        let err = backend
+            .reset_worktree(&slot, "main")
+            .expect_err("reset must refuse a slot with no .git marker");
+        assert!(
+            err.message.contains("refusing to modify"),
+            "error must state the refusal, got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains(&slot.display().to_string()),
+            "error must name the offending path, got: {}",
+            err.message
+        );
+
+        // The real proof: nothing in the ENCLOSING repo was touched.
+        assert_eq!(
+            std::fs::read_to_string(repo.join("README.md")).unwrap(),
+            "uncommitted edit\n",
+            "reset --hard must not have run against the enclosing repo"
+        );
+        assert!(
+            repo.join("scratch.txt").exists(),
+            "clean -fd must not have run against the enclosing repo"
+        );
+    }
+
+    #[test]
+    fn integration_detach_worktree_refuses_markerless_slot() {
+        let (_dir, repo) = temp_repo();
+        let slot = markerless_slot(&repo);
+        let backend = ShellGitBackend::discover().unwrap();
+
+        let branch_before = backend
+            .run_stdout(
+                Some(&repo),
+                &["symbolic-ref", "--short", "HEAD"],
+                GitErrorKind::Other,
+            )
+            .unwrap();
+
+        let err = backend
+            .detach_worktree(&slot)
+            .expect_err("detach must refuse a slot with no .git marker");
+        assert!(
+            err.message.contains("refusing to modify"),
+            "error must state the refusal, got: {}",
+            err.message
+        );
+
+        let branch_after = backend
+            .run_stdout(
+                Some(&repo),
+                &["symbolic-ref", "--short", "HEAD"],
+                GitErrorKind::Other,
+            )
+            .unwrap();
+        assert_eq!(
+            branch_after, branch_before,
+            "checkout --detach must not have run against the enclosing repo"
+        );
+    }
+
+    /// Go `markerPresent` counts a dangling symlink as PRESENT and surfaces
+    /// the unresolvable target as a read failure — never as an absent marker,
+    /// which would let the caller fall through to the enclosing repository.
+    #[test]
+    #[cfg(unix)]
+    fn integration_markerless_check_rejects_dangling_git_symlink() {
+        let (_dir, repo) = temp_repo();
+        let slot = markerless_slot(&repo);
+        std::os::unix::fs::symlink(repo.join(".git").join("does-not-exist"), slot.join(".git"))
+            .unwrap();
+
+        let err = require_worktree_marker(&slot).expect_err("dangling marker must be refused");
+        assert!(
+            err.message.starts_with("resolving .git marker in"),
+            "a dangling symlink is a read failure, not an absent marker; got: {}",
+            err.message
+        );
+    }
+
+    /// The guard must not be so strict that it breaks the real thing: a linked
+    /// worktree's `.git` is a FILE, and that is the normal pool-slot shape.
+    /// (`integration_reset_worktree_cleans_dirty_changes` covers the happy path
+    /// too; this pins the file-vs-directory contract explicitly.)
+    #[test]
+    fn integration_marker_check_accepts_dot_git_file_and_directory() {
+        let (_dir, repo) = temp_repo();
+        let wt = repo.join("wt");
+        must_git(
+            Some(&repo),
+            &["worktree", "add", "--detach", wt.to_str().unwrap(), "main"],
+        );
+
+        let marker = wt.join(".git");
+        assert!(
+            marker.is_file(),
+            "a linked worktree's .git is a file, and the guard must accept it"
+        );
+        require_worktree_marker(&wt).expect("linked worktree must pass the marker check");
+        require_worktree_marker(&repo).expect("primary checkout's .git dir must pass too");
+    }
+
+    #[test]
+    fn integration_marker_check_refuses_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = require_worktree_marker(&dir.path().join("nope"))
+            .expect_err("a path that does not exist has no marker");
+        assert!(
+            err.message.contains("refusing to modify"),
+            "got: {}",
+            err.message
+        );
     }
 }

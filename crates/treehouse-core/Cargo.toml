@@ -20,6 +20,10 @@ owo-colors = { workspace = true }
 rand = { workspace = true }
 humantime = { workspace = true }
 sha2 = { workspace = true }
+# Release-asset extraction for `treehouse update`; see updater.rs.
+flate2 = { workspace = true }
+tar = { workspace = true }
+zip = { workspace = true }
 # The `tru` package (Dicklesworthstone/toon_rust, lib name `toon`) is the TOON
 # encoder, verified + pinned by the toon-verify bead. It is optional (the `toon`
 # feature) so a checkout without network access to toon_rust still compiles.

@@ -94,6 +94,21 @@ pub trait GitBackend: Send + Sync {
     /// dirty worktree is rejected by git).
     fn remove_clean_worktree(&self, repo: &GitRepo, path: &Path) -> Result<(), GitError>;
 
+    /// Creates `branch` at `worktree`'s current HEAD and checks it out (Go
+    /// `vcs.CreateBranch`, the `--branch` / `-b` acquisition flag).
+    ///
+    /// DESTRUCTIVE and fail-closed under the same marker precondition as
+    /// [`Self::reset_worktree`]: `git branch` + `git checkout` against a
+    /// markerless path would create and switch a branch in the repository
+    /// ENCLOSING the pool. Git refuses to create a branch that already exists,
+    /// so this never adopts a caller's ref.
+    fn create_branch(&self, worktree: &Path, branch: &str) -> Result<(), GitError>;
+
+    /// Whether a LOCAL branch named `branch` exists (Go `LocalBranchExists`,
+    /// `git show-ref --verify --quiet refs/heads/<branch>`). Used to refuse
+    /// `--branch` against an existing ref rather than silently adopting it.
+    fn local_branch_exists(&self, repo: &GitRepo, branch: &str) -> bool;
+
     /// Whether the worktree has tracked or untracked changes (Go `IsDirty`):
     /// `git status --porcelain --untracked-files=all` — ANY output is dirty.
     /// The `--untracked-files=all` flag is load-bearing: it forces untracked
@@ -103,9 +118,23 @@ pub trait GitBackend: Send + Sync {
     /// Resets a worktree to `branch` (Go `ResetWorktree`): a single semantic
     /// unit of `checkout --detach --force` then `reset --hard` then
     /// `clean -fd`.
+    ///
+    /// DESTRUCTIVE and fail-closed. Implementations MUST verify that
+    /// `worktree` still carries the marker git wrote when it was created
+    /// (a `.git` entry — file for a linked worktree, directory for a primary
+    /// checkout) and return `Err` before touching anything if it is absent or
+    /// unresolvable. Without the marker, git resolves `worktree` by walking
+    /// UP to whatever repository encloses it; in an in-project pool that is
+    /// the user's own working tree, and `reset --hard` + `clean -fd` there is
+    /// irreversible data loss. Go enforces the same precondition in
+    /// `destructiveBackendForWorktree` (vcs.go:513-525).
     fn reset_worktree(&self, worktree: &Path, branch: &str) -> Result<(), GitError>;
 
     /// Detaches the worktree HEAD (Go `DetachWorktree`).
+    ///
+    /// DESTRUCTIVE and fail-closed under the same marker precondition as
+    /// [`Self::reset_worktree`]: `checkout --detach` against a markerless path
+    /// detaches the ENCLOSING repository's HEAD, not the slot's.
     fn detach_worktree(&self, worktree: &Path) -> Result<(), GitError>;
 
     /// Whether HEAD of `worktree` is an ancestor of `reference` (Go

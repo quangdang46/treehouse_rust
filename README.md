@@ -45,6 +45,26 @@ treehouse is built for coding agents and the orchestrators that spawn them. If y
 | `stderr` | 🌳 human banners, warnings, prompts |
 | `exit 0` | Success (including declined cleanup prompts) |
 | `exit 1` | Error — the message is printed once to `stderr` |
+| `exit 3` | A dirty worktree was left unreturned — **only** when `TREEHOUSE_EXIT_STRICT=1` |
+
+### Exit code 3 (opt-in)
+
+When a worktree has uncommitted changes and you do not pass `--force`, treehouse
+leaves it exactly as it found it. Go v3.0.0 made that case exit `3` instead of
+`0`, as a **breaking change**: a caller reading `exit 0` as "the slot was
+released" was reading a bug.
+
+treehouse keeps `exit 0` as the default so existing scripts do not change
+behaviour, and ships the strict exit code behind an environment variable:
+
+```bash
+TREEHOUSE_EXIT_STRICT=1 treehouse return "$PATH"
+# exit 3 + "worktree not returned ... uncommitted changes were kept"
+```
+
+Turn it on in CI and in any orchestrator that branches on the result. The two
+codes demand different responses: `1` is worth retrying, `3` means the tree stays
+dirty until someone cleans it or passes `--force`.
 
 ```bash
 # 1) Durable lease — path-only on stdout, nothing else
@@ -165,7 +185,9 @@ exit
 | `treehouse get` | Acquire a worktree from the pool |
 | `treehouse get --lease` | Durably lease a worktree without a subshell; print its path |
 | `treehouse enter <name>` | Attach to an existing worktree by name (from `status`), even if in use |
-| `treehouse return [path]` | Release a lease, terminate lingering processes, reset, return to pool |
+| `treehouse return [path\|name]` | Release a lease, terminate lingering processes, reset, return to pool |
+| `treehouse return --all` | Return every worktree this repository holds; slots nobody holds are left alone |
+| `treehouse lease <name>` | Durably lease an existing worktree by name, without touching its contents |
 | `treehouse status` | Show pool status (highlights leased and current worktrees) |
 | `treehouse prune` | Dry-run removal of stale idle worktrees |
 | `treehouse gc` | Reclaim stale, orphaned, and dead-owner worktrees (dry-run default) |
@@ -184,6 +206,8 @@ exit
 | `--lease-holder <label>` | Record who holds the lease (defaults to `$TREEHOUSE_LEASE_HOLDER`) |
 | `--ttl <duration>` | Make the lease expire (e.g. `30m`, `1h30m`, `24h`); requires `--lease` |
 | `--json` | Print `path`, `lease_id`, `lease_holder`, `leased_at` (and `expires_at`) as JSON; requires `--lease` |
+| `--base <branch>` | Cut from this branch instead of the repository default (does **not** create the branch) |
+| `--no-fetch` | Skip the `git fetch origin` that normally runs before acquiring (offline / air-gapped) |
 
 ### `status`
 
@@ -193,11 +217,30 @@ exit
 
 ### `return`
 
+The argument is read as a path first and then as a slot name, so `treehouse return 3`
+does the obvious thing from inside the repo. It defaults to `$TREEHOUSE_DIR`.
+
 | Flag | Description |
 |------|-------------|
 | `--force` | Clean, reset, and return without prompting |
+| `--all` | Return every worktree held for this repository; slots nobody holds are left alone |
 | `--if-lease-id <id>` | Return only if the current lease has this identity (ABA-safe) |
 | `--if-lease-holder <holder>` | Return only if the current lease has this holder |
+
+### `lease`
+
+Durably lease a worktree **by name** without touching its contents — the counterpart
+to `get --lease` for a slot that already exists.
+
+| Flag | Description |
+|------|-------------|
+| `--lease-holder <label>` | Record who holds the lease (defaults to `$TREEHOUSE_LEASE_HOLDER`) |
+| `--json` | Print the lease identity as JSON instead of the bare path |
+
+```bash
+treehouse lease 3 --lease-holder agent-42
+treehouse lease 3 --lease-holder agent-42 --json
+```
 
 ### `prune` / `gc`
 
@@ -222,7 +265,25 @@ exit
 
 | Flag | Description |
 |------|-------------|
-| `--env-path <DIR>` | Custom pool root (overrides `treehouse.toml` root and `~/.treehouse`); available on every command |
+| `--root <DIR>` | Custom pool root; available on every command. Aliased as `--env-path`. |
+| `TREEHOUSE_ROOT` | Same thing, from the environment |
+
+Precedence, highest first:
+
+```
+--root <DIR>  >  TREEHOUSE_ROOT  >  treehouse.toml `root`  >  ~/.treehouse
+```
+
+> **`--root` and `--env-path` are the same flag**, and the directory you name is
+> the **parent** of the pool, not the pool itself — Go's `--root` semantics. So
+> `treehouse --root /tmp/pools get` puts the worktree in
+> `/tmp/pools/.treehouse/<repo>-<hash>/`, not in `/tmp/pools/`. Use an absolute
+> path; a relative one (including `.`) resolves from the repository root, which
+> is how an in-project pool at `<repo>/.treehouse` is configured.
+>
+> This is a behaviour change from v0.1.2 and earlier, where `--env-path` was a
+> silent no-op that always fell back to `~/.treehouse`. If you were relying on
+> the old flag, it now works — and the pool it selects is the one above.
 
 ### `doctor`
 
@@ -241,7 +302,7 @@ Sweeps every pool under `~/.treehouse` — designed to run from your OS schedule
 | `--interval <dur>` | Sweep interval for the foreground loop (e.g. `30s`, `5m`, `1h`). Default: `60s`. Ignored when `--once` is set |
 | `--yes` | Execute instead of dry-run |
 | `--prune-orphans` | Include backing-repository-missing orphans |
-| `--env-path <DIR>` | Custom pool root (overrides `treehouse.toml` root and `~/.treehouse`) |
+| `--root <DIR>` | Custom pool root (see [Global flag](#global-flag)); aliased as `--env-path` |
 
 ```bash
 # One-shot — ideal for cron / systemd timer

@@ -45,7 +45,7 @@ impl StatusJson {
             leased_at: if ws.leased_at == ZERO_TIME {
                 None
             } else {
-                Some(ws.leased_at.to_rfc3339())
+                Some(rfc3339(ws.leased_at))
             },
             processes: ws
                 .processes
@@ -153,18 +153,12 @@ pub struct PruneResultJson {
 }
 
 impl PruneResultJson {
-    pub fn from_result(
-        r: &PruneResult,
-        dry_run: bool,
-        orphans_included: bool,
-        global: bool,
-        pool_count: u32,
-    ) -> Self {
+    pub fn from_result(r: &PruneResult, scope: SweepScope) -> Self {
         PruneResultJson {
-            dry_run,
-            orphans_included,
-            global,
-            pool_count,
+            dry_run: r.dry_run,
+            orphans_included: scope.orphans_included,
+            global: scope.global,
+            pool_count: scope.pool_count,
             candidates: r.candidates.len() as u32,
             pruned: r.pruned.len() as u32,
             skipped: r.skipped.len() as u32,
@@ -175,6 +169,55 @@ impl PruneResultJson {
     }
 }
 
+/// The result of a `gc` command (NEW schema).
+///
+/// Same shape as [`PruneResultJson`] — counts, not per-item records — so an
+/// agent parsing `--format json` from either command handles one vocabulary.
+/// The per-slot detail a human needs is in the human format; a caller that
+/// wants names re-reads them from `status`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct GcResultJson {
+    pub dry_run: bool,
+    pub orphans_included: bool,
+    pub global: bool,
+    pub pool_count: u32,
+    pub candidates: u32,
+    pub reclaimed: u32,
+    pub skipped: u32,
+    /// Worktrees whose physical cleanup failed (state retained for retry).
+    pub errors: u32,
+    pub reclaimable_bytes: u64,
+    pub freed_bytes: u64,
+}
+
+impl GcResultJson {
+    pub fn from_result(r: &crate::gc::GcResult, scope: SweepScope) -> Self {
+        GcResultJson {
+            dry_run: r.dry_run,
+            orphans_included: scope.orphans_included,
+            global: scope.global,
+            pool_count: scope.pool_count,
+            candidates: r.candidates.len() as u32,
+            reclaimed: r.reclaimed.len() as u32,
+            skipped: r.skipped.len() as u32,
+            errors: r.errors.len() as u32,
+            reclaimable_bytes: r.reclaimable_bytes,
+            freed_bytes: r.freed_bytes,
+        }
+    }
+}
+
+/// How many pools a sweep covered, and whether it was global. Threaded through
+/// the result so `--format json` on `prune --all` / `gc --all` says so instead
+/// of reporting a single anonymous pool.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SweepScope {
+    pub global: bool,
+    pub pool_count: u32,
+    pub orphans_included: bool,
+}
+
 /// The one structured result per command. `payload()` returns `None` for
 /// interactive get/enter so a stray stdout write never corrupts the subshell.
 #[derive(Debug, Clone)]
@@ -183,8 +226,9 @@ pub enum CommandResult {
     Enter,
     Return(ReturnResult),
     Status(Vec<crate::pool::WorktreeStatus>),
-    Prune(PruneResult),
+    Prune(PruneResult, SweepScope),
     Destroy(DestroyResult),
+    Gc(crate::gc::GcResult, SweepScope),
 }
 
 /// The result of a `get` command.
@@ -210,17 +254,26 @@ impl CommandResult {
                 let arr: Vec<StatusJson> = statuses.iter().map(StatusJson::from_ws).collect();
                 Some(serde_json::to_value(arr).unwrap_or(serde_json::Value::Null))
             }
-            CommandResult::Prune(r) => {
-                serde_json::to_value(PruneResultJson::from_result(r, false, false, false, 1)).ok()
+            CommandResult::Prune(r, scope) => {
+                serde_json::to_value(PruneResultJson::from_result(r, *scope)).ok()
             }
             CommandResult::Destroy(r) => {
                 serde_json::to_value(DestroyResultJson::from_result(r)).ok()
+            }
+            CommandResult::Gc(r, scope) => {
+                serde_json::to_value(GcResultJson::from_result(r, *scope)).ok()
             }
         }
     }
 }
 
-/// A lease result timestamp helper (Go uses RFC3339Nano; chrono emits it).
+/// Renders a lease timestamp for machine-readable output.
+///
+/// The JSON payloads are a wire contract that scripts parse, so the rendering
+/// lives here rather than being open-coded at each call site: Go emits
+/// RFC3339Nano while chrono emits second-precision by default, and when the
+/// two are reconciled this is the single place that has to change. An inline
+/// `to_rfc3339()` at the call site would hide that.
 pub fn rfc3339(dt: DateTime<Utc>) -> String {
     dt.to_rfc3339()
 }

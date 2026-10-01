@@ -187,6 +187,7 @@ mod tests {
                 leased_at: now(),
                 ..WorktreeEntry::default()
             }],
+            ..Default::default()
         };
         // Even with zero matching processes, heal must not clear the lease.
         heal_state(&mut state, |_| None);
