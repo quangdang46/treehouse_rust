@@ -101,8 +101,7 @@ impl ShellGitBackend {
     /// Discovers and constructs the backend.
     pub fn discover() -> Result<Self, GitError> {
         let bin = find_git_binary().ok_or_else(|| {
-            GitError::new(
-                "git",
+            GitError::program(
                 "git binary not found on PATH (set GIT_BIN)",
                 GitErrorKind::NotFound,
             )
@@ -128,6 +127,13 @@ impl ShellGitBackend {
     /// The spawn itself, with arguments already converted to the OS form.
     fn run_os(&self, cwd: Option<&Path>, args: Vec<OsString>) -> Output {
         let mut cmd = Command::new(&self.git_bin);
+        // `-c submodule.recurse=false` (upstream #177): the pooled operations
+        // must not walk into submodules just because the operator's global
+        // git config asks them to. `fetch` keeps the operator's preference.
+        let first = args.first().and_then(|a| a.to_str()).unwrap_or_default();
+        if first.trim() != "fetch" {
+            cmd.args(crate::git::GIT_CONFIG_OVERRIDES);
+        }
         cmd.args(args);
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
@@ -153,7 +159,7 @@ impl ShellGitBackend {
         kind: GitErrorKind,
     ) -> Result<(), GitError> {
         let output = self.run(cwd, args);
-        checked(output, format!("git {}", args.join(" ")), kind)
+        checked(output, crate::vcs::git_label(args), kind)
     }
 
     /// [`Self::run_checked`] for argument lists that carry a caller-supplied
@@ -173,7 +179,7 @@ impl ShellGitBackend {
             .collect::<Vec<_>>()
             .join(" ");
         let output = self.run_os(cwd, args.iter().map(Arg::to_os_string).collect());
-        checked(output, format!("git {command}"), kind)
+        checked(output, command, kind)
     }
 
     /// Runs git and returns trimmed, UTF-8-lossy stdout, failing on nonzero
@@ -187,7 +193,7 @@ impl ShellGitBackend {
         let output = self.run(cwd, args);
         if !output.status.success() {
             let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let command = format!("git {}", args.join(" "));
+            let command = crate::vcs::git_label(args);
             return Err(GitError::new(command, message, kind));
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -203,7 +209,7 @@ impl ShellGitBackend {
         let output = self.run(cwd, args);
         if !output.status.success() {
             let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let command = format!("git {}", args.join(" "));
+            let command = crate::vcs::git_label(args);
             return Err(GitError::new(command, message, kind));
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -233,11 +239,7 @@ impl ShellGitBackend {
         let output = self.run_os(cwd, args);
         if !output.status.success() {
             let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Err(GitError::new(
-                format!("git {command}"),
-                message,
-                GitErrorKind::Other,
-            ));
+            return Err(GitError::new(command, message, GitErrorKind::Other));
         }
         Ok(output.stdout)
     }
@@ -343,12 +345,13 @@ fn repo_root_from(start: &Path, git_bin: &Path) -> Result<PathBuf, GitError> {
 /// One-shot git run helper for the free functions above.
 fn run_one(git_bin: &Path, cwd: Option<&Path>, args: &[&str]) -> Result<String, GitError> {
     let output = Command::new(git_bin)
+        .args(crate::git::config_overrides(args))
         .args(args)
         .current_dir(cwd.unwrap_or(Path::new(".")))
         .output()
         .map_err(|e| {
             GitError::new(
-                format!("git {}", args.join(" ")),
+                crate::vcs::git_label(args),
                 e.to_string(),
                 GitErrorKind::Other,
             )
@@ -356,7 +359,7 @@ fn run_one(git_bin: &Path, cwd: Option<&Path>, args: &[&str]) -> Result<String, 
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(GitError::new(
-            format!("git {}", args.join(" ")),
+            crate::vcs::git_label(args),
             message,
             GitErrorKind::Other,
         ));
@@ -402,7 +405,7 @@ impl ShellGitBackend {
         )?;
         if kind.trim() != "blob" {
             return Err(GitError::new(
-                format!("git cat-file -t {spec}"),
+                format!("cat-file -t {spec}"),
                 format!("committed {WORKTREE_INCLUDE} is not a file"),
                 GitErrorKind::Other,
             ));
@@ -435,14 +438,14 @@ impl ShellGitBackend {
         // predictable path, so it is removed on every path out.
         let exclude = tempfile::NamedTempFile::new().map_err(|e| {
             GitError::new(
-                "git ls-files --exclude-from",
+                "ls-files --exclude-from",
                 format!("creating temporary exclude file: {e}"),
                 GitErrorKind::Other,
             )
         })?;
         std::fs::write(exclude.path(), manifest).map_err(|e| {
             GitError::new(
-                "git ls-files --exclude-from",
+                "ls-files --exclude-from",
                 format!("writing temporary exclude file: {e}"),
                 GitErrorKind::Other,
             )
@@ -614,7 +617,7 @@ impl GitBackend for ShellGitBackend {
             return Ok(out);
         }
         Err(GitError::new(
-            "git symbolic-ref HEAD",
+            "symbolic-ref HEAD",
             "cannot determine default branch: try running 'git fetch' or ensure you are on a branch",
             GitErrorKind::DefaultBranchUnresolvable,
         ))
@@ -647,7 +650,7 @@ impl GitBackend for ShellGitBackend {
         }
         let message = String::from_utf8_lossy(&out.stderr).trim().to_string();
         Err(GitError::new(
-            "git fetch origin",
+            "fetch origin",
             message,
             GitErrorKind::OriginUnreachable,
         ))
@@ -723,7 +726,7 @@ impl GitBackend for ShellGitBackend {
         let checkout = self.run(Some(worktree), &["checkout", branch]);
         if !checkout.status.success() {
             return Err(GitError::new(
-                format!("git checkout {branch}"),
+                format!("checkout {branch}"),
                 String::from_utf8_lossy(&checkout.stderr).trim().to_string(),
                 GitErrorKind::Other,
             ));
@@ -744,7 +747,7 @@ impl GitBackend for ShellGitBackend {
         )?;
         if checked_out != branch || head != expected_head {
             return Err(GitError::new(
-                format!("git checkout {branch}"),
+                format!("checkout {branch}"),
                 format!(
                     "checkout did not leave HEAD on {branch:?} at commit {expected_head} \
                      (on {checked_out:?} at {head})"
@@ -833,7 +836,7 @@ impl GitBackend for ShellGitBackend {
         }
         let message = String::from_utf8_lossy(&out.stderr).trim().to_string();
         Err(GitError::new(
-            format!("git merge-base --is-ancestor HEAD {reference}"),
+            format!("merge-base --is-ancestor HEAD {reference}"),
             message,
             GitErrorKind::StatusFailed,
         ))
@@ -849,7 +852,7 @@ impl GitBackend for ShellGitBackend {
             if !out.status.success() {
                 let message = String::from_utf8_lossy(&out.stderr).trim().to_string();
                 return Err(GitError::new(
-                    "git ls-remote --symref origin HEAD",
+                    "ls-remote --symref origin HEAD",
                     message,
                     GitErrorKind::OriginUnreachable,
                 ));
@@ -867,14 +870,14 @@ impl GitBackend for ShellGitBackend {
             }
             let branch = branch.ok_or_else(|| {
                 GitError::new(
-                    "git ls-remote --symref",
+                    "ls-remote --symref",
                     "cannot determine origin default branch",
                     GitErrorKind::MergeRefUnresolvable,
                 )
             })?;
             let sha = sha.ok_or_else(|| {
                 GitError::new(
-                    "git ls-remote --symref",
+                    "ls-remote --symref",
                     "cannot determine origin default branch commit",
                     GitErrorKind::MergeRefUnresolvable,
                 )
@@ -884,7 +887,7 @@ impl GitBackend for ShellGitBackend {
             let local_sha = self.ref_commit(&repo.common_dir, &ref_)?;
             if local_sha != sha {
                 return Err(GitError::new(
-                    "git rev-parse",
+                    "rev-parse",
                     format!("{ref_} is stale: expected {sha}, got {local_sha}"),
                     GitErrorKind::MergeRefUnresolvable,
                 ));
@@ -1224,6 +1227,130 @@ mod tests {
         must_git(Some(&repo), &["add", "."]);
         must_git(Some(&repo), &["commit", "-m", "initial"]);
         (dir, repo)
+    }
+
+    /// A git failure names the program exactly ONCE.
+    ///
+    /// Regression: `GitError`'s Display spells the program itself, so a
+    /// caller that also spells it into `command` renders `git git
+    /// rev-parse --show-toplevel: …`. The label helper is what keeps that
+    /// from happening; this asserts the real backend's output, not the
+    /// helper's string.
+    #[test]
+    fn a_real_git_failure_names_the_program_once() {
+        let dir = tempfile::tempdir().unwrap();
+        // A `.git` FILE satisfies the "is this a repository" marker and then
+        // fails every git command — the same shape as a damaged checkout.
+        std::fs::write(dir.path().join(".git"), "gitdir: /gone\n").unwrap();
+        let backend = ShellGitBackend::discover().unwrap();
+        let err = backend
+            .repo_root(dir.path())
+            .expect_err("a damaged checkout cannot resolve a repo root");
+        let rendered = err.to_string();
+        assert!(
+            !rendered.starts_with("git git "),
+            "the program is named twice: {rendered}"
+        );
+        assert!(
+            rendered.starts_with("git ") && rendered.contains("rev-parse --show-toplevel"),
+            "unexpected label: {rendered}"
+        );
+    }
+
+    /// The pooled git runners pin `submodule.recurse=false`.
+    ///
+    /// An operator whose global git config sets `submodule.recurse = true`
+    /// otherwise makes `worktree add`, `reset` and `checkout` walk into
+    /// submodules, where they fail on a linked worktree whose submodule
+    /// gitdir points into the main repository's metadata (upstream #177).
+    #[test]
+    fn the_git_runners_pin_submodule_recurse_off() {
+        assert_eq!(
+            crate::git::config_overrides(&["worktree", "add"]),
+            vec!["-c", "submodule.recurse=false"],
+            "a pooled operation must pin submodule recursion off"
+        );
+        assert_eq!(
+            crate::git::config_overrides(&["reset", "--hard", "HEAD"]),
+            vec!["-c", "submodule.recurse=false"]
+        );
+        // Fetch keeps the operator's preference: a repository that wants its
+        // submodules fetched should keep getting them.
+        assert!(
+            crate::git::config_overrides(&["fetch", "origin"]).is_empty(),
+            "fetch must not pin submodule recursion"
+        );
+    }
+
+    /// The pin actually reaches git: a submodule checkout in a linked
+    /// worktree fails without it and succeeds with it.
+    #[test]
+    fn a_submodule_worktree_resets_with_the_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let sub = base.join("sub");
+        let repo = base.join("repo");
+        must_git(
+            None,
+            &["init", "--initial-branch=main", sub.to_str().unwrap()],
+        );
+        must_git(Some(&sub), &["config", "user.email", "test@test.com"]);
+        must_git(Some(&sub), &["config", "user.name", "Test"]);
+        std::fs::write(sub.join("f.txt"), b"submodule\n").unwrap();
+        must_git(Some(&sub), &["add", "f.txt"]);
+        must_git(Some(&sub), &["commit", "-m", "submodule content"]);
+
+        must_git(
+            None,
+            &["init", "--initial-branch=main", repo.to_str().unwrap()],
+        );
+        must_git(Some(&repo), &["config", "user.email", "test@test.com"]);
+        must_git(Some(&repo), &["config", "user.name", "Test"]);
+        must_git(
+            Some(&repo),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                sub.to_str().unwrap(),
+                "vendor/libfoo",
+            ],
+        );
+        must_git(Some(&repo), &["commit", "-m", "add submodule"]);
+
+        // A global config that turns submodule recursion ON — the condition
+        // the pin exists to neutralise.
+        let gitconfig = base.join("gitconfig");
+        std::fs::write(&gitconfig, b"[submodule]\n\trecurse = true\n").unwrap();
+
+        let backend = ShellGitBackend::discover().unwrap();
+        let wt = base.join("wt");
+        backend
+            .worktree_add(
+                &GitRepo {
+                    common_dir: repo.clone(),
+                    worktree: None,
+                },
+                &wt,
+                "main",
+            )
+            .expect("the pinned worktree add must succeed");
+
+        // The reset the pool performs on release. Without the pin this is
+        // where git fails: "fatal: could not reset submodule index".
+        let out = Command::new(&backend.git_bin)
+            .args(crate::git::GIT_CONFIG_OVERRIDES)
+            .args(["reset", "--hard", "HEAD"])
+            .current_dir(&wt)
+            .output()
+            .expect("git must run");
+        assert!(
+            out.status.success(),
+            "reset failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = gitconfig;
     }
 
     #[test]

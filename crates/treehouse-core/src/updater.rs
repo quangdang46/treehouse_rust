@@ -155,6 +155,60 @@ pub fn check_latest(github_api_url: &str, enforce_https: bool) -> Option<String>
     v.get("tag_name")?.as_str().map(|s| s.to_string())
 }
 
+/// The Nix store root. A variable so a test can point it elsewhere.
+const NIX_STORE_DIR: &str = "/nix/store";
+
+/// Whether `path` lies inside the Nix store, after symlink resolution.
+///
+/// A path that cannot be resolved is judged as given: an unreadable path is
+/// not evidence that it is outside the store.
+pub fn in_nix_store(path: &Path) -> bool {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let Ok(rel) = resolved.strip_prefix(NIX_STORE_DIR) else {
+        return false;
+    };
+    // The store root itself is not "inside" the store — a binary at
+    // /nix/store exactly is not a store package.
+    !rel.as_os_str().is_empty()
+}
+
+/// Whether the running executable lives in the Nix store.
+///
+/// A Nix-installed treehouse is upgraded through Nix, not through
+/// `treehouse update`: the store is content-addressed and read-only, so
+/// replacing the binary in place is both impossible and wrong. The updater
+/// refuses such an install, and the update notice is silenced so the user is
+/// not told to run a command that cannot work (upstream #180).
+pub fn running_from_nix_store() -> bool {
+    std::env::current_exe()
+        .map(|exe| in_nix_store(&exe))
+        .unwrap_or(false)
+}
+
+/// The latest release this platform can actually install, if any.
+/// A release that ships no archive for this OS/arch is NOT an update: it
+/// cannot be downloaded, so advertising it produces a notice that says "a new
+/// version is available" and a `treehouse update` that can never succeed —
+/// a nag the user has no way to clear. This resolves the release's assets
+/// before answering, so the version it names is one the updater can act on.
+///
+/// `None` means: no newer release, or a newer release this platform cannot
+/// install. Both mean "do not tell the user to update".
+pub fn check_installable(
+    github_api_url: &str,
+    current_version: &str,
+    enforce_https: bool,
+) -> Option<String> {
+    let result = check_latest_result(github_api_url, current_version, enforce_https).ok()?;
+    if !result.update_available {
+        return None;
+    }
+    // A release with no archive for this platform cannot be installed, so it
+    // is not an update this build can offer.
+    result.download_url.as_ref()?;
+    Some(result.latest_version)
+}
+
 /// Writes the update-check cache.
 pub fn write_cache(latest: &str) {
     let cache = UpdateCheckCache {
@@ -1893,6 +1947,85 @@ mod tests {
     fn check_latest_result_rejects_plain_http() {
         let err = check_latest_result("http://insecure.example", "1.0.0", true).unwrap_err();
         assert!(matches!(err, UpdateError::InsecureUrl(_)), "got {err:?}");
+    }
+
+    /// A release with no archive for this platform is not an update.
+    ///
+    /// Regression: the update notice used to name ANY release the API
+    /// returned, including one that ships no archive for this OS/arch. The
+    /// notice then advertised a version `treehouse update` could never
+    /// install, and no amount of retrying would clear it — a permanent nag
+    /// with no fix available to the user.
+    #[test]
+    fn check_installable_refuses_a_release_with_no_asset_for_this_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        // A release that ships ONLY another platform's archive.
+        let body = r#"{"tag_name":"v9.9.9","assets":[
+             {"name":"treehouse-v9.9.9-plan9-ia64.tar.gz","browser_download_url":"file:///dev/null"}]}"#;
+        let api = dir.path().join("latest.json");
+        std::fs::write(&api, body).unwrap();
+
+        let result = check_latest_result(&file_url(&api), "0.0.1", false)
+            .expect("the release fixture must resolve");
+        assert!(
+            result.update_available,
+            "the release IS newer; it just cannot be installed here"
+        );
+        assert!(
+            result.download_url.is_none(),
+            "the fixture must not match this platform"
+        );
+
+        assert_eq!(
+            check_installable(&file_url(&api), "0.0.1", false),
+            None,
+            "a release with no archive for this platform must not be advertised"
+        );
+    }
+
+    /// A release that DOES ship an archive for this platform is advertised.
+    #[test]
+    fn check_installable_names_a_release_this_platform_can_install() {
+        let suffix = os_arch_suffix();
+        let asset = format!("treehouse-v9.9.9-{suffix}.{}", archive_ext());
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            r#"{{"tag_name":"v9.9.9","assets":[
+             {{"name":"{asset}","browser_download_url":"file:///dev/null"}}]}}"#
+        );
+        let api = dir.path().join("latest.json");
+        std::fs::write(&api, body).unwrap();
+
+        assert!(
+            matches_current_platform_asset(&asset),
+            "the fixture must name this platform: {asset}"
+        );
+        assert_eq!(
+            check_installable(&file_url(&api), "0.0.1", false).as_deref(),
+            Some("v9.9.9"),
+            "an installable newer release must be advertised"
+        );
+    }
+
+    /// A path inside the Nix store is recognised, and the store root itself is
+    /// not "inside" the store.
+    #[test]
+    fn the_nix_store_is_recognised() {
+        // The store root itself: /nix/store is the store, not a package in it.
+        assert!(
+            !in_nix_store(Path::new("/nix/store")),
+            "the store root is not a package inside the store"
+        );
+        // A path that cannot be resolved is judged as given, so a readable
+        // child of the store is inside it.
+        assert!(
+            in_nix_store(Path::new("/nix/store/abc123-treehouse-3.1.2/bin/treehouse")),
+            "a store package path must be recognised"
+        );
+        assert!(
+            !in_nix_store(Path::new("/usr/local/bin/treehouse")),
+            "an ordinary install is not in the store"
+        );
     }
 }
 

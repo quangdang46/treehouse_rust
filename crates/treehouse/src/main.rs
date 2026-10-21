@@ -105,8 +105,13 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 2 && args[1] == "--update-check" {
         let version = args.get(2).cloned().unwrap_or_default();
-        if let Some(latest) = treehouse_core::updater::check_latest(
+        // Only a version this platform can INSTALL is cached. Caching a
+        // release with no archive for this OS/arch would advertise an update
+        // that `treehouse update` can never apply — a notice the user can do
+        // nothing about.
+        if let Some(latest) = treehouse_core::updater::check_installable(
             treehouse_core::updater::DEFAULT_GITHUB_API_URL,
+            treehouse_core::VERSION,
             true,
         ) {
             treehouse_core::updater::write_cache(&latest);
@@ -117,10 +122,15 @@ fn main() {
     }
 
     let cli = Cli::parse();
+    // A Nix-installed treehouse is upgraded through Nix. `treehouse update`
+    // cannot replace a binary in the content-addressed store, so the notice
+    // would send the user to a command that cannot work (upstream #180).
+    let nix_install = treehouse_core::updater::running_from_nix_store();
     // PersistentPreRun-equivalent: show a cached update notice (not for update
-    // itself, dev builds, or when suppressed).
+    // itself, dev builds, Nix installs, or when suppressed).
     if treehouse_core::VERSION != "dev"
         && std::env::var("TREEHOUSE_NO_UPDATE_CHECK").as_deref() != Ok("1")
+        && !nix_install
         && !matches!(cli.command, Some(Command::Update))
         && treehouse_core::updater::update_available(treehouse_core::VERSION)
         && let Some(cache) = treehouse_core::updater::read_cache()
@@ -166,6 +176,7 @@ fn main() {
 fn should_spawn_update_check(cli: &Cli) -> bool {
     treehouse_core::VERSION != "dev"
         && std::env::var("TREEHOUSE_NO_UPDATE_CHECK").as_deref() != Ok("1")
+        && !treehouse_core::updater::running_from_nix_store()
         && !matches!(cli.command, Some(Command::Update))
         && treehouse_core::updater::is_cache_stale(treehouse_core::VERSION)
 }
@@ -396,13 +407,21 @@ fn cmd_get(cli: &Cli, args: &cli::GetArgs) -> Result<()> {
     let path = acquired.path.clone();
     eprintln!(
         "🌳 Entered worktree at {}. Type 'exit' to return.",
-        path.display()
+        treehouse_core::config::pretty_path(Path::new(&path))
     );
 
     unsafe {
         std::env::set_var("TREEHOUSE_DIR", &path);
     }
-    let status = spawn_shell(&path);
+    let status = spawn_shell(&path).unwrap_or_else(|e| {
+        // The shell could not be started at all. Go ignores the spawn error
+        // here too (cmd/get.go:181) and returns the worktree either way, so
+        // the slot is not stranded — but the failure is reported, because a
+        // caller that asked for a subshell and silently got none has no way
+        // to tell that from a shell that exited immediately.
+        eprintln!("🌳 Could not start a shell in {}: {e}", path.display());
+        0
+    });
     unsafe {
         std::env::remove_var("TREEHOUSE_DIR");
     }
@@ -469,9 +488,20 @@ fn cmd_enter(cli: &Cli, args: &cli::EnterArgs) -> Result<()> {
     let statuses = pool.status()?;
     let found = statuses.iter().find(|s| s.name == args.name);
     let Some(found) = found else {
+        // Name the slots that DO exist. "the pool is empty" is only true when
+        // there are none; saying it about a pool with three slots in it sends
+        // the caller off to create a fourth instead of correcting the name.
+        let names: Vec<&str> = statuses.iter().map(|s| s.name.as_str()).collect();
+        if names.is_empty() {
+            return Err(anyhow!(
+                "no worktree named \"{}\": the pool is empty. Run 'treehouse get' to create one",
+                args.name
+            ));
+        }
         return Err(anyhow!(
-            "no worktree named \"{}\": the pool is empty. Run 'treehouse get' to create one",
-            args.name
+            "no worktree named \"{}\" in pool (available: {}). Run 'treehouse status' for details",
+            args.name,
+            names.join(", ")
         ));
     };
     let path = Path::new(&found.path).to_path_buf();
@@ -481,14 +511,28 @@ fn cmd_enter(cli: &Cli, args: &cli::EnterArgs) -> Result<()> {
         return Ok(());
     }
 
+    // The banner names the slot as well as the path: `enter` is how a caller
+    // attaches to a worktree someone else is using, and the slot name is what
+    // `treehouse status` shows — without it the caller has a path and no way
+    // to tell which entry of the pool they are in.
+    eprintln!(
+        "🌳 Entered worktree {} at {}. Type 'exit' to leave.",
+        found.name,
+        treehouse_core::config::pretty_path(&path)
+    );
+
     unsafe {
         std::env::set_var("TREEHOUSE_DIR", &path);
     }
-    let _ = spawn_shell(&path);
+    let spawned = spawn_shell(&path);
     unsafe {
         std::env::remove_var("TREEHOUSE_DIR");
     }
-    eprintln!("Pool state unchanged.");
+    // A shell that could not be spawned is a failure, not a quiet no-op: the
+    // caller asked to be dropped into a worktree and was not. `enter` touches
+    // no pool state either way, so there is nothing to roll back.
+    spawned?;
+    eprintln!("🌳 Left worktree. Pool state unchanged.");
     Ok(())
 }
 
@@ -1160,7 +1204,7 @@ fn cmd_prune_all(cli: &Cli, args: &cli::PruneArgs) -> Result<()> {
         };
     // Per-pool error isolation: a pool-level failure is recorded as a
     // CleanupError in the result so the remaining pools are still swept.
-    treehouse_core::discovery::sweep_pools(&user, ctx_factory, |pool| {
+    let per_pool = |pool: &treehouse_core::pool::Pool| {
         let pool_dir = pool.pool_dir().to_path_buf();
         match pool.prune(&opts) {
             Ok(result) => {
@@ -1183,10 +1227,22 @@ fn cmd_prune_all(cli: &Cli, args: &cli::PruneArgs) -> Result<()> {
             }
         }
         Ok(())
-    })?;
+    };
+    // `--root` (and `TREEHOUSE_ROOT`) name the tree to sweep, the same way
+    // they do for the GC sweep; without either, the user-level root is swept.
+    let root = sweep_root(cli)?;
+    let pool_count = match root {
+        Some(dir) => {
+            treehouse_core::discovery::sweep_pools_at(&dir, ctx_factory, per_pool)?;
+            treehouse_core::discovery::discover_pools(&dir).pools.len() as u32
+        }
+        None => {
+            treehouse_core::discovery::sweep_pools(&user, ctx_factory, per_pool)?;
+            count_pools(&user)
+        }
+    };
     let merged = treehouse_core::discovery::merge_prune_results(results);
     let has_pool_errors = !merged.errors.is_empty();
-    let pool_count = count_pools(&user);
     render_prune(
         cli,
         merged,
@@ -1249,7 +1305,8 @@ fn cmd_gc_all(cli: &Cli, args: &cli::GcArgs) -> Result<()> {
         dry_run: !args.yes,
         prune_orphans: args.prune_orphans,
     };
-    let (merged, pool_count) = sweep_all_pools(&opts)?;
+    let root = sweep_root(cli)?;
+    let (merged, pool_count) = sweep_all_pools(&opts, root.as_deref())?;
 
     // An empty sweep still RENDERS. The early return this replaces printed the
     // human banner and stopped, so `treehouse gc --all --format json` on a clean
@@ -1279,16 +1336,48 @@ fn count_pools(user: &TreehouseConfig) -> u32 {
     treehouse_core::discovery::discover_pools(&root).pools.len() as u32
 }
 
+/// The pool-root container a user-wide sweep should cover.
+///
+/// `--root` and `TREEHOUSE_ROOT` name the PARENT of the pool container, the
+/// same way they do for a repo-scoped command: `--root /tmp/pools` sweeps
+/// `/tmp/pools/.treehouse`. `None` means the user-level root, which is what a
+/// sweep covers when neither is set.
+///
+/// A relative root resolves from the repository root (Go's `--root` rule), so
+/// it needs a repository — a sweep scheduled from cron outside any checkout
+/// cannot resolve one and says so rather than silently sweeping the wrong
+/// tree.
+fn sweep_root(cli: &Cli) -> Result<Option<PathBuf>> {
+    let flag = cli.root.as_deref().map(str::trim).filter(|r| !r.is_empty());
+    let env = std::env::var("TREEHOUSE_ROOT")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let Some(root) = flag.map(str::to_string).or(env) else {
+        return Ok(None);
+    };
+    let repo_root = crate::cli::resolve_repo_ctx()
+        .map(|ctx| ctx.repo_root)
+        .unwrap_or_default();
+    let dir = treehouse_core::config::resolve_pool_root(&repo_root, Some(&root))
+        .map_err(|e| anyhow!("resolving pool root {root:?}: {e}"))?;
+    Ok(Some(dir))
+}
+
 /// Sweep every managed pool under the user-level root using the GC engine.
 ///
 /// This is the **single source of truth** for multi-pool GC sweeps.
 /// Both `gc --all` and `watch --once` call this function — no duplicate
 /// cleanup logic.
 ///
+/// `root` overrides the container the sweep covers; `None` sweeps the
+/// user-level root.
+///
 /// Per-pool error isolation: a pool-level failure is recorded as a
 /// `CleanupError` in the result so the remaining pools are still swept.
 fn sweep_all_pools(
     opts: &treehouse_core::gc::GcOptions,
+    root: Option<&Path>,
 ) -> Result<(treehouse_core::gc::GcResult, u32), anyhow::Error> {
     let user = treehouse_core::config::TreehouseConfig::load_global()?;
     let mut results: Vec<(PathBuf, _)> = Vec::new();
@@ -1302,7 +1391,7 @@ fn sweep_all_pools(
                 },
             )
         };
-    treehouse_core::discovery::sweep_pools(&user, ctx_factory, |pool| {
+    let per_pool = |pool: &treehouse_core::pool::Pool| {
         let pool_dir = pool.pool_dir().to_path_buf();
         match pool.gc(opts) {
             Ok(result) => {
@@ -1325,10 +1414,20 @@ fn sweep_all_pools(
             }
         }
         Ok(())
-    })?;
+    };
+    let pool_count = match root {
+        Some(dir) => {
+            treehouse_core::discovery::sweep_pools_at(dir, ctx_factory, per_pool)?;
+            treehouse_core::discovery::discover_pools(dir).pools.len() as u32
+        }
+        None => {
+            treehouse_core::discovery::sweep_pools(&user, ctx_factory, per_pool)?;
+            count_pools(&user)
+        }
+    };
     Ok((
         treehouse_core::discovery::merge_gc_results(results),
-        count_pools(&user),
+        pool_count,
     ))
 }
 
@@ -1343,8 +1442,12 @@ fn cmd_watch(cli: &Cli, args: &cli::WatchArgs) -> Result<()> {
     };
 
     let orphans_included = args.prune_orphans;
+    // Resolved once, before the loop: the sweep root cannot change under a
+    // long-running watcher, and re-resolving it every tick would re-read the
+    // environment each time.
+    let root = sweep_root(cli)?;
     if args.once {
-        let (merged, pool_count) = sweep_all_pools(&opts)?;
+        let (merged, pool_count) = sweep_all_pools(&opts, root.as_deref())?;
         // Same defect as `gc --all`: an empty sweep returned before the render,
         // so `--format json` produced no document at all. The human banner is
         // kept verbatim and printed only for the human format, because the
@@ -1387,7 +1490,7 @@ fn cmd_watch(cli: &Cli, args: &cli::WatchArgs) -> Result<()> {
 
     let mut had_pool_errors = false;
     while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-        let (merged, pool_count) = sweep_all_pools(&opts)?;
+        let (merged, pool_count) = sweep_all_pools(&opts, root.as_deref())?;
         let has_errors = !merged.errors.is_empty();
         had_pool_errors = had_pool_errors || has_errors;
 
@@ -1602,6 +1705,12 @@ fn cmd_update() -> Result<()> {
         println!("Skipping update: running a dev build");
         return Ok(());
     }
+    // A Nix install is upgraded through Nix: the store is content-addressed
+    // and read-only, so replacing the binary in place is neither possible nor
+    // what the user wants (upstream #180).
+    if treehouse_core::updater::running_from_nix_store() {
+        anyhow::bail!("self-update is not available for Nix installs; upgrade through Nix");
+    }
     let current = treehouse_core::VERSION;
     let (api_url, enforce_https) = update_api_endpoint();
 
@@ -1610,11 +1719,25 @@ fn cmd_update() -> Result<()> {
     // the release ASSETS, so this check is always live (Go `CheckLatest` is too).
     let result = treehouse_core::updater::check_latest_result(&api_url, current, enforce_https)
         .map_err(|e| anyhow!("checking for updates: {e}"))?;
-    treehouse_core::updater::write_cache(&result.latest_version);
 
     if !result.update_available {
+        treehouse_core::updater::write_cache(&result.latest_version);
         println!("🌳 treehouse is up to date ({current})");
         return Ok(());
+    }
+
+    // A release with no archive for this platform cannot be installed, so it
+    // is not an update this build can offer. Saying so is more useful than
+    // advertising it and failing the download: the release exists, this
+    // platform is simply not in it.
+    if result.download_url.is_none() {
+        anyhow::bail!(
+            "treehouse {current} is the latest release for this platform; \
+             v{} ships no archive for {}-{}",
+            result.latest_version,
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
     }
 
     let target = update_target()?;
@@ -1623,6 +1746,12 @@ fn cmd_update() -> Result<()> {
     // what let a script gating on `$?` read a dead network as a finished update.
     let applied = treehouse_core::updater::apply_into(&result, enforce_https, &target)
         .map_err(|e| anyhow!("applying update: {e}"))?;
+
+    // The cache is written AFTER the binary was really replaced, so it can
+    // only ever name a version this installation actually reached. A failed
+    // update leaves the cache alone: the notice then keeps pointing at the
+    // version the user is still missing, which is true.
+    treehouse_core::updater::write_cache(&applied.to_version);
 
     // Printed from `applied`, never from `result`: the installed binary is the
     // only thing that makes "updated" true.
@@ -1732,7 +1861,7 @@ fn resolve_machine_format(cli: &Cli, json_flag: bool) -> Result<format::OutputFo
 }
 
 /// Spawns the interactive subshell in `work_dir`, returning its exit code.
-fn spawn_shell(work_dir: &Path) -> i32 {
+fn spawn_shell(work_dir: &Path) -> Result<i32, anyhow::Error> {
     #[cfg(unix)]
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     #[cfg(windows)]
@@ -1740,10 +1869,23 @@ fn spawn_shell(work_dir: &Path) -> i32 {
 
     let status = std::process::Command::new(&shell)
         .current_dir(work_dir)
-        .status();
+        .status()
+        .map_err(|e| anyhow!("starting shell {shell:?} in {}: {e}", work_dir.display()));
     match status {
-        Ok(s) => s.code().unwrap_or(0),
-        Err(_) => 0,
+        // A shell killed by a signal has no exit code; report it as the
+        // conventional 128+signal rather than as success.
+        Ok(s) => Ok(s.code().unwrap_or_else(|| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                128 + s.signal().unwrap_or(0)
+            }
+            #[cfg(not(unix))]
+            {
+                1
+            }
+        })),
+        Err(e) => Err(e),
     }
 }
 

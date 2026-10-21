@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::{self, ConfigError, TreehouseConfig};
 use crate::env::TreehouseEnv;
@@ -132,7 +132,7 @@ pub fn user_pool_root_with_config(user: &TreehouseConfig) -> Option<PathBuf> {
 /// treehouse state file are classified as pools. A state file that fails to
 /// parse (IO or invalid JSON) is recorded in `skipped` — a corrupt or foreign
 /// directory is never swept blindly.
-pub fn discover_pools(root: &PathBuf) -> DiscoverResult {
+pub fn discover_pools(root: &Path) -> DiscoverResult {
     let mut result = DiscoverResult::default();
     let Ok(entries) = fs::read_dir(root) else {
         return result; // No pools at all — empty result, not an error.
@@ -190,7 +190,7 @@ pub fn load_user_config_for_discovery() -> Result<TreehouseConfig, ConfigError> 
 pub fn sweep_pools<F>(
     user: &TreehouseConfig,
     ctx_factory: impl Fn(&PathBuf) -> Result<crate::pool::Pool, crate::pool::PoolError>,
-    mut per_pool: F,
+    per_pool: F,
 ) -> Result<(), crate::pool::PoolError>
 where
     F: FnMut(&crate::pool::Pool) -> Result<(), crate::pool::PoolError>,
@@ -198,7 +198,24 @@ where
     let Some(root) = user_pool_root_with_config(user) else {
         return Ok(());
     };
-    let found = discover_pools(&root);
+    sweep_pools_at(&root, ctx_factory, per_pool)
+}
+
+/// [`sweep_pools`] over an explicit pool-root container.
+///
+/// The user config names the root a sweep covers by default; this variant
+/// takes the container directly, so a caller that resolved `--root` (or
+/// `TREEHOUSE_ROOT`) to a different tree sweeps THAT tree instead of the
+/// user-level one.
+pub fn sweep_pools_at<F>(
+    root: &Path,
+    ctx_factory: impl Fn(&PathBuf) -> Result<crate::pool::Pool, crate::pool::PoolError>,
+    mut per_pool: F,
+) -> Result<(), crate::pool::PoolError>
+where
+    F: FnMut(&crate::pool::Pool) -> Result<(), crate::pool::PoolError>,
+{
+    let found = discover_pools(root);
     for p in &found.pools {
         let Ok(pool) = ctx_factory(&p.dir) else {
             let msg = format!("🌳 skipping pool {}: cannot open", p.dir.display());
@@ -290,7 +307,7 @@ mod tests {
         fs::create_dir_all(&decoy).unwrap();
         fs::write(decoy.join("random.txt"), "hello").unwrap();
 
-        let result = discover_pools(&tmp.path().to_path_buf());
+        let result = discover_pools(tmp.path());
         assert_eq!(result.pools.len(), 1, "only the state-file dir is a pool");
         assert_eq!(result.pools[0].name, "myrepo-abc123");
         assert!(result.skipped.contains_key(&decoy));

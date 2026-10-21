@@ -43,8 +43,13 @@ pub enum GitErrorKind {
 }
 
 /// Errors from invoking git.
+///
+/// `command` is the ARGUMENT LIST alone — `rev-parse --show-toplevel`, not
+/// `git rev-parse --show-toplevel`. The program name is added by the
+/// [`Display`] impl below, so a caller that spells it into `command` renders
+/// the program twice (`git git rev-parse …`). Use
+/// [`crate::vcs::git_label`] to build the label from an argument list.
 #[derive(Debug, thiserror::Error)]
-#[error("git {command}: {message}")]
 pub struct GitError {
     pub command: String,
     pub message: String,
@@ -59,10 +64,61 @@ impl GitError {
             kind,
         }
     }
+
+    /// A failure that is not attributable to one git invocation — the binary
+    /// is missing, for instance. There is no argument list to name, so the
+    /// program is named on its own.
+    pub fn program(message: impl Into<String>, kind: GitErrorKind) -> Self {
+        Self {
+            command: String::new(),
+            message: message.into(),
+            kind,
+        }
+    }
 }
 
-/// The git backend contract, mirroring Go `internal/git/git.go`.
+impl std::fmt::Display for GitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.command.is_empty() {
+            write!(f, "git: {}", self.message)
+        } else {
+            write!(f, "git {}: {}", self.command, self.message)
+        }
+    }
+}
+
+/// The `-c` overrides every git runner in this port applies.
 ///
+/// `submodule.recurse=false` pins git's submodule recursion OFF for the
+/// pooled operations — `worktree add`, `reset`, `status`, `checkout`,
+/// `detach`. An operator whose global git config sets `submodule.recurse =
+/// true` otherwise makes those operations walk into submodules, where they
+/// can fail on a missing submodule or touch state the pool does not own.
+///
+/// `fetch` is deliberately NOT pinned: a repository that wants its submodules
+/// fetched should keep getting them. This mirrors Go's `execGit` pin
+/// (gitvcs.go, upstream #177), which excludes the fetch runner for the same
+/// reason.
+pub const GIT_CONFIG_OVERRIDES: [&str; 2] = ["-c", "submodule.recurse=false"];
+
+/// Whether a git invocation is a `fetch` — the one runner that keeps the
+/// operator's own submodule-recursion preference.
+pub fn is_fetch(args: &[&str]) -> bool {
+    args.first().is_some_and(|a| a.trim() == "fetch")
+}
+
+/// The `-c` overrides to prepend to a git invocation's argument list.
+///
+/// Empty for a `fetch` (see [`GIT_CONFIG_OVERRIDES`]).
+pub fn config_overrides(args: &[&str]) -> Vec<&'static str> {
+    if is_fetch(args) {
+        Vec::new()
+    } else {
+        GIT_CONFIG_OVERRIDES.to_vec()
+    }
+}
+
+/// The git backend contract, mirroring Go `internal/git/git.go`.///
 /// Every method uses the exact git invocation from the Go baseline and
 /// interprets exit codes identically.
 ///

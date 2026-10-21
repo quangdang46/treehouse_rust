@@ -1219,6 +1219,10 @@ fn acquire_locked(
         if state.worktrees.len() as u32 >= max_trees {
             return Err(skips.into_pool_full(state.worktrees.len() as u32, max_trees));
         }
+        // A leftover slot directory from a crashed run is reclaimed here, so
+        // the slot it was sitting on is available again instead of being
+        // skipped forever.
+        reclaim_empty_leftover_slots(dir, &state);
         let name = next_free_name(dir, &state);
         let wt_path = resolve_worktree_path(
             root,
@@ -1653,6 +1657,7 @@ fn raw_git(
     args: &[&str],
 ) -> Result<(bool, Vec<u8>, Vec<u8>), GitError> {
     let out = std::process::Command::new(git_bin)
+        .args(crate::git::config_overrides(args))
         .args(args)
         .current_dir(cwd)
         .output()
@@ -1969,6 +1974,72 @@ pub fn next_name(state: &State) -> String {
 /// Fail-closed: if the pool directory cannot be read, the computed name is
 /// still returned and the subsequent `worktree_add` is what surfaces the
 /// problem. Silently returning a different number would hide the fault.
+/// Reclaims leftover slot directories that hold nothing.
+///
+/// A slot directory with no state entry is a leftover: a run that crashed
+/// between creating the worktree and writing the state, or a directory
+/// someone removed by hand. The allocator skips such a slot rather than
+/// reissuing it — that skip is what keeps a worktree whose state entry was
+/// lost from ever being handed out again — so without this sweep the
+/// leftover sits in the pool forever: a directory that no command can
+/// reach, reclaim, or report.
+///
+/// Only a slot holding NOTHING is reclaimed. A slot with any content is
+/// left exactly where it is, because it may be a worktree whose state entry
+/// was lost and its contents are somebody's work.
+///
+/// A symlink is never followed and never removed: it may point anywhere,
+/// and "the slot looks empty" is not a safe thing to conclude about one.
+fn reclaim_empty_leftover_slots(pool_dir: &Path, state: &State) {
+    let Ok(entries) = std::fs::read_dir(pool_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.parse::<i64>().is_err() {
+            continue; // Not a slot directory.
+        }
+        if state.worktrees.iter().any(|w| w.name == name) {
+            continue; // A pool slot, not a leftover.
+        }
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue; // A symlink or a file: not ours to remove.
+        }
+        if !holds_nothing(&path) {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(&path);
+    }
+}
+
+/// Whether `path` holds nothing at all: no files, and no subdirectory that
+/// holds anything either.
+///
+/// Symlinks count as content — they are not followed, and a link is not
+/// "nothing".
+fn holds_nothing(path: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let child = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&child) else {
+            return false;
+        };
+        if !meta.is_dir() {
+            return false;
+        }
+        if !holds_nothing(&child) {
+            return false;
+        }
+    }
+    true
+}
+
 pub(crate) fn next_free_name(pool_dir: &Path, state: &State) -> String {
     let mut max = next_name(state).parse::<i64>().unwrap_or(1) - 1;
     if let Ok(entries) = std::fs::read_dir(pool_dir) {
@@ -3213,6 +3284,104 @@ mod tests {
         assert_eq!(next_free_name(dir.path(), &state), "8");
         std::fs::create_dir_all(dir.path().join("9")).unwrap();
         assert_eq!(next_free_name(dir.path(), &state), "10");
+    }
+
+    /// An empty leftover slot directory is reclaimed, so its slot is usable
+    /// again (upstream #186).
+    ///
+    /// Regression: the allocator skips a slot that exists on disk, which is
+    /// what keeps a worktree whose state entry was lost from being handed
+    /// out again. A leftover that holds NOTHING has nothing to protect, and
+    /// without a reclaim it sat in the pool forever — a directory no command
+    /// could reach, reclaim, or report.
+    #[test]
+    fn an_empty_leftover_slot_is_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        // A leftover slot: no state entry, and it holds nothing.
+        std::fs::create_dir_all(dir.path().join("1").join("repo")).unwrap();
+
+        reclaim_empty_leftover_slots(dir.path(), &State::default());
+
+        assert!(
+            !dir.path().join("1").exists(),
+            "the empty leftover slot must be reclaimed"
+        );
+        assert_eq!(
+            next_free_name(dir.path(), &State::default()),
+            "1",
+            "the reclaimed slot must be available again"
+        );
+    }
+
+    /// A leftover that holds something is NEVER reclaimed.
+    ///
+    /// It may be a worktree whose state entry was lost, and its contents are
+    /// somebody's work. The slot stays occupied and keeps being skipped.
+    #[test]
+    fn a_leftover_slot_with_content_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("1").join("repo")).unwrap();
+        std::fs::write(dir.path().join("1").join("repo").join("keep.txt"), b"work").unwrap();
+
+        reclaim_empty_leftover_slots(dir.path(), &State::default());
+
+        assert!(
+            dir.path().join("1").exists(),
+            "a slot holding content must not be reclaimed"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("1").join("repo").join("keep.txt")).unwrap(),
+            b"work",
+            "the content must be untouched"
+        );
+        assert_eq!(
+            next_free_name(dir.path(), &State::default()),
+            "2",
+            "an occupied slot must never be reissued"
+        );
+    }
+
+    /// A slot the state still knows about is not a leftover, whatever it
+    /// holds.
+    #[test]
+    fn a_slot_with_a_state_entry_is_never_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("1").join("repo")).unwrap();
+        let state = State {
+            worktrees: vec![WorktreeEntry {
+                name: "1".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        reclaim_empty_leftover_slots(dir.path(), &state);
+
+        assert!(
+            dir.path().join("1").exists(),
+            "a slot the state knows about must not be reclaimed"
+        );
+    }
+
+    /// A symlinked slot directory is never followed and never removed.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_slot_is_never_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("1")).unwrap();
+
+        reclaim_empty_leftover_slots(dir.path(), &State::default());
+
+        assert!(target.exists(), "the symlink target must be untouched");
+        assert!(
+            std::fs::symlink_metadata(dir.path().join("1"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink itself must still be there"
+        );
     }
 
     #[test]

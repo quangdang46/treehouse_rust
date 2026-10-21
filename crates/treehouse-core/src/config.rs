@@ -684,7 +684,7 @@ fn user_config_path_for_display() -> String {
 /// Only affects display. Resolving the home prefix textually — rather than
 /// canonicalizing — keeps the check from failing on paths that do not exist,
 /// which is the normal case for a config file that is only being named.
-fn pretty_path(path: &Path) -> String {
+pub fn pretty_path(path: &Path) -> String {
     if let Some(home) = home_dir()
         && let Ok(rel) = path.strip_prefix(&home)
         && !rel.as_os_str().is_empty()

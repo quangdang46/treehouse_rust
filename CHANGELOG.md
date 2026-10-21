@@ -7,7 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+#### `treehouse get` failed outright on any repository with a submodule
+
+The pooled git operations (`worktree add`, `reset`, `checkout`, `status`) ran
+with the operator's own submodule-recursion setting. With
+`submodule.recurse = true` in the global git config — a common setting — they
+walked into submodules, where a linked worktree's submodule gitdir points into
+the main repository's metadata and does not exist. Git failed with
+`fatal: could not reset submodule index`, and `treehouse get` exited 1 on a
+perfectly ordinary repository.
+
+Every git runner now pins `-c submodule.recurse=false`, matching upstream Go
+(#177). `fetch` is deliberately left alone: a repository that wants its
+submodules fetched should keep getting them.
+
+#### A git failure named the program twice
+
+`GitError`'s `Display` spells the program itself, and the shell backend also
+spelled it into the label — so every git failure read
+`git git rev-parse --show-toplevel: fatal: not a git repository`. The seam in
+`vcs/mod.rs` had already been fixed for this; the shell backend behind it had
+not, and the seam was not the one answering.
+
+#### `treehouse enter` never said where it dropped you
+
+`enter` opened the subshell and printed only `Pool state unchanged.` — no
+banner naming the worktree, and no banner on the way out. It also reported
+"the pool is empty" for any unknown name, even in a pool full of slots.
+
+It now matches Go: `🌳 Entered worktree <name> at <path>. Type 'exit' to
+leave.` on the way in, `🌳 Left worktree. Pool state unchanged.` on the way
+out, and an unknown name lists the slots that do exist. A shell that cannot be
+started is now an error instead of a silent success.
+
+#### `treehouse watch --root <DIR>` was ignored
+
+`--root` is documented as available on every command, and `watch` lists it in
+its own flag table — but the sweep always covered the user-level root. A
+`watch` pointed at another root swept the wrong pools, on the user's own
+machine. `watch`, `gc --all` and `prune --all` now honour `--root` and
+`TREEHOUSE_ROOT`, and sweep the tree they name.
+
+#### The update notice could name a version that could not be installed
+
+The background update check cached whatever `tag_name` the release API
+returned, without looking at the release's assets. A release that ships no
+archive for the running OS/arch was therefore advertised as available — and
+`treehouse update` could never install it, so the notice could never be
+cleared.
+
+The check now resolves the release's assets first and only advertises a
+version this platform can actually install. `treehouse update` writes the
+cache only after it has really replaced the binary.
+
+#### A Nix install was told to run a command that cannot work
+
+A treehouse installed in the Nix store cannot be replaced in place: the store
+is content-addressed and read-only, and such an install is upgraded through
+Nix. `treehouse update` now refuses such an install with that explanation,
+and the update notice stays silent for it (upstream Go #180).
+
+#### Empty leftover slot directories were never reclaimed
+
+A slot directory left behind by a crashed run — with no state entry — was
+skipped by the allocator forever. It was a directory no command could reach,
+reclaim, or report, and the slot it sat on was never usable again.
+
+An empty leftover is now reclaimed before a new slot is chosen, so the slot
+becomes available again. A leftover that holds anything is left exactly where
+it is: it may be a worktree whose state entry was lost, and its contents are
+somebody's work. A symlinked slot is never followed and never removed.
 
 ## [0.2.0] - 2026-10-01
 

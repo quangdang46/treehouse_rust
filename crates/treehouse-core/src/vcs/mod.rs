@@ -594,6 +594,7 @@ pub(crate) fn git_label(args: &[&str]) -> String {
 /// Runs `git <args>` in `worktree`, returning trimmed stdout.
 fn git_out(git_bin: &Path, worktree: &Path, args: &[&str]) -> Result<String, GitError> {
     let output = std::process::Command::new(git_bin)
+        .args(crate::git::config_overrides(args))
         .args(args)
         .current_dir(worktree)
         .output()
