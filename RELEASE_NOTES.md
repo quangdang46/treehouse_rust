@@ -1,25 +1,54 @@
-# treehouse 0.2.1
+# treehouse 0.2.2
 
 A patch release. No new commands, no changed flags, no changed output formats,
 no changed exit codes, no changed state-file format. Existing pools keep
 working; nothing needs `treehouse init` again.
 
-It fixes seven defects, all of them found by installing 0.2.0 from its release
+It fixes nine defects, all of them found by installing 0.2.0 from its release
 and driving every command against real git repositories — a plain repo, a
 multi-branch repo, a repo with a committed `.worktreeinclude`, a repo with a
-submodule, and a repo under a deliberately hostile global git config.
+submodule, a repo with no remote, and a repo under a deliberately hostile
+global git config.
 
-Two of the seven are inherited from upstream Go, which fixed them after this
+Two of the nine are inherited from upstream Go, which fixed them after this
 port's v3.1.0 baseline; the rest are this port's own.
 
 ---
 
-## Read this first: `treehouse get` failed on any repository with a submodule
+## Read this first: every command run from inside a pooled worktree talked to the wrong pool
 
-This is the one that bites hardest, because it is not a corner case. If your
-global git config sets `submodule.recurse = true` — a common setting, and the
-default in some setups — then `treehouse get` **failed outright** on any
-repository that has a submodule:
+This is the one that bites hardest, because it hits the normal way an agent
+works. The pool is keyed on the repository it serves, but the repository was
+resolved from your working directory with `git rev-parse --show-toplevel` — and
+inside a linked worktree, that answers with **the worktree itself**. So a
+command run from inside a pooled worktree resolved a *different* pool:
+
+```console
+$ cd "$(treehouse get --lease)"
+$ treehouse status
+🌳 No worktrees in pool.        # the pool it is standing in is not empty
+$ treehouse return
+worktree /path/to/worktree is not managed by treehouse
+```
+
+It only showed on a repository with **no remote**. A repository with a remote
+is keyed on the remote URL, so every checkout of it shared one pool and the bug
+hid completely — which is why it survived both this port and the upstream Go
+implementation it was ported from. (Upstream Go resolves the *main* repository
+root; this port resolved the worktree's own root.)
+
+The pool is now resolved from the main repository root, which resolves back
+through the common git dir. The pool is the same one no matter which checkout
+you are standing in.
+
+---
+
+## `treehouse get` failed on any repository with a submodule
+
+This one is not a corner case either. If your global git config sets
+`submodule.recurse = true` — a common setting, and the default in some setups —
+then `treehouse get` **failed outright** on any repository that has a
+submodule:
 
 ```
 fatal: could not reset submodule index
@@ -40,6 +69,18 @@ avoiding submodules, you can stop.
 ---
 
 ## The rest
+
+### `treehouse return <path>` could not be used from outside the repository
+
+Naming a path is how you return a worktree when you are not standing in one —
+but the pool was resolved from your working directory, so the command failed
+with "not a git repository" before it could look at the path.
+
+`return` now resolves its pool from the target, the way upstream Go does: the
+built-in layout puts a worktree two levels under its pool, so the pool can be
+read off the path itself — which also means a worktree can be returned after
+the repository is gone. A path that no pool claims still falls back to reading
+the argument as a slot name, so `treehouse return 3` keeps working.
 
 ### A git failure named the program twice
 
@@ -116,7 +157,7 @@ somebody's work — and a symlinked slot is never followed and never removed.
 ## Still open
 
 Naming these because a reader skimming the source would otherwise assume more
-than has been proven. None of them changed in 0.2.1.
+than has been proven. None of them changed in 0.2.1 or 0.2.2.
 
 - **The jj backend is implemented, registered, and not exercised end to end.**
   `vcs/jj.rs` implements 21 of the `GitBackend` trait's 24 methods behind a

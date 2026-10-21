@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### Every command run from inside a pooled worktree talked to the wrong pool
+
+The pool is keyed on the repository it serves, but the repository was
+resolved from the caller's working directory with
+`git rev-parse --show-toplevel` — and inside a linked worktree that answers
+with the worktree itself. So a command run from inside a pooled worktree
+resolved a DIFFERENT pool: `status` reported "No worktrees in pool" for the
+very worktree the caller was standing in, and `return` refused it with "worktree
+… is not managed by treehouse".
+
+It only showed on a repository with no remote. A repository with a remote is
+keyed on the remote URL, so every checkout shared one pool and the bug hid —
+which is why it survived the port and the upstream Go implementation it was
+ported from, where the same resolution is `vcs.FindMainRepoRoot()`.
+
+The pool is now resolved from the MAIN repository root, which resolves back
+through the common git dir, so the pool is the same one no matter which
+checkout the caller is standing in.
+
+#### `treehouse return <path>` could not be used from outside the repository
+
+Naming a path is how a caller returns a worktree when it is not standing in
+one — but the pool was resolved from the caller's working directory, so the
+command failed with "not a git repository" before it could look at the path.
+
+`return` now resolves its pool from the target, the way upstream Go does
+(`resolveReturnPoolDir`): the built-in layout puts a worktree two levels under
+its pool, so the pool can be read off the path itself — which also means a
+worktree can be returned after the repository is gone. A path that no pool
+claims still falls back to reading the argument as a slot name, so
+`treehouse return 3` keeps working.
+
+
+
 #### `treehouse get` failed outright on any repository with a submodule
 
 The pooled git operations (`worktree add`, `reset`, `checkout`, `status`) ran

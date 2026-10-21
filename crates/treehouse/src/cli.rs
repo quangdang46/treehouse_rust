@@ -399,7 +399,17 @@ pub struct RepoCtx {
 pub fn resolve_repo_ctx() -> anyhow::Result<RepoCtx> {
     let git = treehouse_core::git::ShellGitBackend::discover()?;
     let cwd = std::env::current_dir()?;
-    let repo_root = git.repo_root(&cwd)?;
+    // The MAIN repository root, not the worktree's own root.
+    //
+    // `git rev-parse --show-toplevel` inside a linked worktree answers with
+    // the worktree itself, and a pool keyed on that path is a DIFFERENT pool
+    // from the one the worktree belongs to — so every command run from
+    // inside a pooled worktree would talk to an empty pool of its own.
+    // The main root resolves back through the common git dir, so the pool is
+    // the same one no matter which checkout the caller is standing in.
+    //
+    // Go resolves it the same way (`vcs.FindMainRepoRoot`, cmd/status.go:46).
+    let repo_root = git.main_repo_root(&cwd)?;
     let remote_url = git.remote_url(
         &treehouse_core::git::GitRepo {
             common_dir: repo_root.clone(),

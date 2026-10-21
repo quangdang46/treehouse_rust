@@ -6,12 +6,47 @@
 //! * the sweep tests name a pool root, so a sweep that ignores `--root` and
 //!   reaches for the user-level root instead fails them;
 //! * the git-error test reads the message, so a label that names the program
-//!   twice fails it.
+//!   twice fails it;
+//! * the pool-resolution tests run from inside a pooled worktree and from
+//!   outside the repository, so a pool resolved from the caller's working
+//!   directory instead of from the worktree fails them.
 
 #[path = "e2e/common.rs"]
 mod common;
 
 use std::path::Path;
+
+/// A repository with NO remote, plus an isolated HOME.
+///
+/// The shared harness gives every repo a bare remote, and a remote is what
+/// keys the pool directory — so with one, every checkout of a repository
+/// shares a pool and the wrong-pool bug hides. Without a remote the pool is
+/// keyed on the repository's path, which is exactly the case where
+/// resolving the pool from the wrong root shows up.
+fn setup_without_remote() -> (std::path::PathBuf, std::path::PathBuf) {
+    let base = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    let base = base.path().to_path_buf();
+    #[cfg(not(windows))]
+    let base = std::fs::canonicalize(&base).unwrap_or(base);
+    let home = base.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let repo = base.join("repo");
+    common::git(
+        None,
+        &["init", "--initial-branch=main", repo.to_str().unwrap()],
+    );
+    common::git(Some(&repo), &["config", "user.email", "test@test.com"]);
+    common::git(Some(&repo), &["config", "user.name", "Test"]);
+    std::fs::write(repo.join("README.md"), b"hello\n").unwrap();
+    common::git(Some(&repo), &["add", "."]);
+    common::git(Some(&repo), &["commit", "-m", "initial commit"]);
+    (repo, home)
+}
+
+/// The worktree path `get --lease` handed back.
+fn worktree_path(out: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(out.trim())
+}
 
 /// `enter` says WHERE it dropped the caller.
 ///
@@ -249,4 +284,140 @@ fn e2e_get_survives_a_global_submodule_recurse_setting() {
         Path::new(out.trim()).exists(),
         "get must hand back a worktree that exists, got {out:?}"
     );
+}
+
+/// `status` from inside a pooled worktree reports THAT pool.
+///
+/// Regression: the pool was resolved from the working directory, and inside
+/// a linked worktree `git rev-parse --show-toplevel` answers with the
+/// worktree itself — so a repository with no remote (where the pool is keyed
+/// on the repository's path) resolved a DIFFERENT, empty pool. The caller
+/// standing in the worktree saw "No worktrees in pool" while the pool held
+/// the worktree they were standing in.
+#[test]
+fn e2e_status_from_inside_a_worktree_reports_the_right_pool() {
+    let (repo, home) = setup_without_remote();
+    let bin = common::treehouse_bin();
+
+    let (out, _err, code) = common::run(&bin, &repo, &home, &[], &["get", "--lease"]);
+    assert_eq!(code, 0, "get failed");
+    let wt = worktree_path(&out);
+
+    // The human status table goes to stdout; stderr carries the banners.
+    let (out, err, code) = common::run_from(&bin, &repo, &wt, &home, &[], &["status"]);
+    assert_eq!(code, 0, "status from inside the worktree failed: {err}");
+    assert!(
+        out.contains(&wt.to_string_lossy().to_string())
+            || out.contains(wt.file_name().unwrap().to_str().unwrap()),
+        "status must report the pool the worktree belongs to, got {out:?}"
+    );
+    assert!(
+        !out.contains("No worktrees in pool") && !err.contains("No worktrees in pool"),
+        "the pool holding this worktree is not empty: {out:?} / {err:?}"
+    );
+}
+
+/// `return` from inside a pooled worktree returns THAT worktree.
+///
+/// This is the `TREEHOUSE_DIR` default: `get` sets it before spawning the
+/// shell, so `treehouse return` with no argument is how a caller hands the
+/// worktree back from inside it.
+#[test]
+fn e2e_return_from_inside_a_worktree_returns_that_worktree() {
+    let (repo, home) = setup_without_remote();
+    let bin = common::treehouse_bin();
+
+    let (out, _err, code) = common::run(&bin, &repo, &home, &[], &["get", "--lease"]);
+    assert_eq!(code, 0, "get failed");
+    let wt = worktree_path(&out);
+
+    let (_out, err, code) = common::run_from(
+        &bin,
+        &repo,
+        &wt,
+        &home,
+        &[("TREEHOUSE_DIR", wt.to_str().unwrap())],
+        &["return"],
+    );
+    assert_eq!(code, 0, "return from inside the worktree failed: {err}");
+
+    let (out, _err, _code) = common::run(&bin, &repo, &home, &[], &["status", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    assert_eq!(
+        v[0]["status"], "available",
+        "the worktree must be back in the pool: {out}"
+    );
+}
+
+/// `return <path>` works from outside the repository entirely.
+///
+/// Regression: the pool was resolved from the caller's working directory, so
+/// returning a worktree from outside any checkout failed with "not a git
+/// repository" — the one case where naming a path is most useful.
+#[test]
+fn e2e_return_by_path_works_from_outside_the_repository() {
+    let (repo, home) = setup_without_remote();
+    let bin = common::treehouse_bin();
+
+    let (out, _err, code) = common::run(&bin, &repo, &home, &[], &["get", "--lease"]);
+    assert_eq!(code, 0, "get failed");
+    let wt = worktree_path(&out);
+
+    // A directory that is not a repository at all.
+    let outside = home.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+
+    let (_out, err, code) = common::run_from(
+        &bin,
+        &repo,
+        &outside,
+        &home,
+        &[],
+        &["return", wt.to_str().unwrap()],
+    );
+    assert_eq!(code, 0, "return by path failed: {err}");
+
+    let (out, _err, _code) = common::run(&bin, &repo, &home, &[], &["status", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    assert_eq!(
+        v[0]["status"], "available",
+        "the worktree must be back in the pool: {out}"
+    );
+}
+
+/// `return <slot-name>` still resolves the NAME, not a path.
+///
+/// Regression guard for the pool-resolution change: the argument is read as a
+/// path FIRST and only then as a slot name, so a bare "1" must still find
+/// slot 1. Reading "1" as a path and giving up when no pool claims it would
+/// break the form every agent uses.
+#[test]
+fn e2e_return_by_slot_name_still_resolves_the_name() {
+    let (repo, home) = setup_without_remote();
+    let bin = common::treehouse_bin();
+
+    common::run(&bin, &repo, &home, &[], &["get", "--lease"]);
+    let (_out, err, code) = common::run(&bin, &repo, &home, &[], &["return", "1"]);
+    assert_eq!(code, 0, "return by slot name failed: {err}");
+
+    let (out, _err, _code) = common::run(&bin, &repo, &home, &[], &["status", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    assert_eq!(
+        v[0]["status"], "available",
+        "slot 1 must be back in the pool: {out}"
+    );
+}
+
+/// `return <slot-name>` works from inside a pooled worktree too.
+#[test]
+fn e2e_return_by_slot_name_works_from_inside_a_worktree() {
+    let (repo, home) = setup_without_remote();
+    let bin = common::treehouse_bin();
+
+    common::run(&bin, &repo, &home, &[], &["get", "--lease"]);
+    let (out, _err, _code) = common::run(&bin, &repo, &home, &[], &["get", "--lease"]);
+    let wt = worktree_path(&out);
+
+    let (_out, err, code) = common::run_from(&bin, &repo, &wt, &home, &[], &["return", "1"]);
+    assert_eq!(code, 0, "return by slot name failed: {err}");
 }

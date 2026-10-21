@@ -15,6 +15,7 @@ use clap::Parser;
 use cli::{Cli, Command, OutputFormat};
 use treehouse_core::config::TreehouseConfig;
 use treehouse_core::destroy::{DestroyOptions, DestroyTargetSpec};
+use treehouse_core::git::GitBackend;
 use treehouse_core::prune::PruneOptions;
 use treehouse_core::result::SweepScope;
 
@@ -548,13 +549,38 @@ fn cmd_return(cli: &Cli, args: &cli::ReturnArgs) -> Result<()> {
         return cmd_return_all(cli, args);
     }
 
-    let pool = open_pool_for_cli(cli)?;
-
     let raw = args
         .path
         .clone()
         .or_else(|| std::env::var("TREEHOUSE_DIR").ok())
         .ok_or_else(|| anyhow!("no worktree path specified"))?;
+    let explicit_path = args.path.is_some();
+
+    // The pool is resolved from the TARGET, not from the caller's working
+    // directory. `treehouse return <path>` has to work from outside the
+    // repository — that is the whole point of naming a path — and it has to
+    // work from inside a pooled worktree, which is where an agent stands.
+    //
+    // An argument is read as a PATH first and only then as a slot NAME, so
+    // every argument that resolves today keeps resolving to the same
+    // worktree (Go `resolveReturnTarget`, return_cmd.go:441-459). The two
+    // vocabularies can collide — standing in a pool directory, "1" is both a
+    // slot name and a real subdirectory — and a path that already works must
+    // never be redirected to the name reading.
+    let abs = absolute(&raw);
+    let pool = match return_pool_for_path(cli, Path::new(&abs), explicit_path)? {
+        Some(pool) => pool,
+        None => {
+            // No pool claims that path. If the argument can also be read as a
+            // slot NAME, that is the other reading of it — and the pool is
+            // the one serving the repository the caller stands in.
+            if !explicit_path || !could_be_worktree_name(&raw) {
+                return Err(anyhow!("worktree {abs} is not managed by treehouse"));
+            }
+            open_pool_for_cli(cli)?
+        }
+    };
+
     let path = resolve_return_target(&pool, &raw)?;
 
     let preconditions = treehouse_core::pool::ReleasePreconditions {
@@ -574,6 +600,83 @@ fn cmd_return(cli: &Cli, args: &cli::ReturnArgs) -> Result<()> {
     let mut err = stderr.lock();
     format::render(to_output_format(cli.format)?, &result, &mut out, &mut err)?;
     Ok(())
+}
+
+/// The pool that serves the worktree at `wt_path`, if any.
+///
+/// Go `resolveReturnPoolDir` (return_cmd.go:567-600). The built-in layout
+/// puts a worktree two levels under its pool, so the pool can be read off
+/// the path itself — which is what lets `treehouse return <path>` work from
+/// outside the repository, and even after the repository is gone. The
+/// candidate is confirmed to be a pool AND to hold this worktree, so a
+/// directory that merely sits two levels above another pool cannot claim it.
+///
+/// A worktree whose path does not carry that layout (a `--worktree-path`
+/// template can put one anywhere) falls back to the pool of the repository
+/// that owns it.
+///
+/// `None` means no pool claims the path, which is the signal to try reading
+/// the argument as a slot NAME instead.
+fn return_pool_for_path(
+    cli: &Cli,
+    wt_path: &Path,
+    explicit_path: bool,
+) -> Result<Option<treehouse_core::pool::Pool>> {
+    let candidate = wt_path.parent().and_then(|p| p.parent());
+    if let Some(dir) = candidate
+        && treehouse_core::pool::Pool::is_pool_dir(dir)
+    {
+        let config = treehouse_core::config::TreehouseConfig::load_global()?;
+        let pool = treehouse_core::pool::Pool::open_at(
+            dir,
+            &treehouse_core::pool::OpenOptions {
+                config,
+                ..Default::default()
+            },
+        )?;
+        if pool.find_by_path(&wt_path.to_string_lossy())?.is_some() {
+            return Ok(Some(pool));
+        }
+    }
+
+    // Fall back to the repository that owns the worktree. With an explicit
+    // path that repository is the one the path is in; without one it is the
+    // one the caller is standing in.
+    let repo_root = if explicit_path {
+        let git = treehouse_core::git::ShellGitBackend::discover()?;
+        // No repository owns that path: no pool claims it, and the caller is
+        // free to read the argument as a slot NAME instead.
+        let Ok(root) = git.main_repo_root(wt_path) else {
+            return Ok(None);
+        };
+        root
+    } else {
+        cli::resolve_repo_ctx()?.repo_root
+    };
+    let config = treehouse_core::config::TreehouseConfig::load(&repo_root)?;
+    let remote_url = {
+        let git = treehouse_core::git::ShellGitBackend::discover()?;
+        git.remote_url(
+            &treehouse_core::git::GitRepo {
+                common_dir: repo_root.clone(),
+                worktree: None,
+            },
+            "origin",
+        )
+    };
+    let pool_dir = treehouse_core::config::resolve_pool_dir(
+        &repo_root,
+        cli.root.as_deref(),
+        remote_url.as_deref(),
+    )
+    .map_err(|e| anyhow!("resolving pool directory: {e}"))?;
+    Ok(Some(treehouse_core::pool::Pool::open_at(
+        &pool_dir,
+        &treehouse_core::pool::OpenOptions {
+            config,
+            ..Default::default()
+        },
+    )?))
 }
 
 /// `return --all`: reclaim every HELD worktree in this repository's pool.
