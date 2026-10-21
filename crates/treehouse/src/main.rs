@@ -1732,8 +1732,8 @@ fn cmd_update() -> Result<()> {
     // platform is simply not in it.
     if result.download_url.is_none() {
         anyhow::bail!(
-            "treehouse {current} is the latest release for this platform; \
-             v{} ships no archive for {}-{}",
+            "treehouse {current} is up to date for this platform: \
+             {} ships no archive for {}-{}",
             result.latest_version,
             std::env::consts::OS,
             std::env::consts::ARCH
