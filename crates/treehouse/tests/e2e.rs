@@ -228,3 +228,60 @@ fn e2e_gc_never_evicts_live_process_after_ttl_expiry() {
         "after the process exits, gc should reclaim the stale lease, got: {out}"
     );
 }
+
+/// `treehouse run` forwards SIGTERM to the child's process group: the child
+/// dies with it, `wait` returns, the cleanup guard releases the lease, and
+/// treehouse exits 128+SIGTERM. Before the fix the signal killed treehouse
+/// outright — the `sleep` kept running orphaned and the lease sat held for
+/// its whole TTL.
+#[cfg(unix)]
+#[test]
+fn e2e_run_sigterm_kills_child_and_releases_lease() {
+    let (repo, home) = common::setup();
+    let bin = common::treehouse_bin();
+
+    let mut child = common::spawn(&bin, &repo, &home, &["run", "--", "sh", "-c", "sleep 60"]);
+
+    // Give acquire + spawn time to complete; the child must still be waiting.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "run should still be blocked on the child"
+    );
+
+    // Signal ONLY treehouse: forwarding to the child's process group is the
+    // behavior under test.
+    let killed = std::process::Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("kill must exist on unix");
+    assert!(killed.success());
+
+    // Cleanup (process grace + conditional release under the state lock) is
+    // bounded but not instant; poll with a deadline rather than risk a hang.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "treehouse did not exit after SIGTERM"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert_eq!(
+        status.code(),
+        Some(128 + 15),
+        "treehouse should exit 128+SIGTERM after forwarding, got {status:?}"
+    );
+
+    // The lease must be RELEASED: status shows the slot available again, not
+    // leased to a dead run:<pid> holder.
+    let (out, err, code) = common::run(&bin, &repo, &home, &[], &["status"]);
+    assert_eq!(code, 0, "status failed: {err}");
+    assert!(
+        !out.contains("leased"),
+        "the lease must be released after SIGTERM, got: {out}"
+    );
+}

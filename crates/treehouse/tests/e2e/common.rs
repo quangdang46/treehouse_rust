@@ -114,6 +114,18 @@ pub fn run_from(
     )
 }
 
+/// Spawns the treehouse binary WITHOUT waiting — for tests that need to
+/// signal the process (e.g. `run`'s SIGTERM forwarding).
+pub fn spawn(bin: &Path, repo: &Path, home: &Path, args: &[&str]) -> std::process::Child {
+    let mut cmd = Command::new(bin);
+    cmd.args(args).current_dir(repo);
+    for (k, v) in build_env(home) {
+        cmd.env(k, v);
+    }
+    cmd.spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn treehouse {args:?}: {e}"))
+}
+
 /// The subprocess env: isolated HOME/USERPROFILE, update checks suppressed.
 fn build_env(home: &Path) -> Vec<(String, String)> {
     let skip = [
