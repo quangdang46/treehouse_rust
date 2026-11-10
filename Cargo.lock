@@ -2550,7 +2550,7 @@ dependencies = [
 
 [[package]]
 name = "treehouse"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2568,7 +2568,7 @@ dependencies = [
 
 [[package]]
 name = "treehouse-core"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "chrono",
  "fd-lock",

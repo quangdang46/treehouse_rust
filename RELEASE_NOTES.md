@@ -1,219 +1,162 @@
-# treehouse 0.2.2
+# treehouse 0.2.3
 
 A patch release. No new commands, no changed flags, no changed output formats,
 no changed exit codes, no changed state-file format. Existing pools keep
 working; nothing needs `treehouse init` again.
 
-It fixes nine defects, all of them found by installing 0.2.0 from its release
-and driving every command against real git repositories — a plain repo, a
-multi-branch repo, a repo with a committed `.worktreeinclude`, a repo with a
-submodule, a repo with no remote, and a repo under a deliberately hostile
-global git config.
-
-Two of the nine are inherited from upstream Go, which fixed them after this
-port's v3.1.0 baseline; the rest are this port's own.
+It fixes a batch of defects found by code review and end-to-end testing —
+signal handling in `treehouse run`, a git spawn failure that was reported as
+success, a permanently bricked pool after an externally deleted worktree, a
+state lock held across slow operations, and a correctness/cleanup sweep.
 
 ---
 
-## Read this first: every command run from inside a pooled worktree talked to the wrong pool
+## `treehouse run` now survives signals
 
-This is the one that bites hardest, because it hits the normal way an agent
-works. The pool is keyed on the repository it serves, but the repository was
-resolved from your working directory with `git rev-parse --show-toplevel` — and
-inside a linked worktree, that answers with **the worktree itself**. So a
-command run from inside a pooled worktree resolved a *different* pool:
+`run` had no signal handling at all. A SIGINT or SIGTERM killed the process
+instantly: `Child::wait` never returned, the cleanup guard never ran, the
+child — which runs in its **own process group**, so a terminal Ctrl-C hits
+`treehouse` only — kept running orphaned inside the worktree, and its durable
+lease stayed held for the whole TTL. `gc` and `prune` skip leased slots, so
+the slot leaked until someone noticed.
 
-```console
-$ cd "$(treehouse get --lease)"
-$ treehouse status
-🌳 No worktrees in pool.        # the pool it is standing in is not empty
-$ treehouse return
-worktree /path/to/worktree is not managed by treehouse
-```
+`run` now installs a forwarding handler before spawning (a `sigaction` on
+Unix, `SetConsoleCtrlHandler` + `GenerateConsoleCtrlEvent(CTRL_BREAK)` on
+Windows). The first signal is forwarded to the child's process group so
+`wait` returns and cleanup runs normally; a repeat signal escalates to
+SIGKILL so a child that traps the first one cannot hang `run`. Once the
+child is reaped the handler restores the default disposition and re-raises,
+so later signals — including a second Ctrl-C during cleanup — kill normally.
 
-It only showed on a repository with **no remote**. A repository with a remote
-is keyed on the remote URL, so every checkout of it shared one pool and the bug
-hid completely — which is why it survived both this port and the upstream Go
-implementation it was ported from. (Upstream Go resolves the *main* repository
-root; this port resolved the worktree's own root.)
+A cleanup failure is also no longer silent: `run` prints a stderr warning and
+exits nonzero even when the child itself succeeded.
 
-The pool is now resolved from the main repository root, which resolves back
-through the common git dir. The pool is the same one no matter which checkout
-you are standing in.
+Verified end to end: `treehouse run -- sh -c 'sleep 60'` + SIGTERM exits 143,
+the child's whole process group is dead, the slot goes back to `available`,
+and no `sleep` is left behind.
 
 ---
 
-## `treehouse get` failed on any repository with a submodule
+## A missing `git` binary is now an error, not a silent success
 
-This one is not a corner case either. If your global git config sets
-`submodule.recurse = true` — a common setting, and the default in some setups —
-then `treehouse get` **failed outright** on any repository that has a
-submodule:
+When the `git` executable failed to *spawn* — not found on `PATH`, not
+executable, out of memory — the shell backend synthesized a successful
+`ExitStatus` with empty output. Every consumer read that as a real answer:
+`is_dirty` returned `false`, `is_head_merged_into_ref` returned `true`, and
+`gc`/`prune`/`destroy` would classify an **unverified** worktree as clean and
+merged — then `remove_dir_all` deleted it. `return` and `reset` reported
+success while nothing had run.
 
-```
-fatal: could not reset submodule index
-```
-
-The pooled git operations (`worktree add`, `reset`, `checkout`, `status`) were
-running with your own submodule-recursion setting. In a linked worktree, a
-submodule's gitdir points into the *main* repository's metadata, where it does
-not exist — so any operation that recursed into a submodule failed.
-
-Every git runner now pins `-c submodule.recurse=false`, which is what upstream
-Go does. `fetch` is deliberately left alone: a repository that wants its
-submodules fetched should keep getting them.
-
-You do not need to change anything. If you were working around this by
-avoiding submodules, you can stop.
+Spawn failures now propagate as `GitError` through every git call. Destructive
+paths fail closed: if treehouse cannot verify a worktree's state, it does not
+delete it. Boolean probes (`local_branch_exists`, `ref_exists`, `is_ancestor`,
+`has_remote`, `remote_url`) degrade to `false`/`None` so the caller's own git
+invocation surfaces the missing binary with a real error.
 
 ---
 
-## The rest
+## A worktree deleted outside git no longer bricks the pool
 
-### `treehouse return <path>` could not be used from outside the repository
+Delete a pooled worktree's directory with `rm -rf` (or let a cleanup tool do
+it) and git still lists the path as a registered worktree. The next
+`treehouse get --lease` reuses that slot name, `git worktree add` refuses with
+`missing but already registered worktree`, `heal_state` drops the pool entry,
+and **every subsequent `get` fails the same way** — permanently, until someone
+runs `git worktree prune` by hand. `gc --yes` could not help: the state entry
+was already gone.
 
-Naming a path is how you return a worktree when you are not standing in one —
-but the pool was resolved from your working directory, so the command failed
-with "not a git repository" before it could look at the path.
+`worktree_add` now runs `git worktree prune` first — which only drops
+registrations whose directories are actually gone; locked worktrees are never
+pruned — and retries the add once on failure. Verified end to end: `get
+--lease`, `rm -rf` the slot, `get --lease` succeeds again.
 
-`return` now resolves its pool from the target, the way upstream Go does: the
-built-in layout puts a worktree two levels under its pool, so the pool can be
-read off the path itself — which also means a worktree can be returned after
-the repository is gone. A path that no pool claims still falls back to reading
-the argument as a slot name, so `treehouse return 3` keeps working.
+---
 
-### A git failure named the program twice
+## The state lock no longer spans slow operations
 
-Every git error read `git git rev-parse --show-toplevel: fatal: not a git
-repository`. `GitError`'s `Display` spells the program itself, and the shell
-backend behind the VCS seam also spelled it into the label. The seam had
-already been fixed for this; the backend underneath it had not, and the backend
-was the one answering.
+The "short-lock" protocol was being violated: the exclusive state lock was
+held across per-slot process-table scans, `is_dirty` git calls, `git worktree
+add`/`remove` (seconds on a large repository), `terminate_with_grace`, and
+`remove_dir_all`. Two agents touching the same pool got spurious
+`Lock(Timeout)` errors exactly when the pool was busiest.
 
-### `treehouse enter` never said where it dropped you
+Acquisition, `status`, `destroy`, `prune`, and `gc` now classify outside the
+lock, stamp a reservation inside it, and re-validate on commit — the same
+shape the reset path already used. Git subprocesses and filesystem mutations
+run outside the critical section.
 
-`enter` opened the subshell and printed only `Pool state unchanged.` — no
-banner naming the worktree, and none on the way out. It also reported "the
-pool is empty" for *any* unknown name, even in a pool full of slots, which
-sent you off to create another worktree instead of correcting the name.
+---
 
-It now matches upstream Go:
+## Correctness batch
 
-```
-🌳 Entered worktree 3 at /path/to/pool/3/myrepo. Type 'exit' to leave.
-🌳 Left worktree. Pool state unchanged.
-```
+- **Fresh slots are no longer reset after checkout.** `get` ran
+  `read-tree --reset -u` + `clean -fd` even for a brand-new slot, deleting
+  files that post-checkout hooks or smudge filters had just created. Fresh
+  slots skip the reset; only reused slots are reset.
+- **Hook output can no longer deadlock a command.** A lifecycle hook writing
+  more than ~64 KiB to a piped stdout/stderr blocked in `wait` forever — no
+  timeout, no drain — hanging `get`/`destroy`/`prune`. Hook pipes are now
+  drained concurrently with a timeout.
+- **Path comparison is canonicalized.** `find_by_path` compared paths
+  lexically against git-canonicalized stored paths, so a symlinked prefix
+  (`/var` vs `/private/var` on macOS) made a managed worktree look unmanaged.
+  Both sides are canonicalized when possible.
+- **`gc` actually runs `pre_destroy` hooks.** The code claimed it did;
+  `execute_gc` never wired `GcOptions.pre_destroy`. It does now, matching
+  `prune` and `destroy`.
+- **`doctor` tells the truth.** `disk_free`/`disk_total` returned `0` on Unix,
+  so the disk check always reported "100% free"; `inspect_worktrees` ran
+  `git fetch` — a network *write* — inside a "READ-ONLY" diagnostic; and the
+  dirty probe bypassed the slot's backend, reporting the enclosing
+  repository's dirtiness. Disk probes are implemented, the fetch is gone, and
+  probes route through the worktree's own backend.
+- **Reservation is re-checked before `get` returns.** A concurrent
+  `destroy --include-in-use` could delete the slot between reservation and
+  commit; `get` re-verifies the reservation (owner pid / lease) inside the
+  final critical section.
+- **Leasing a damaged slot is refused.** `lease_existing` could hand out a
+  valid lease on a markerless/damaged slot, which then sat behind the lease
+  where `gc`/`prune`/`destroy` all skip it — bricked behind a valid lease.
 
-and an unknown name lists the slots that exist:
+## Cleanup batch
 
-```
-no worktree named "9" in pool (available: 1, 2, 3). Run 'treehouse status' for details
-```
-
-A shell that cannot be started is now an error instead of a silent success.
-
-### `treehouse watch --root <DIR>` was ignored
-
-`--root` is documented as available on every command, and `watch` lists it in
-its own flag table — but the sweep always covered the user-level root. A
-`watch` pointed at another root swept the **wrong pools, on your own machine**.
-
-`watch`, `gc --all` and `prune --all` now honour `--root` and
-`TREEHOUSE_ROOT`, and sweep the tree they name. With neither set, they sweep
-`~/.treehouse` exactly as before.
-
-### The update notice could name a version that could not be installed
-
-The background update check cached whatever `tag_name` the release API
-returned, without looking at the release's assets. A release shipping no
-archive for your OS/arch was advertised as available — and `treehouse update`
-could never install it, so the notice could never be cleared.
-
-The check now resolves the release's assets first and only advertises a
-version your platform can actually install. `treehouse update` writes the cache
-only after it has really replaced the binary, so a failed update no longer
-leaves a poisoned cache behind.
-
-### A Nix install was told to run a command that cannot work
-
-A treehouse in the Nix store cannot be replaced in place — the store is
-content-addressed and read-only, and such an install is upgraded through Nix.
-`treehouse update` now refuses it with that explanation, and the update notice
-stays silent for it.
-
-### Empty leftover slot directories were never reclaimed
-
-A slot directory left behind by a crashed run — with no state entry — was
-skipped by the allocator forever. It was a directory no command could reach,
-reclaim, or report, sitting on a slot that was never usable again.
-
-An empty leftover is now reclaimed before a new slot is chosen, so the slot
-becomes available again. A leftover that holds anything is left exactly where
-it is — it may be a worktree whose state entry was lost, and its contents are
-somebody's work — and a symlinked slot is never followed and never removed.
+- `treehouse run` with an empty command list panicked indexing
+  `command[0]`; it is now a proper error.
+- Branch names are validated with `git check-ref-format --branch` — git's own
+  authoritative check — instead of a partial reimplementation that missed
+  cases like a lone `@` or per-component `.`-prefixes.
+- `status()` no longer rewrites the state file on every call when healing
+  changed nothing.
+- `watch`'s SIGINT now interrupts an in-flight sweep instead of waiting for
+  it to finish.
+- `--format toon` on a build without the `toon` feature still emits JSON, but
+  now says so on stderr instead of silently downgrading.
+- `TREEHOUSE_UPDATE_TARGET` can no longer redirect a self-update replacement
+  to an arbitrary path from a stray environment variable.
+- `doctor` detects a leftover `HEAD.lock` from a crashed git process and
+  reports that ref updates in that worktree will fail until it is removed.
+- A `git worktree add` that succeeded but whose state write failed no longer
+  orphans the directory silently — the orphan is reclaimed.
 
 ---
 
 ## Still open
 
-Naming these because a reader skimming the source would otherwise assume more
-than has been proven. None of them changed in 0.2.1 or 0.2.2.
+Carried over unchanged from 0.2.2 — naming these because a reader skimming the
+source would otherwise assume more than has been proven.
 
 - **The jj backend is implemented, registered, and not exercised end to end.**
-  `vcs/jj.rs` implements 21 of the `GitBackend` trait's 24 methods behind a
-  `JjRunner` seam, and it is registered unconditionally
-  (`registry.register(BACKEND_JJ, Arc::new(jj::JjBackend::discover()))`), so a
-  `.jj` marker always resolves. Three things are true and worth separating:
-
-  - **No jj binary, no jj run.** `which jj` finds nothing on the machine this
-    release was built on, so every jj test runs against a scripted fake runner.
-    Argument construction, marker and flavour resolution, the fail-closed
-    refusals, and the clean/dirty reset protocol are exercised; **jj's own
-    output formats are not verified by anything in this repository.** Treat jj
-    as built and unproven, not as shipped-and-working.
-  - **Creation does not go through the seam.** Reset, dirty checks, and the
-    guarded reset dispatch per marker, but worktree *creation* still calls
-    `git.worktree_add` directly. A jj workspace that reached creation would get
-    a git worktree. In practice it never gets that far: the pool opens by
-    resolving the repository root through `ShellGitBackend`, which shells out
-    to `git rev-parse --show-toplevel`, so as of this build
-    `TREEHOUSE_VCS=jj treehouse get --lease` in a `.jj`-only directory exits 1
-    with
-
-    ```
-    git rev-parse --show-toplevel: fatal: not a git repository (or any of the parent directories): .git
-    ```
-
-    — a git error naming git, which is the wrong thing to tell someone who
-    correctly selected jj. Moving root resolution behind the seam is in
-    progress; when it lands this string is replaced by a refusal that names the
-    `jj` backend, says it will not fall back to git, and points at `JJ_BIN`. Do
-    not script against either string.
-  - **Seeding is not implemented for jj.** Of the three trait methods jj leaves
-    on their defaults, `resolve_for_worktree` simply dispatches back through the
-    seam, so it costs nothing — but `seed_worktree` and
-    `reset_worktree_with_seeded_paths` refuse, so a jj workspace cannot use
-    `.worktreeinclude`. Everything else jj implements, including
-    `is_worktree_safe_to_reset` and `reset_worktree_to_ref`.
-
-  What is genuinely solid today: `--branch` is refused in a jj workspace with
-  `--branch is only supported by the git backend (cannot create "feat/x" in a jj
-  workspace)` rather than silently writing a git ref that means nothing. One
-  precondition the paragraph above implies and this one did not: that refusal is
-  reached only *after* the repository root resolves, so it is what you see in a
-  checkout git can still open. In a `.jj`-only directory the root never resolves
-  and the git error above is what you get instead.
+  See the 0.2.2 notes; nothing in this release changed it.
 - **VCS selection reads `TREEHOUSE_VCS` only.** The `vcs` key in
-  `treehouse.toml` and `~/.config/treehouse/config.toml` is not consulted —
-  `TreehouseConfig` has no `vcs` field. Opt in through the environment variable.
-- **A missing `jj` binary is not reported as a configuration problem.** The
-  backend is registered even when discovery finds no binary, so a `.jj` marker
-  fails with `jj binary not found on PATH (set JJ_BIN)` rather than `no backend
-  is registered for "jj"`, which would send you looking for a setting that is
-  already correct.
+  `treehouse.toml` and `~/.config/treehouse/config.toml` is not consulted.
+- **A missing `jj` binary is not reported as a configuration problem.**
 - **Windows ARM64 has no prebuilt asset.** The release matrix builds
-  `windows-x86_64` only. On Windows ARM64, `install.ps1` falls back to building
-  from source, which works but is slower.
+  `windows-x86_64` only; on Windows ARM64, `install.ps1` falls back to
+  building from source.
+- **`treehouse run` cleanup still only kills processes whose cwd is inside
+  the worktree.** A child that `chdir`s out, or double-forks, can escape the
+  sweep; a SIGKILL/crash leaves a dirty worktree behind an expired lease with
+  no blessed disposable path yet.
 
 ---
 
@@ -225,7 +168,7 @@ treehouse update
 curl -fsSL https://raw.githubusercontent.com/quangdang46/treehouse_rust/main/install.sh | bash
 ```
 
-Nothing in your scripts needs changing: no flag, output format, exit code, or
-state-file field changed. Existing pools keep working.
+Nothing in your scripts needs changing: no flag, output format, state-file
+field, or documented exit code changed. Existing pools keep working.
 
 Full technical detail is in [CHANGELOG.md](CHANGELOG.md).
