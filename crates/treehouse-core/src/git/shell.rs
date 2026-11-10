@@ -669,17 +669,27 @@ impl GitBackend for ShellGitBackend {
 
     fn worktree_add(&self, repo: &GitRepo, path: &Path, branch: &str) -> Result<(), GitError> {
         let ref_ = self.branch_ref(repo, branch);
-        self.run_checked_args(
-            Some(&repo.common_dir),
-            &[
-                Arg::Lit("worktree"),
-                Arg::Lit("add"),
-                Arg::Lit("--detach"),
-                Arg::Path(path),
-                Arg::Lit(&ref_),
-            ],
-            GitErrorKind::Other,
-        )
+        match self.worktree_add_once(repo, path, &ref_) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                // A worktree directory deleted OUTSIDE git leaves a stale
+                // registration behind: `worktree add` then refuses the path
+                // forever with "missing but already registered worktree",
+                // and every later pool acquisition fails the same way — the
+                // pool entry was already healed away, so nothing else ever
+                // clears the registration. `worktree prune` drops exactly
+                // those entries (locked worktrees are never pruned), then one
+                // retry either succeeds or surfaces the real error — the
+                // retry's own message, since it describes the post-prune
+                // state the operator actually has to fix.
+                let _ = self.run_checked(
+                    Some(&repo.common_dir),
+                    &["worktree", "prune"],
+                    GitErrorKind::Other,
+                );
+                self.worktree_add_once(repo, path, &ref_)
+            }
+        }
     }
 
     fn worktree_remove(&self, repo: &GitRepo, path: &Path) -> Result<(), GitError> {
@@ -1174,6 +1184,24 @@ fn set_mode(_path: &Path, _mode: u32) -> std::io::Result<()> {
 }
 
 impl ShellGitBackend {
+    /// A single `git worktree add --detach <path> <ref_>` attempt, where
+    /// `ref_` is already resolved by [`Self::branch_ref`]. Split out so
+    /// [`GitBackend::worktree_add`] can prune stale registrations and retry
+    /// once without recomputing the ref.
+    fn worktree_add_once(&self, repo: &GitRepo, path: &Path, ref_: &str) -> Result<(), GitError> {
+        self.run_checked_args(
+            Some(&repo.common_dir),
+            &[
+                Arg::Lit("worktree"),
+                Arg::Lit("add"),
+                Arg::Lit("--detach"),
+                Arg::Path(path),
+                Arg::Lit(ref_),
+            ],
+            GitErrorKind::Other,
+        )
+    }
+
     /// `git rev-parse --verify <ref>^{commit}`.
     fn ref_commit(&self, dir: &Path, ref_: &str) -> Result<String, GitError> {
         self.run_stdout(
@@ -1498,6 +1526,41 @@ mod tests {
         assert!(
             !wt.join("scratch.txt").exists(),
             "clean -fd must remove untracked files"
+        );
+    }
+
+    /// A worktree directory deleted OUTSIDE git leaves a stale registration:
+    /// the next `worktree add` at the same path fails with "missing but
+    /// already registered worktree" forever. `worktree_add` must prune the
+    /// stale registration and retry — this is the pool-bricking bug where an
+    /// externally deleted slot made every later `get` fail.
+    #[test]
+    fn integration_worktree_add_prunes_a_deleted_registration() {
+        let (_dir, repo) = temp_repo();
+        let wt = repo.join("wt");
+        let backend = ShellGitBackend::discover().unwrap();
+        let repo_ref = GitRepo {
+            common_dir: repo.clone(),
+            worktree: None,
+        };
+
+        backend.worktree_add(&repo_ref, &wt, "main").unwrap();
+        assert!(wt.join(".git").exists());
+
+        // External deletion: the directory AND its gitdir pointer go away,
+        // but `git worktree list` still shows the registration as prunable.
+        std::fs::remove_dir_all(&wt).unwrap();
+
+        // Before the fix this returned the "already registered" error on
+        // every call; now the stale registration is pruned and the add
+        // succeeds.
+        backend
+            .worktree_add(&repo_ref, &wt, "main")
+            .expect("worktree_add must recover a stale registration");
+        assert!(wt.join(".git").exists(), "the retried add must land");
+        assert!(
+            !backend.is_dirty(&wt).unwrap(),
+            "the re-added worktree must be clean"
         );
     }
 
