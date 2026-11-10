@@ -120,12 +120,23 @@ impl ShellGitBackend {
     }
 
     /// Runs `git <args>` in `cwd`, returning the `Output` (no exit-code check).
-    fn run(&self, cwd: Option<&Path>, args: &[&str]) -> Output {
+    ///
+    /// A SPAWN failure is an `Err`, never a synthetic `Output`: there is no
+    /// portable non-success `ExitStatus`, and `ExitStatus::default()` reports
+    /// SUCCESS — which is how a git binary that vanished between discovery and
+    /// use used to read as "clean worktree, merged HEAD", green-lighting
+    /// `remove_dir_all` on trees nobody verified.
+    fn run(&self, cwd: Option<&Path>, args: &[&str]) -> Result<Output, GitError> {
         self.run_os(cwd, args.iter().map(|s| OsString::from(*s)).collect())
     }
 
     /// The spawn itself, with arguments already converted to the OS form.
-    fn run_os(&self, cwd: Option<&Path>, args: Vec<OsString>) -> Output {
+    fn run_os(&self, cwd: Option<&Path>, args: Vec<OsString>) -> Result<Output, GitError> {
+        let command = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
         let mut cmd = Command::new(&self.git_bin);
         // `-c submodule.recurse=false` (upstream #177): the pooled operations
         // must not walk into submodules just because the operator's global
@@ -138,15 +149,15 @@ impl ShellGitBackend {
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
-        cmd.output().unwrap_or_else(|e| {
+        cmd.output().map_err(|e| {
             // If git is missing at runtime (deleted since discovery), surface
             // the spawn error so callers see a hard failure, not a silent
             // empty success.
-            Output {
-                status: std::process::ExitStatus::default(),
-                stdout: Vec::new(),
-                stderr: format!("git binary failed to spawn: {e}").into_bytes(),
-            }
+            GitError::new(
+                command,
+                format!("git binary failed to spawn: {e}"),
+                GitErrorKind::Other,
+            )
         })
     }
 
@@ -158,7 +169,7 @@ impl ShellGitBackend {
         args: &[&str],
         kind: GitErrorKind,
     ) -> Result<(), GitError> {
-        let output = self.run(cwd, args);
+        let output = self.run(cwd, args)?;
         checked(output, crate::vcs::git_label(args), kind)
     }
 
@@ -178,7 +189,7 @@ impl ShellGitBackend {
             .map(|a| a.to_os_string().to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join(" ");
-        let output = self.run_os(cwd, args.iter().map(Arg::to_os_string).collect());
+        let output = self.run_os(cwd, args.iter().map(Arg::to_os_string).collect())?;
         checked(output, command, kind)
     }
 
@@ -190,7 +201,7 @@ impl ShellGitBackend {
         args: &[&str],
         kind: GitErrorKind,
     ) -> Result<String, GitError> {
-        let output = self.run(cwd, args);
+        let output = self.run(cwd, args)?;
         if !output.status.success() {
             let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
             let command = crate::vcs::git_label(args);
@@ -206,7 +217,7 @@ impl ShellGitBackend {
         args: &[&str],
         kind: GitErrorKind,
     ) -> Result<String, GitError> {
-        let output = self.run(cwd, args);
+        let output = self.run(cwd, args)?;
         if !output.status.success() {
             let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
             let command = crate::vcs::git_label(args);
@@ -236,7 +247,7 @@ impl ShellGitBackend {
             .map(|a| a.to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join(" ");
-        let output = self.run_os(cwd, args);
+        let output = self.run_os(cwd, args)?;
         if !output.status.success() {
             let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
             return Err(GitError::new(command, message, GitErrorKind::Other));
@@ -644,7 +655,7 @@ impl GitBackend for ShellGitBackend {
         if !self.has_remote(repo, "origin") {
             return Ok(());
         }
-        let out = self.run(Some(&repo.common_dir), &["fetch", "origin"]);
+        let out = self.run(Some(&repo.common_dir), &["fetch", "origin"])?;
         if out.status.success() {
             return Ok(());
         }
@@ -723,7 +734,7 @@ impl GitBackend for ShellGitBackend {
             GitErrorKind::Other,
         )?;
 
-        let checkout = self.run(Some(worktree), &["checkout", branch]);
+        let checkout = self.run(Some(worktree), &["checkout", branch])?;
         if !checkout.status.success() {
             return Err(GitError::new(
                 format!("checkout {branch}"),
@@ -759,7 +770,9 @@ impl GitBackend for ShellGitBackend {
     }
 
     fn local_branch_exists(&self, repo: &GitRepo, branch: &str) -> bool {
-        let out = self.run(
+        // A spawn failure cannot prove the branch exists — report false and
+        // let the caller's own git calls surface the missing binary.
+        self.run(
             Some(&repo.common_dir),
             &[
                 "show-ref",
@@ -767,8 +780,9 @@ impl GitBackend for ShellGitBackend {
                 "--quiet",
                 &format!("refs/heads/{branch}"),
             ],
-        );
-        out.status.success()
+        )
+        .map(|out| out.status.success())
+        .unwrap_or(false)
     }
 
     fn is_dirty(&self, worktree: &Path) -> Result<bool, GitError> {
@@ -825,7 +839,7 @@ impl GitBackend for ShellGitBackend {
         let out = self.run(
             Some(worktree),
             &["merge-base", "--is-ancestor", "HEAD", reference],
-        );
+        )?;
         if out.status.success() {
             return Ok(true);
         }
@@ -848,7 +862,7 @@ impl GitBackend for ShellGitBackend {
             let out = self.run(
                 Some(&repo.common_dir),
                 &["ls-remote", "--symref", "origin", "HEAD"],
-            );
+            )?;
             if !out.status.success() {
                 let message = String::from_utf8_lossy(&out.stderr).trim().to_string();
                 return Err(GitError::new(
@@ -1172,15 +1186,15 @@ impl ShellGitBackend {
     /// Whether a ref exists (`rev-parse --verify` succeeds).
     fn ref_exists(&self, dir: &Path, ref_: &str) -> bool {
         self.run(Some(dir), &["rev-parse", "--verify", ref_])
-            .status
-            .success()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
     }
 
     /// Whether ref `a` is an ancestor of ref `b` (merge-base --is-ancestor).
     fn is_ancestor(&self, dir: &Path, a: &str, b: &str) -> bool {
         self.run(Some(dir), &["merge-base", "--is-ancestor", a, b])
-            .status
-            .success()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
     }
 }
 
@@ -1192,6 +1206,47 @@ mod tests {
     fn discover_finds_git() {
         let backend = ShellGitBackend::discover().expect("git must be installed");
         assert!(backend.git_bin.exists(), "git binary path must exist");
+    }
+
+    /// A git binary that cannot be spawned must surface as `Err` everywhere it
+    /// matters — never as the `ExitStatus::default()` SUCCESS the runner used
+    /// to synthesize. `is_dirty -> false` plus `is_head_merged_into_ref ->
+    /// true` was the lethal pair: gc/prune/destroy read both as "verified
+    /// safe" and ran `remove_dir_all` on worktrees nobody checked.
+    ///
+    /// `with_bin` stands in for `GIT_BIN` pointing at a vanished binary:
+    /// `discover` validates existence up front, so the runtime-missing case
+    /// can only be reached through an explicit path.
+    #[test]
+    fn spawn_failure_is_an_error_not_a_success() {
+        let missing = PathBuf::from(if cfg!(windows) {
+            "C:\\definitely-not-here\\git.exe"
+        } else {
+            "/definitely/not/here/git"
+        });
+        let backend = ShellGitBackend::with_bin(missing);
+        let (_dir, repo) = temp_repo();
+        let wt = repo.join("wt");
+
+        let err = backend
+            .is_dirty(&wt)
+            .expect_err("is_dirty must fail when git cannot spawn");
+        assert!(
+            err.message.contains("failed to spawn"),
+            "the spawn failure must be named, got: {err}"
+        );
+
+        backend
+            .is_head_merged_into_ref(&wt, "main")
+            .expect_err("is_head_merged_into_ref must fail when git cannot spawn");
+
+        let repo_ref = GitRepo {
+            common_dir: repo.clone(),
+            worktree: None,
+        };
+        backend
+            .default_branch(&repo_ref)
+            .expect_err("default_branch must fail when git cannot spawn");
     }
 
     // ---- integration tests against a real git repo (port of git_test.go) ----
