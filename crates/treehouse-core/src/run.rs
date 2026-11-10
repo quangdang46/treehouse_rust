@@ -57,6 +57,16 @@ pub struct RunResult {
 /// Runs a command inside an acquired worktree, guaranteeing cleanup on every
 /// exit path.
 pub fn run(pool: &Pool, opts: &RunOptions) -> Result<RunResult, PoolError> {
+    // An empty command must fail BEFORE the acquire: `spawn_child` indexes
+    // `command[0]` and the CLI's `required` only guards the binary's own
+    // parser — a library caller passing `vec![]` would otherwise panic, and
+    // validating after `pool.get` would leak a leased slot on the way out.
+    if opts.command.is_empty() {
+        return Err(PoolError::Io(
+            "run requires a command".to_string(),
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty command"),
+        ));
+    }
     let ttl_chrono = chrono::Duration::from_std(opts.ttl).unwrap_or(chrono::Duration::hours(24));
     let lease_opts = LeaseAcquireOptions {
         holder: opts.holder.clone(),
@@ -193,6 +203,13 @@ struct CleanupGuard<'a> {
 
 impl CleanupGuard<'_> {
     /// Cleans up: terminate lingering processes, reset, release the lease.
+    ///
+    /// Scope of the kill: `terminate_with_grace` only signals processes whose
+    /// working directory is INSIDE this worktree (the `find_in_worktree`
+    /// cwd match, minus treehouse's own protected chain). A process the agent
+    /// spawned that `cd`'d elsewhere, or one holding the tree open without
+    /// living in it, is NOT killed — it simply makes later pool commands see
+    /// the slot as in-use until it exits on its own.
     fn run(&self) -> CleanupOutcome {
         // 1. Terminate lingering processes in the worktree (2s grace).
         let _ = self

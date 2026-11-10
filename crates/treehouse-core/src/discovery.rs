@@ -553,6 +553,7 @@ mod tests {
             let opts = crate::gc::GcOptions {
                 dry_run: true,
                 prune_orphans: false,
+                ..Default::default()
             };
             let result = pool.gc(&opts).unwrap();
             gc_results.push((pool.pool_dir().to_path_buf(), result));
@@ -587,6 +588,7 @@ mod tests {
                     let opts = crate::gc::GcOptions {
                         dry_run: true,
                         prune_orphans: false,
+                        ..Default::default()
                     };
                     results.push((pool_dir, p.gc(&opts).unwrap()));
                 }

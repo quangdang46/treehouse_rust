@@ -464,27 +464,111 @@ impl Pool {
             }
         }
 
-        // Phase 2: RE-CLASSIFY + physical cleanup + state commit.
-        //
-        // The plan's verdict is not trusted: between planning and here the
-        // `pre_destroy` hooks have run with no lock held, so a slot can have
-        // gone dirty, gained a process, or landed on a different HEAD. Go
-        // re-runs the whole classification inside the deleting lock
-        // (`finalPruneSafetyCheck`, prune.go:607-625) and clears the
-        // reservation on a skip, which is what makes the two-phase contract
-        // mean anything.
+        // Phase 2a (LOCK, short): re-validate every reservation on a fresh
+        // healed snapshot. The `pre_destroy` hooks ran with no lock held, so
+        // a slot can have been taken over; a mismatched reservation is never
+        // removed and its state is left to its new owner.
+        let snapshot =
+            crate::pool::healed_state_snapshot(&self.dir, self.lock_timeout, &self.process)?;
+
+        // Phase 2b (OUTSIDE lock): RE-CLASSIFY + physical cleanup. The plan's
+        // verdict is not trusted: between planning and here the hooks have
+        // run unlocked, so a slot can have gone dirty, gained a process, or
+        // landed on a different HEAD (Go `finalPruneSafetyCheck`,
+        // prune.go:607-625).
         //
         // Invariant: a worktree is removed from state **only** when cleanup
-        // fully succeeds. On failure the entry is retained, reservation
-        // restored, so the next prune run can retry.
+        // fully succeeds. On failure the entry is retained with its
+        // reservation restored, so the next prune run can retry.
+        let mut pruned = Vec::new();
+        let mut skipped = Vec::new();
+        let mut errors = Vec::new();
+        // Deferred state commits, applied under the single phase-2c lock.
+        let mut commits: Vec<PruneCommit> = Vec::new();
+        for (reservation, worktree, context) in &reserved {
+            let Some(live) = snapshot.iter().find(|w| w.path == reservation.worktree) else {
+                continue;
+            };
+            if !reservation.matches(live) {
+                continue; // re-acquired mid-hook; never remove
+            }
+            let path = live.path.clone();
+
+            // Re-classify against the state we just read.
+            if let Some(skip) =
+                self.final_prune_safety_check(live, context, opts, worktree.orphaned)
+            {
+                commits.push(PruneCommit::Restore(reservation.clone()));
+                skipped.push(skip);
+                continue;
+            }
+
+            let repo = crate::git::GitRepo {
+                common_dir: context.repo_root.clone(),
+                worktree: None,
+            };
+            let orphaned = worktree.orphaned;
+
+            // A: VCS deregistration. `remove_clean_worktree` is the
+            // NON-FORCED removal (Go `RemoveCleanWorktree`, prune.go:551):
+            // prune only ever deletes worktrees it has just proven clean,
+            // and a forced removal would happily discard content that
+            // became uncommitted inside the hook window. An orphan has no
+            // live repository to deregister from, so it takes the
+            // filesystem route alone (Go prune.go:535-550).
+            let mut cleanup_ok = true;
+            if !orphaned && let Err(e) = self.git.remove_clean_worktree(&repo, Path::new(&path)) {
+                errors.push(CleanupError {
+                    name: worktree.name.clone(),
+                    path: path.clone(),
+                    phase: "git_worktree_remove".into(),
+                    detail: e.to_string(),
+                });
+                cleanup_ok = false;
+            }
+
+            // B: filesystem removal (skip if git remove already failed).
+            if cleanup_ok {
+                match std::fs::remove_dir_all(Path::new(&path)) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Path already gone (git removed it) — not an error.
+                    }
+                    Err(e) => {
+                        errors.push(CleanupError {
+                            name: worktree.name.clone(),
+                            path: path.clone(),
+                            phase: "filesystem_remove".into(),
+                            detail: e.to_string(),
+                        });
+                        cleanup_ok = false;
+                    }
+                }
+            }
+
+            if cleanup_ok {
+                commits.push(PruneCommit::Remove(reservation.clone()));
+                pruned.push(worktree.clone());
+            } else {
+                // Retain the entry, but drop OUR reservation from it. Left
+                // stamped, the slot reads as `destroying` and every
+                // subsequent prune skips it until this process exits, which
+                // turns one failed cleanup into a permanently unprunable
+                // slot.
+                commits.push(PruneCommit::Restore(reservation.clone()));
+            }
+        }
+
+        // Phase 2c (LOCK, short): apply every deferred state commit.
         crate::pool::with_pool_lock(&self.dir, self.lock_timeout, || {
             let mut state = State::read_state(&self.dir).map_err(PoolError::State)?;
-            let mut pruned = Vec::new();
-            let mut skipped = Vec::new();
+            heal_state(&mut state, |pid| self.process.started_at(pid));
             let mut removed = std::collections::HashSet::new();
-            let mut errors = Vec::new();
-
-            for (reservation, worktree, context) in &reserved {
+            for commit in &commits {
+                let (reservation, remove) = match commit {
+                    PruneCommit::Remove(r) => (r, true),
+                    PruneCommit::Restore(r) => (r, false),
+                };
                 let Some(idx) = state
                     .worktrees
                     .iter()
@@ -493,88 +577,25 @@ impl Pool {
                     continue;
                 };
                 if !reservation.matches(&state.worktrees[idx]) {
-                    continue; // re-acquired mid-hook; never remove
-                }
-                let path = state.worktrees[idx].path.clone();
-
-                // Re-classify against the state we just read.
-                if let Some(skip) = self.final_prune_safety_check(
-                    &state.worktrees[idx],
-                    context,
-                    opts,
-                    worktree.orphaned,
-                ) {
-                    reservation.restore_original(&mut state.worktrees[idx]);
-                    skipped.push(skip);
                     continue;
                 }
-
-                let repo = crate::git::GitRepo {
-                    common_dir: context.repo_root.clone(),
-                    worktree: None,
-                };
-                let orphaned = worktree.orphaned;
-
-                // A: VCS deregistration. `remove_clean_worktree` is the
-                // NON-FORCED removal (Go `RemoveCleanWorktree`, prune.go:551):
-                // prune only ever deletes worktrees it has just proven clean,
-                // and a forced removal would happily discard content that
-                // became uncommitted inside the hook window. An orphan has no
-                // live repository to deregister from, so it takes the
-                // filesystem route alone (Go prune.go:535-550).
-                let mut cleanup_ok = true;
-                if !orphaned && let Err(e) = self.git.remove_clean_worktree(&repo, Path::new(&path))
-                {
-                    errors.push(CleanupError {
-                        name: worktree.name.clone(),
-                        path: path.clone(),
-                        phase: "git_worktree_remove".into(),
-                        detail: e.to_string(),
-                    });
-                    cleanup_ok = false;
-                }
-
-                // B: filesystem removal (skip if git remove already failed).
-                if cleanup_ok {
-                    match std::fs::remove_dir_all(Path::new(&path)) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            // Path already gone (git removed it) — not an error.
-                        }
-                        Err(e) => {
-                            errors.push(CleanupError {
-                                name: worktree.name.clone(),
-                                path: path.clone(),
-                                phase: "filesystem_remove".into(),
-                                detail: e.to_string(),
-                            });
-                            cleanup_ok = false;
-                        }
-                    }
-                }
-
-                if cleanup_ok {
-                    removed.insert(path.clone());
-                    pruned.push(worktree.clone());
+                if remove {
+                    removed.insert(reservation.worktree.clone());
                 } else {
-                    // Retain the entry, but drop OUR reservation from it. Left
-                    // stamped, the slot reads as `destroying` and every
-                    // subsequent prune skips it until this process exits, which
-                    // turns one failed cleanup into a permanently unprunable
-                    // slot.
                     reservation.restore_original(&mut state.worktrees[idx]);
                 }
             }
-
             state.worktrees.retain(|w| !removed.contains(&w.path));
             state_file::write_state(&self.dir, &state)
                 .map_err(|e| PoolError::Io("writing state".into(), e))?;
-            Ok::<_, PoolError>((pruned, skipped, errors))
-        })
+            Ok::<_, PoolError>(())
+        })?;
+
+        Ok((pruned, skipped, errors))
     }
 
-    /// The last word on disposability, run inside the deleting lock (Go
-    /// `finalPruneSafetyCheck` / `finalOrphanPruneSafetyCheck`).
+    /// The last word on disposability, run against the post-hook snapshot
+    /// (Go `finalPruneSafetyCheck` / `finalOrphanPruneSafetyCheck`).
     ///
     /// Returns `Some(skip)` when the slot must be left alone, `None` when it is
     /// still disposable. Deliberately re-derives everything — in-use, dirty,
@@ -662,15 +683,19 @@ impl Pool {
     }
 }
 
-/// Snapshot: read + heal + write under one lock.
+/// A deferred state mutation from prune's outside-lock phase, applied under
+/// the single phase-2c lock once all physical work is done.
+enum PruneCommit {
+    /// The worktree was physically removed: drop its state entry.
+    Remove(Reservation),
+    /// The slot was skipped or cleanup failed: restore the pre-destroy owner.
+    Restore(Reservation),
+}
+
+/// Snapshot: read + heal under one short lock; writes state back only when
+/// healing changed an entry. All per-slot probes run outside the lock.
 pub(crate) fn with_pool_snapshot(pool: &Pool) -> Result<Vec<WorktreeEntry>, PoolError> {
-    crate::pool::with_pool_lock(&pool.dir, pool.lock_timeout, || {
-        let mut state = State::read_state(&pool.dir).map_err(PoolError::State)?;
-        heal_state(&mut state, |pid| pool.process.started_at(pid));
-        state_file::write_state(&pool.dir, &state)
-            .map_err(|e| PoolError::Io("writing state".into(), e))?;
-        Ok(state.worktrees.clone())
-    })
+    crate::pool::healed_state_snapshot(&pool.dir, pool.lock_timeout, &pool.process)
 }
 
 /// Recursively measures a directory's size (Go `dirSize`).

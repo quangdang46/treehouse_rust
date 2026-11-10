@@ -763,6 +763,17 @@ fn cmd_return_all(cli: &Cli, args: &cli::ReturnArgs) -> Result<()> {
     let mut failed: Vec<String> = Vec::new();
     for wt in &targets {
         eprintln!("🌳 Returning {} ({}) at {}", wt.name, wt.status, wt.path);
+        // A bulk sweep releases leases it does not own: the listing pinned the
+        // lease id, which guards against a takeover MID-run, but a slot that
+        // was already leased to another agent when the sweep started is still
+        // returned. Say so out loud — the narrow `treehouse return <path>` is
+        // the deliberate way to hand back somebody else's slot.
+        if wt.status == treehouse_core::pool::STATUS_LEASED && !wt.lease_holder.is_empty() {
+            eprintln!(
+                "   note: {} is leased to {:?}; --all returns it anyway. To return only your own work, name the worktree or use --if-lease-holder.",
+                wt.name, wt.lease_holder
+            );
+        }
         // Pin the lease THIS listing saw. The two instants are separated by
         // every earlier confirmation in the run, a far wider window than a
         // named return has.
@@ -1387,6 +1398,7 @@ fn cmd_gc(cli: &Cli, args: &cli::GcArgs) -> Result<()> {
     let opts = treehouse_core::gc::GcOptions {
         dry_run: !args.yes,
         prune_orphans: args.prune_orphans,
+        ..Default::default()
     };
     let result = pool.gc(&opts)?;
 
@@ -1407,6 +1419,7 @@ fn cmd_gc_all(cli: &Cli, args: &cli::GcArgs) -> Result<()> {
     let opts = treehouse_core::gc::GcOptions {
         dry_run: !args.yes,
         prune_orphans: args.prune_orphans,
+        ..Default::default()
     };
     let root = sweep_root(cli)?;
     let (merged, pool_count) = sweep_all_pools(&opts, root.as_deref())?;
@@ -1482,6 +1495,18 @@ fn sweep_all_pools(
     opts: &treehouse_core::gc::GcOptions,
     root: Option<&Path>,
 ) -> Result<(treehouse_core::gc::GcResult, u32), anyhow::Error> {
+    sweep_all_pools_cancel(opts, root, None)
+}
+
+/// `sweep_all_pools` with an optional cancellation flag checked before each
+/// pool's gc: `watch` sets it on SIGINT/SIGTERM so a long sweep stops
+/// STARTING new pools instead of running every remaining one to completion.
+/// Pools already swept keep their results; the flag only gates the rest.
+fn sweep_all_pools_cancel(
+    opts: &treehouse_core::gc::GcOptions,
+    root: Option<&Path>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<(treehouse_core::gc::GcResult, u32), anyhow::Error> {
     let user = treehouse_core::config::TreehouseConfig::load_global()?;
     let mut results: Vec<(PathBuf, _)> = Vec::new();
     let ctx_factory =
@@ -1495,6 +1520,9 @@ fn sweep_all_pools(
             )
         };
     let per_pool = |pool: &treehouse_core::pool::Pool| {
+        if cancel.is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Ok(());
+        }
         let pool_dir = pool.pool_dir().to_path_buf();
         match pool.gc(opts) {
             Ok(result) => {
@@ -1542,6 +1570,7 @@ fn cmd_watch(cli: &Cli, args: &cli::WatchArgs) -> Result<()> {
     let opts = treehouse_core::gc::GcOptions {
         dry_run: !args.yes,
         prune_orphans: args.prune_orphans,
+        ..Default::default()
     };
 
     let orphans_included = args.prune_orphans;
@@ -1593,7 +1622,11 @@ fn cmd_watch(cli: &Cli, args: &cli::WatchArgs) -> Result<()> {
 
     let mut had_pool_errors = false;
     while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-        let (merged, pool_count) = sweep_all_pools(&opts, root.as_deref())?;
+        // The flag is ALSO the mid-sweep cancel: a SIGINT landing while
+        // `sweep_all_pools` is between pools stops it STARTING the rest, so
+        // shutdown is prompt even with many pools instead of waiting out the
+        // whole sweep.
+        let (merged, pool_count) = sweep_all_pools_cancel(&opts, root.as_deref(), Some(&shutdown))?;
         let has_errors = !merged.errors.is_empty();
         had_pool_errors = had_pool_errors || has_errors;
 
@@ -1799,6 +1832,14 @@ const ENV_UPDATE_API_URL: &str = "TREEHOUSE_UPDATE_API_URL";
 /// Production resolves the running executable. A packager staging an install
 /// prefix, and the test that proves the download→verify→replace pipeline is
 /// wired, both need to aim somewhere that is not the executable under test.
+///
+/// Honored ONLY in debug builds: in a release binary an env-var-controlled
+/// replacement target is an arbitrary-file-overwrite primitive (the update
+/// flow writes the downloaded archive over whatever path this names), so a
+/// stray or hostile `TREEHOUSE_UPDATE_TARGET` in a user's environment must
+/// never redirect it. `cargo test`/dev builds keep the override so the e2e
+/// pipeline test can aim at a scratch binary.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
 const ENV_UPDATE_TARGET: &str = "TREEHOUSE_UPDATE_TARGET";
 
 /// Update treehouse to the latest release.
@@ -1889,9 +1930,14 @@ fn update_api_endpoint() -> (String, bool) {
 /// because the override has to bypass it, and a second `canonicalize` is
 /// cheaper than a second code path through the replacement.
 fn update_target() -> Result<PathBuf> {
+    // Debug builds only — see `ENV_UPDATE_TARGET`. A release binary ignores
+    // the variable entirely rather than warning, so a stray value in the
+    // environment cannot even be probed for.
+    #[cfg(debug_assertions)]
     if let Ok(target) = std::env::var(ENV_UPDATE_TARGET)
         && !target.trim().is_empty()
     {
+        eprintln!("note: {ENV_UPDATE_TARGET} is set; replacing {target}");
         return Ok(PathBuf::from(target.trim()));
     }
     let exe = std::env::current_exe().map_err(|e| anyhow!("resolving executable: {e}"))?;

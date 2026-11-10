@@ -177,6 +177,18 @@ pub trait GitBackend: Send + Sync {
     /// `--branch` against an existing ref rather than silently adopting it.
     fn local_branch_exists(&self, repo: &GitRepo, branch: &str) -> bool;
 
+    /// `git check-ref-format --branch <name>`: the AUTHORITATIVE branch-name
+    /// validation. Callers run a cheap lexical pre-check first (no subprocess
+    /// for the common typo), but only git's own validator is complete — a bare
+    /// `@`, a path component ending in `.`, and the `@{-N}` shorthand edges
+    /// are exactly where hand-rolled rules diverge. Default: `Ok(())` —
+    /// backends that cannot answer skip it and the lexical check still
+    /// applies. Git overrides with the real command.
+    fn check_branch_name(&self, repo: &GitRepo, branch: &str) -> Result<(), GitError> {
+        let _ = (repo, branch);
+        Ok(())
+    }
+
     /// Whether the worktree has tracked or untracked changes (Go `IsDirty`):
     /// `git status --porcelain --untracked-files=all` — ANY output is dirty.
     /// The `--untracked-files=all` flag is load-bearing: it forces untracked

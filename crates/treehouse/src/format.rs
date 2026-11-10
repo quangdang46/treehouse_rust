@@ -260,6 +260,14 @@ fn render_toon(
         }
         #[cfg(not(feature = "toon"))]
         {
+            // The fallback is silent JSON: a caller that asked for TOON and
+            // got JSON with no signal parses it happily and never knows the
+            // token savings were not real. Say so on stderr (the data channel
+            // stays clean).
+            let _ = writeln!(
+                _err,
+                "warning: this build lacks the `toon` feature; emitting JSON instead of TOON"
+            );
             writeln!(
                 out,
                 "{}",

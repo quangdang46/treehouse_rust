@@ -224,12 +224,7 @@ fn inspect_worktrees(pool: &Pool) -> Result<Vec<DoctorCheck>, PoolError> {
     let mut orphans = Vec::new();
     let mut dirty = Vec::new();
     let mut in_use = Vec::new();
-
-    let repo_root = pool
-        .git
-        .main_repo_root(&pool.root)
-        .unwrap_or_else(|_| pool.root.clone());
-    let default_ref = pool.resolve_prune_default_ref(&repo_root);
+    let mut head_locks = Vec::new();
 
     for wt in &state.worktrees {
         if wt.destroying {
@@ -254,9 +249,21 @@ fn inspect_worktrees(pool: &Pool) -> Result<Vec<DoctorCheck>, PoolError> {
         if pool.backing_repository_missing(&wt.path) {
             orphans.push(PathBuf::from(&wt.path));
         }
-        // Dirty.
-        if pool.git_is_dirty(Path::new(&wt.path)).unwrap_or(false) {
+        // Dirty — dispatched on the SLOT's own backend marker, never on the
+        // pool's git backend: a `.jj` slot probed with git would report the
+        // failure in git's vocabulary, and a markerless slot would be
+        // answered by whatever repository encloses the pool. Markerless
+        // slots are skipped here (they surface as orphans/damaged instead).
+        let slot = Path::new(&wt.path);
+        if !crate::pool::slot_backend_name(slot).is_empty() && pool.slot_is_dirty(slot) {
             dirty.push(PathBuf::from(&wt.path));
+        }
+        // A leftover HEAD.lock means a git process died mid-ref-update; every
+        // later ref write in that worktree fails until it is removed.
+        if let Some(gitdir) = worktree_gitdir(slot)
+            && gitdir.join("HEAD.lock").exists()
+        {
+            head_locks.push(PathBuf::from(&wt.path));
         }
         // In-use (live process or live owner).
         let proc_in_use = pool
@@ -267,7 +274,6 @@ fn inspect_worktrees(pool: &Pool) -> Result<Vec<DoctorCheck>, PoolError> {
             in_use.push(PathBuf::from(&wt.path));
         }
     }
-    let _ = default_ref;
     let _ = reclaimable;
 
     Ok(vec![
@@ -309,7 +315,27 @@ fn inspect_worktrees(pool: &Pool) -> Result<Vec<DoctorCheck>, PoolError> {
             "live process or owner reservation",
             in_use,
         ),
+        check_group(
+            "stale_head_locks",
+            Severity::Warn,
+            "HEAD.lock left by a crashed git process; ref updates in this worktree will fail until it is removed",
+            head_locks,
+        ),
     ])
+}
+
+/// The gitdir a worktree's `.git` file points at (linked worktrees carry a
+/// `gitdir:` pointer file rather than a directory). `None` for a markerless
+/// or unreadable slot.
+fn worktree_gitdir(worktree: &Path) -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(worktree.join(".git")).ok()?;
+    let gitdir = contents.strip_prefix("gitdir:")?.trim();
+    let p = Path::new(gitdir);
+    Some(if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        worktree.join(p)
+    })
 }
 
 fn check_group(
@@ -359,11 +385,38 @@ fn check_disk(pool: &Pool) -> DoctorCheck {
     }
 }
 
+/// `statvfs` for the pool's filesystem. `f_bavail` counts blocks available to
+/// unprivileged callers (what "free" means to a user); `f_frsize` is the
+/// fundamental block size, falling back to `f_bsize` where it is 0.
 #[cfg(unix)]
-fn disk_free(_p: &Path) -> u64 {
-    // Use statvfs via libc-free approach: report 0 (unknown) to avoid a dep.
-    let _ = _p;
-    0
+fn statvfs_for(p: &Path) -> Option<libc::statvfs> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(p.as_os_str().as_bytes()).ok()?;
+    unsafe {
+        let mut st: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut st) == 0 {
+            Some(st)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(unix)]
+fn disk_free(p: &Path) -> u64 {
+    statvfs_for(p)
+        .map(|s| {
+            // Field widths differ across unixes (fsblkcnt_t is u32 on macOS,
+            // u64 on Linux); u128 covers both and the product cannot overflow.
+            let frsize = u128::from(if s.f_frsize > 0 {
+                s.f_frsize
+            } else {
+                s.f_bsize
+            });
+            let bytes = u128::from(s.f_bavail) * frsize;
+            u64::try_from(bytes).unwrap_or(u64::MAX)
+        })
+        .unwrap_or(0)
 }
 
 #[cfg(windows)]
@@ -385,8 +438,18 @@ fn disk_free(p: &Path) -> u64 {
 }
 
 #[cfg(unix)]
-fn disk_total(_p: &Path) -> u64 {
-    0
+fn disk_total(p: &Path) -> u64 {
+    statvfs_for(p)
+        .map(|s| {
+            let frsize = u128::from(if s.f_frsize > 0 {
+                s.f_frsize
+            } else {
+                s.f_bsize
+            });
+            let bytes = u128::from(s.f_blocks) * frsize;
+            u64::try_from(bytes).unwrap_or(u64::MAX)
+        })
+        .unwrap_or(0)
 }
 
 #[cfg(windows)]

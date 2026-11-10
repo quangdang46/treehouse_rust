@@ -779,6 +779,17 @@ impl GitBackend for ShellGitBackend {
         Ok(())
     }
 
+    fn check_branch_name(&self, repo: &GitRepo, branch: &str) -> Result<(), GitError> {
+        // `--branch` validates the branch SHORTHAND (and expands `@{-N}`).
+        // The plumbing takes no `--` separator, but the caller's lexical
+        // check has already refused option-shaped names.
+        self.run_checked(
+            Some(&repo.common_dir),
+            &["check-ref-format", "--branch", branch],
+            GitErrorKind::Other,
+        )
+    }
+
     fn local_branch_exists(&self, repo: &GitRepo, branch: &str) -> bool {
         // A spawn failure cannot prove the branch exists — report false and
         // let the caller's own git calls surface the missing binary.

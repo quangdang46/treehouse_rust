@@ -119,12 +119,15 @@ impl Pool {
         let mut resolver = crate::prune::PruneContextResolver::new(self);
 
         // Build the target list: all managed worktrees, or just the named one.
-        let state = State::read_state(&self.dir).map_err(PoolError::State)?;
+        // Healed snapshot under a short lock — the plan phase's probes all
+        // run outside it (see `execute_destroy`).
+        let entries =
+            crate::pool::healed_state_snapshot(&self.dir, self.lock_timeout, &self.process)?;
         let targets: Vec<WorktreeEntry> = match spec {
-            DestroyTargetSpec::All => state.worktrees.clone(),
+            DestroyTargetSpec::All => entries.clone(),
             DestroyTargetSpec::Single(path) => {
                 let mut found = None;
-                for wt in &state.worktrees {
+                for wt in &entries {
                     if wt.path == *path {
                         found = Some(wt.clone());
                         break;
@@ -304,6 +307,18 @@ impl Pool {
     ///
     /// Each planned target arrives with the context resolved from its OWN path,
     /// and that per-slot `repo_root` is what `worktree_remove` runs against.
+    ///
+    /// Lock discipline (the audit's lock-scope finding): the state lock is
+    /// held only for state reads/writes. The per-slot classification probes
+    /// (process scans, `git status`, merge checks) and ALL destructive work —
+    /// `terminate_with_grace`, `git worktree remove`, `remove_dir_all` — run
+    /// OUTSIDE it. Safety is preserved by the two-phase contract: the
+    /// `Destroying` reservation stamped in phase 1 blocks every other pool
+    /// command (`get`, `return`, `prune`, `gc`, `status` all skip or refuse
+    /// `destroying` entries), the reservation is re-validated on a fresh
+    /// snapshot before each slot's external work, and the authoritative
+    /// re-classification runs immediately before `worktree_remove` — the same
+    /// ordering Go's in-lock version had, minus the lock-held subprocesses.
     fn execute_destroy(
         &self,
         removable: &[(DestroyTarget, crate::prune::PruneContext)],
@@ -321,56 +336,101 @@ impl Pool {
             .map(|(t, ctx)| (t.path.clone(), (t.clone(), ctx.clone())))
             .collect();
 
-        // Phase 1: reserve Destroying + fresh owner under the lock.
-        //
-        // Returns the skips alongside the reservations: a target that flips to
-        // non-removable between the plan phase and here (concurrent destroy,
-        // or it became dirty/in-use/leased) is neither destroyed nor reported
-        // unless we carry its skip out. Go appends both phases' skips into
-        // `result.Skipped` (destroy.go:378, :383).
-        let (reserved, mut skips) = with_pool_lock(&self.dir, self.lock_timeout, || {
+        // Phase 1a (OUTSIDE lock): classify each planned slot against a healed
+        // snapshot. The plan's verdict is a hint; this catches flips between
+        // plan and reserve without holding the lock through the probes.
+        let snapshot =
+            crate::pool::healed_state_snapshot(&self.dir, self.lock_timeout, &self.process)?;
+        let mut phase1: Vec<(WorktreeEntry, DestroyTarget, crate::prune::PruneContext)> =
+            Vec::new();
+        let mut skips = Vec::new();
+        for wt in &snapshot {
+            let Some((_, context)) = planned_by_path.get(&wt.path) else {
+                continue;
+            };
+            let context = context.clone();
+            let default_ref = context.default_ref.as_deref().unwrap_or("");
+            let current = self.classify_for_destroy(wt, default_ref);
+            if wt.destroying && crate::reservation::owner_alive(wt, &self.process) {
+                skips.push(DestroySkip {
+                    target: current,
+                    needed_flags: vec![],
+                    leased_bulk: false,
+                    detail: "reserved by another destroy".into(),
+                });
+                continue;
+            }
+            if let Err(skip) = self.allows(&current, allow_leased, opts) {
+                skips.push(skip);
+                continue;
+            }
+            phase1.push((wt.clone(), current, context));
+        }
+
+        // Phase 1b (LOCK, short): stamp the `Destroying` reservation on every
+        // slot that is STILL in the state the classifier saw. The cheap
+        // reservation/lease fields are re-validated — a slot acquired,
+        // leased, or reserved by another destroy between the snapshot and
+        // this lock fails the equality check and is skipped rather than
+        // destroyed under its new owner.
+        let (reserved, phase1b_skips) = with_pool_lock(&self.dir, self.lock_timeout, || {
             let mut state = State::read_state(&self.dir).map_err(PoolError::State)?;
             heal_state(&mut state, |pid| self.process.started_at(pid));
             let mut reserved = Vec::new();
-            let mut skips = Vec::new();
-            for i in 0..state.worktrees.len() {
-                let Some((_, context)) = planned_by_path.get(&state.worktrees[i].path) else {
+            let mut phase1_skips = Vec::new();
+            for (snap_wt, current, context) in &phase1 {
+                let Some(live) = state.worktrees.iter().find(|w| w.path == snap_wt.path) else {
                     continue;
                 };
-                let context = context.clone();
-                let default_ref = context.default_ref.as_deref().unwrap_or("");
-                let current = self.classify_for_destroy(&state.worktrees[i], default_ref);
-                if state.worktrees[i].destroying
-                    && crate::reservation::owner_alive(&state.worktrees[i], &self.process)
+                // The classification was computed against `snap_wt`; if the
+                // reservation-relevant fields moved since, the verdict is
+                // stale — skip rather than act on it.
+                if live.destroying != snap_wt.destroying
+                    || live.owner_pid != snap_wt.owner_pid
+                    || live.owner_started_at != snap_wt.owner_started_at
+                    || live.leased != snap_wt.leased
+                    || live.lease_id != snap_wt.lease_id
+                    || live.lease_holder != snap_wt.lease_holder
                 {
-                    skips.push(DestroySkip {
-                        target: current,
+                    phase1_skips.push(DestroySkip {
+                        target: current.clone(),
+                        needed_flags: vec![],
+                        leased_bulk: false,
+                        detail: "state changed during classification".into(),
+                    });
+                    continue;
+                }
+                if live.destroying && crate::reservation::owner_alive(live, &self.process) {
+                    phase1_skips.push(DestroySkip {
+                        target: current.clone(),
                         needed_flags: vec![],
                         leased_bulk: false,
                         detail: "reserved by another destroy".into(),
                     });
                     continue;
                 }
-                if let Err(skip) = self.allows(&current, allow_leased, opts) {
-                    skips.push(skip);
-                    continue;
-                }
-                let path = state.worktrees[i].path.clone();
+                let idx = state
+                    .worktrees
+                    .iter()
+                    .position(|w| w.path == snap_wt.path)
+                    .expect("entry found above");
+                let path = state.worktrees[idx].path.clone();
                 let reservation =
-                    Reservation::reserve_destroy(&path, &mut state.worktrees[i], &self.process)
+                    Reservation::reserve_destroy(&path, &mut state.worktrees[idx], &self.process)
                         .map_err(|e| {
-                            PoolError::Git(crate::git::GitError::new(
-                                "reserve destroy",
-                                e.to_string(),
-                                crate::git::GitErrorKind::Other,
-                            ))
-                        })?;
-                reserved.push((reservation, current, context));
+                        PoolError::Git(crate::git::GitError::new(
+                            "reserve destroy",
+                            e.to_string(),
+                            crate::git::GitErrorKind::Other,
+                        ))
+                    })?;
+                reserved.push((reservation, current.clone(), context.clone()));
             }
             state_file::write_state(&self.dir, &state)
                 .map_err(|e| PoolError::Io("writing state".into(), e))?;
-            Ok::<_, PoolError>((reserved, skips))
+            Ok::<_, PoolError>((reserved, phase1_skips))
         })?;
+        skips.extend(phase1b_skips);
 
         // Hooks OUTSIDE all locks (non-fatal).
         if !opts.pre_destroy.is_empty() {
@@ -386,158 +446,191 @@ impl Pool {
             }
         }
 
-        // Phase 2: re-verify + delete under a fresh lock.
-        let (destroyed, exec_skips) = with_pool_lock(&self.dir, self.lock_timeout, || {
-            let mut state = State::read_state(&self.dir).map_err(PoolError::State)?;
-            let mut destroyed = Vec::new();
-            let mut skips = Vec::new();
-            let mut removed_paths = std::collections::HashSet::new();
+        // Phase 2a (LOCK, short): re-validate every reservation on a fresh
+        // healed snapshot — the hooks ran with no lock held, so a slot can
+        // have been taken over. Entries that no longer match are skipped
+        // without touching state (their new owner stamped it).
+        let snapshot2 =
+            crate::pool::healed_state_snapshot(&self.dir, self.lock_timeout, &self.process)?;
 
-            for (reservation, planned, context) in &reserved {
-                let idx = state
-                    .worktrees
-                    .iter()
-                    .position(|w| w.path == reservation.worktree);
-                let Some(idx) = idx else { continue };
-                if !reservation.matches(&state.worktrees[idx]) {
-                    skips.push(DestroySkip {
-                        target: planned.clone(),
-                        needed_flags: vec![],
-                        leased_bulk: false,
-                        detail: "re-acquired during pre-destroy hook".into(),
-                    });
-                    continue;
-                }
-
-                let path = state.worktrees[idx].path.clone();
-                // Re-classify with the ORIGINAL reservation restored (so a
-                // worktree that's still disposable is removed, but one that
-                // became dirty/in-use is skipped).
-                let mut current_entry = state.worktrees[idx].clone();
-                reservation.restore_original(&mut current_entry);
-                let mut current = self.classify_for_destroy(
-                    &current_entry,
-                    context.default_ref.as_deref().unwrap_or(""),
-                );
-                current.bytes = planned.bytes;
-                if self.allows(&current, allow_leased, opts).is_err() {
-                    reservation.restore_original(&mut state.worktrees[idx]);
-                    skips.push(DestroySkip {
-                        target: current,
-                        needed_flags: vec![],
-                        leased_bulk: false,
-                        detail: "re-classified as not removable".into(),
-                    });
-                    continue;
-                }
-
-                // If in-use and authorized, terminate processes.
-                if current.classes.contains(DestroyClass::InUse) && opts.include_in_use {
-                    match self
-                        .process
-                        .terminate_with_grace(Path::new(&path), DESTROY_GRACE_PERIOD)
-                    {
-                        Ok(_) => {}
-                        Err(e) => {
-                            reservation.restore_original(&mut state.worktrees[idx]);
-                            skips.push(DestroySkip {
-                                target: current.clone(),
-                                needed_flags: vec![],
-                                leased_bulk: false,
-                                detail: format!("could not terminate worktree processes: {e}"),
-                            });
-                            continue;
-                        }
-                    }
-                    // Re-scan with a LIVE table (`find_in_worktree`
-                    // re-enumerates). Reading a pre-kill snapshot here would
-                    // still list the pids we just terminated and make
-                    // `--include-in-use` skip forever, so the flag could never
-                    // remove a worktree that actually had processes.
-                    //
-                    // A scan ERROR fails CLOSED: it restores the reservation
-                    // and skips rather than continuing to
-                    // `worktree_remove` + `remove_dir_all` on a worktree whose
-                    // liveness we could not establish (Go
-                    // destroy.go:504-510).
-                    let survivors = match self.process.find_in_worktree(Path::new(&path)) {
-                        Ok(survivors) => survivors,
-                        Err(e) => {
-                            reservation.restore_original(&mut state.worktrees[idx]);
-                            skips.push(DestroySkip {
-                                target: current,
-                                needed_flags: vec![],
-                                leased_bulk: false,
-                                detail: format!("could not verify worktree processes stopped: {e}"),
-                            });
-                            continue;
-                        }
-                    };
-                    if !survivors.is_empty() {
-                        reservation.restore_original(&mut state.worktrees[idx]);
-                        skips.push(DestroySkip {
-                            target: current,
-                            needed_flags: vec![],
-                            leased_bulk: false,
-                            detail: "worktree processes still running after termination".into(),
-                        });
-                        continue;
-                    }
-                }
-
-                // Remove the worktree from the repository that OWNS it (M-020).
-                //
-                // `context.repo_root` was resolved from THIS slot's path in the
-                // plan phase. Using a pool-wide root here is what made a
-                // shared pool's removals run from the wrong repository, and made
-                // `destroy --all` (where `self.root` is not a repository at all)
-                // reclaim nothing while recording a CleanupError per slot
-                // forever. Go reaches the same per-slot root through
-                // `resolvePoolRepoRoot(wt)` at destroy.go:588.
-                let remove_root = context.repo_root.clone();
-                if remove_root.as_os_str().is_empty() {
-                    // No live repository owns this slot, so there is nothing to
-                    // deregister it from: git has no registration to drop.
-                    // Go takes the filesystem route alone for the same slots
-                    // (destroy.go:576-590).
-                    reservation.restore_original(&mut state.worktrees[idx]);
-                    skips.push(DestroySkip {
-                        target: current,
-                        needed_flags: vec![],
-                        leased_bulk: false,
-                        detail: "cannot resolve the repository owning this worktree".into(),
-                    });
-                    continue;
-                }
-                match self.git.worktree_remove(
-                    &crate::git::GitRepo {
-                        common_dir: remove_root,
-                        worktree: None,
-                    },
-                    Path::new(&path),
-                ) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        reservation.restore_original(&mut state.worktrees[idx]);
-                        skips.push(DestroySkip {
-                            target: current,
-                            needed_flags: vec![],
-                            leased_bulk: false,
-                            detail: e.to_string(),
-                        });
-                        continue;
-                    }
-                }
-                let _ = remove_dir_all_guarded(Path::new(&path));
-                removed_paths.insert(path.clone());
-                destroyed.push(current);
+        // Phase 2b (OUTSIDE lock): per slot — re-classify with the ORIGINAL
+        // reservation restored, terminate in-use processes if authorized,
+        // `git worktree remove`, `remove_dir_all`. Every probe and every
+        // subprocess runs here, never inside the state lock.
+        let mut destroyed = Vec::new();
+        let mut exec_skips = Vec::new();
+        // State commits deferred to the single phase-2c lock: Remove drops
+        // the entry, Restore puts the pre-destroy owner back.
+        let mut commits: Vec<CommitAction> = Vec::new();
+        for (reservation, planned, context) in &reserved {
+            let Some(live) = snapshot2.iter().find(|w| w.path == reservation.worktree) else {
+                continue;
+            };
+            if !reservation.matches(live) {
+                exec_skips.push(DestroySkip {
+                    target: planned.clone(),
+                    needed_flags: vec![],
+                    leased_bulk: false,
+                    detail: "re-acquired during pre-destroy hook".into(),
+                });
+                continue;
             }
 
-            // Drop removed entries from state.
+            let path = live.path.clone();
+            // Re-classify with the ORIGINAL reservation restored (so a
+            // worktree that's still disposable is removed, but one that
+            // became dirty/in-use is skipped).
+            let mut current_entry = live.clone();
+            reservation.restore_original(&mut current_entry);
+            let mut current = self
+                .classify_for_destroy(&current_entry, context.default_ref.as_deref().unwrap_or(""));
+            current.bytes = planned.bytes;
+            if self.allows(&current, allow_leased, opts).is_err() {
+                commits.push(CommitAction::Restore(reservation.clone()));
+                exec_skips.push(DestroySkip {
+                    target: current,
+                    needed_flags: vec![],
+                    leased_bulk: false,
+                    detail: "re-classified as not removable".into(),
+                });
+                continue;
+            }
+
+            // If in-use and authorized, terminate processes.
+            if current.classes.contains(DestroyClass::InUse) && opts.include_in_use {
+                match self
+                    .process
+                    .terminate_with_grace(Path::new(&path), DESTROY_GRACE_PERIOD)
+                {
+                    Ok(_) => {}
+                    Err(e) => {
+                        commits.push(CommitAction::Restore(reservation.clone()));
+                        exec_skips.push(DestroySkip {
+                            target: current.clone(),
+                            needed_flags: vec![],
+                            leased_bulk: false,
+                            detail: format!("could not terminate worktree processes: {e}"),
+                        });
+                        continue;
+                    }
+                }
+                // Re-scan with a LIVE table (`find_in_worktree`
+                // re-enumerates). Reading a pre-kill snapshot here would
+                // still list the pids we just terminated and make
+                // `--include-in-use` skip forever, so the flag could never
+                // remove a worktree that actually had processes.
+                //
+                // A scan ERROR fails CLOSED: it restores the reservation
+                // and skips rather than continuing to
+                // `worktree_remove` + `remove_dir_all` on a worktree whose
+                // liveness we could not establish (Go
+                // destroy.go:504-510).
+                let survivors = match self.process.find_in_worktree(Path::new(&path)) {
+                    Ok(survivors) => survivors,
+                    Err(e) => {
+                        commits.push(CommitAction::Restore(reservation.clone()));
+                        exec_skips.push(DestroySkip {
+                            target: current,
+                            needed_flags: vec![],
+                            leased_bulk: false,
+                            detail: format!("could not verify worktree processes stopped: {e}"),
+                        });
+                        continue;
+                    }
+                };
+                if !survivors.is_empty() {
+                    commits.push(CommitAction::Restore(reservation.clone()));
+                    exec_skips.push(DestroySkip {
+                        target: current,
+                        needed_flags: vec![],
+                        leased_bulk: false,
+                        detail: "worktree processes still running after termination".into(),
+                    });
+                    continue;
+                }
+            }
+
+            // Remove the worktree from the repository that OWNS it (M-020).
+            //
+            // `context.repo_root` was resolved from THIS slot's path in the
+            // plan phase. Using a pool-wide root here is what made a
+            // shared pool's removals run from the wrong repository, and made
+            // `destroy --all` (where `self.root` is not a repository at all)
+            // reclaim nothing while recording a CleanupError per slot
+            // forever. Go reaches the same per-slot root through
+            // `resolvePoolRepoRoot(wt)` at destroy.go:588.
+            let remove_root = context.repo_root.clone();
+            if remove_root.as_os_str().is_empty() {
+                // No live repository owns this slot, so there is nothing to
+                // deregister it from: git has no registration to drop.
+                // Go takes the filesystem route alone for the same slots
+                // (destroy.go:576-590).
+                commits.push(CommitAction::Restore(reservation.clone()));
+                exec_skips.push(DestroySkip {
+                    target: current,
+                    needed_flags: vec![],
+                    leased_bulk: false,
+                    detail: "cannot resolve the repository owning this worktree".into(),
+                });
+                continue;
+            }
+            match self.git.worktree_remove(
+                &crate::git::GitRepo {
+                    common_dir: remove_root,
+                    worktree: None,
+                },
+                Path::new(&path),
+            ) {
+                Ok(()) => {}
+                Err(e) => {
+                    commits.push(CommitAction::Restore(reservation.clone()));
+                    exec_skips.push(DestroySkip {
+                        target: current,
+                        needed_flags: vec![],
+                        leased_bulk: false,
+                        detail: e.to_string(),
+                    });
+                    continue;
+                }
+            }
+            let _ = remove_dir_all_guarded(Path::new(&path));
+            commits.push(CommitAction::Remove(reservation.clone()));
+            destroyed.push(current);
+        }
+
+        // Phase 2c (LOCK, short): apply every deferred state commit. A
+        // reservation that no longer matches is left alone — the entry now
+        // belongs to someone else, or heal will drop it because the path is
+        // already gone.
+        with_pool_lock(&self.dir, self.lock_timeout, || {
+            let mut state = State::read_state(&self.dir).map_err(PoolError::State)?;
+            heal_state(&mut state, |pid| self.process.started_at(pid));
+            let mut removed_paths = std::collections::HashSet::new();
+            for action in &commits {
+                let (reservation, remove) = match action {
+                    CommitAction::Remove(r) => (r, true),
+                    CommitAction::Restore(r) => (r, false),
+                };
+                let Some(idx) = state
+                    .worktrees
+                    .iter()
+                    .position(|w| w.path == reservation.worktree)
+                else {
+                    continue;
+                };
+                if !reservation.matches(&state.worktrees[idx]) {
+                    continue;
+                }
+                if remove {
+                    removed_paths.insert(reservation.worktree.clone());
+                } else {
+                    reservation.restore_original(&mut state.worktrees[idx]);
+                }
+            }
             state.worktrees.retain(|w| !removed_paths.contains(&w.path));
             state_file::write_state(&self.dir, &state)
                 .map_err(|e| PoolError::Io("writing state".into(), e))?;
-            Ok::<_, PoolError>((destroyed, skips))
+            Ok::<_, PoolError>(())
         })?;
 
         // Both phases' skips reach the caller: a phase-1 skip means the target
@@ -547,6 +640,15 @@ impl Pool {
         skips.extend(exec_skips);
         Ok((destroyed, skips))
     }
+}
+
+/// A deferred state mutation from destroy's outside-lock phase, applied under
+/// the single phase-2c lock once all physical work is done.
+enum CommitAction {
+    /// The worktree was physically removed: drop its state entry.
+    Remove(Reservation),
+    /// The slot was skipped or cleanup failed: restore the pre-destroy owner.
+    Restore(Reservation),
 }
 
 /// Recursively removes a directory, refusing unsafe roots (Go

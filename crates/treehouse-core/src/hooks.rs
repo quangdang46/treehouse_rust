@@ -12,6 +12,15 @@
 
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// Upper bound on one hook command. Hooks are user-configured and run on the
+/// acquire/destroy path, so a wedged hook must not stall the pool forever;
+/// on expiry the child is killed and the failure is logged like any other.
+pub const HOOK_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How often the wait loop polls the child while draining its pipes.
+const WAIT_POLL: Duration = Duration::from_millis(10);
 
 /// Runs each command sequentially in `work_dir`. Failures are logged to
 /// `stderr` (🌳 hook command failed: "<cmd>" (exit N): <err>) and do not stop
@@ -47,27 +56,66 @@ pub fn run_one(
         }
     };
 
-    // Reap the child; forward any captured output.
-    let status = match child.wait() {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = writeln!(stderr, "🌳 hook command failed: {command:?} (exit -1): {e}");
-            return;
+    // Drain both pipes CONCURRENTLY while the child runs. Reading them only
+    // after `wait` deadlocks the moment a hook writes more than the OS pipe
+    // buffer (~64 KiB) to either stream: the child blocks on write, `wait`
+    // never returns, and the reader never starts.
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+    let out_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = out_pipe.as_mut() {
+            use std::io::Read;
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = err_pipe.as_mut() {
+            use std::io::Read;
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    // Wait with a timeout: a hook that never exits is killed rather than
+    // holding the caller (and, worse, a `pre_destroy` sweep) open forever.
+    let deadline = Instant::now() + HOOK_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Err(());
+                }
+                std::thread::sleep(WAIT_POLL);
+            }
+            Err(_) => break Err(()),
         }
     };
 
-    if let Some(mut pipe) = child.stdout.take() {
-        use std::io::Read;
-        let mut buf = Vec::new();
-        let _ = pipe.read_to_end(&mut buf);
-        let _ = stdout.write_all(&buf);
-    }
-    if let Some(mut pipe) = child.stderr.take() {
-        use std::io::Read;
-        let mut buf = Vec::new();
-        let _ = pipe.read_to_end(&mut buf);
-        let _ = stderr.write_all(&buf);
-    }
+    // The pipes hit EOF once the child is reaped (or killed), so the readers
+    // always finish; join them before forwarding so output order per stream
+    // is preserved.
+    let out_buf = out_reader.join().unwrap_or_default();
+    let err_buf = err_reader.join().unwrap_or_default();
+    let _ = stdout.write_all(&out_buf);
+    let _ = stderr.write_all(&err_buf);
+
+    let status = match status {
+        Ok(s) => s,
+        Err(()) => {
+            let _ = writeln!(
+                stderr,
+                "🌳 hook command failed: {command:?} (exit -1): timed out after {}s",
+                HOOK_TIMEOUT.as_secs()
+            );
+            return;
+        }
+    };
 
     if !status.success() {
         let code = status.code().unwrap_or(-1);
@@ -168,6 +216,21 @@ mod tests {
             errs.contains("hook command failed"),
             "expected failure log: {errs}"
         );
+    }
+
+    /// A hook emitting more than the OS pipe buffer (~64 KiB) must not
+    /// deadlock: the pipes are drained while the child runs, not after `wait`.
+    #[cfg(unix)]
+    #[test]
+    fn hook_with_output_larger_than_the_pipe_buffer_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut out, mut err) = buf();
+        // ~256 KiB on stdout AND stderr — far past any pipe buffer.
+        let cmd =
+            "head -c 262144 /dev/zero | tr '\\0' 'o'; head -c 262144 /dev/zero | tr '\\0' 'e' >&2";
+        run_one(cmd, dir.path(), &mut out, &mut err);
+        assert_eq!(out.len(), 262144, "stdout must be fully drained");
+        assert_eq!(err.len(), 262144, "stderr must be fully drained");
     }
 
     #[cfg(windows)]

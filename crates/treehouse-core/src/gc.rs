@@ -77,6 +77,10 @@ pub struct GcResult {
 pub struct GcOptions {
     pub dry_run: bool,
     pub prune_orphans: bool,
+    /// `pre_destroy` hooks run between the reservation and the delete phases,
+    /// outside the state lock. When empty, the pool's configured
+    /// `[hooks].pre_destroy` commands are used (same source prune uses).
+    pub pre_destroy: Vec<String>,
 }
 
 impl Default for GcOptions {
@@ -84,6 +88,7 @@ impl Default for GcOptions {
         Self {
             dry_run: true,
             prune_orphans: false,
+            pre_destroy: Vec::new(),
         }
     }
 }
@@ -351,25 +356,115 @@ impl Pool {
                 Ok::<_, PoolError>(reserved)
             })?;
 
-        // Phase 2: RE-CLASSIFY + physical cleanup + state commit.
-        //
-        // gc's two-phase engine has the same shape as prune's, so it gets the
-        // same treatment: the plan's verdict is not trusted, because the
-        // `pre_destroy` hooks run with no lock held between the two phases and
-        // a slot can go dirty, gain a process, or gain a valid lease in that
-        // window. The full classification is re-run inside the deleting lock.
+        // `pre_destroy` hooks, OUTSIDE all locks (non-fatal). An explicit
+        // `GcOptions::pre_destroy` wins; otherwise the pool's configured
+        // `[hooks].pre_destroy` commands run — the same source prune uses.
+        let hooks = if opts.pre_destroy.is_empty() {
+            &self.config.hooks.pre_destroy
+        } else {
+            &opts.pre_destroy
+        };
+        if !reserved.is_empty() && !hooks.is_empty() {
+            for (reservation, _, _) in &reserved {
+                let mut out = std::io::stdout();
+                let mut err = std::io::stderr();
+                crate::hooks::run(hooks, Path::new(&reservation.worktree), &mut out, &mut err);
+            }
+        }
+
+        // Phase 2a (LOCK, short): re-validate every reservation on a fresh
+        // healed snapshot — the hooks ran with no lock held, so a slot can
+        // have been taken over. A mismatched reservation is never removed.
+        let snapshot =
+            crate::pool::healed_state_snapshot(&self.dir, self.lock_timeout, &self.process)?;
+
+        // Phase 2b (OUTSIDE lock): RE-CLASSIFY + physical cleanup. gc's
+        // two-phase engine has the same shape as prune's: the plan's verdict
+        // is not trusted, because the `pre_destroy` hooks run unlocked
+        // between the two phases and a slot can go dirty, gain a process, or
+        // gain a valid lease in that window.
         //
         // Invariant: a worktree is removed from state **only** when cleanup
         // fully succeeds. On failure the entry is retained with its
         // reservation restored, so it is immediately retryable rather than
         // stuck behind a `destroying` flag naming a still-live process.
+        let mut reclaimed = Vec::new();
+        let mut errors = Vec::new();
+        // Deferred state commits, applied under the single phase-2c lock.
+        let mut commits: Vec<GcCommit> = Vec::new();
+        for (reservation, w, context) in &reserved {
+            let Some(live) = snapshot.iter().find(|e| e.path == reservation.worktree) else {
+                continue;
+            };
+            if !reservation.matches(live) {
+                continue; // re-acquired mid-hook; never remove
+            }
+            let path = live.path.clone();
+
+            if self.final_gc_safety_check(live, context, opts) {
+                commits.push(GcCommit::Restore(reservation.clone()));
+                continue;
+            }
+
+            let repo = crate::git::GitRepo {
+                // The repository that OWNS this worktree, not whatever
+                // repository the pool happens to have been opened against.
+                common_dir: context.repo_root.clone(),
+                worktree: None,
+            };
+
+            // A: git worktree remove. An orphan has no live repository to
+            // deregister from, so it takes the filesystem route alone.
+            let mut cleanup_ok = true;
+            if w.tag != GC_TAG_ORPHANED
+                && let Err(e) = self.git.worktree_remove(&repo, Path::new(&path))
+            {
+                errors.push(CleanupError {
+                    name: w.name.clone(),
+                    path: path.clone(),
+                    phase: "git_worktree_remove".into(),
+                    detail: e.to_string(),
+                });
+                cleanup_ok = false;
+            }
+
+            // B: filesystem removal (skip if git remove already failed).
+            if cleanup_ok {
+                match std::fs::remove_dir_all(Path::new(&path)) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Path already gone (git removed it) — not an error.
+                    }
+                    Err(e) => {
+                        errors.push(CleanupError {
+                            name: w.name.clone(),
+                            path: path.clone(),
+                            phase: "filesystem_remove".into(),
+                            detail: e.to_string(),
+                        });
+                        cleanup_ok = false;
+                    }
+                }
+            }
+
+            if cleanup_ok {
+                commits.push(GcCommit::Remove(reservation.clone()));
+                reclaimed.push(w.clone());
+            } else {
+                commits.push(GcCommit::Restore(reservation.clone()));
+            }
+        }
+
+        // Phase 2c (LOCK, short): apply every deferred state commit.
         crate::pool::with_pool_lock(&self.dir, self.lock_timeout, || {
             let mut state = State::read_state(&self.dir).map_err(PoolError::State)?;
-            let mut reclaimed = Vec::new();
+            heal_state(&mut state, |pid| self.process.started_at(pid));
             let mut removed = std::collections::HashSet::new();
-            let mut errors = Vec::new();
-
-            for (reservation, w, context) in &reserved {
+            for commit in &commits {
+                let (reservation, remove) = match commit {
+                    GcCommit::Remove(r) => (r, true),
+                    GcCommit::Restore(r) => (r, false),
+                };
                 let Some(idx) = state
                     .worktrees
                     .iter()
@@ -378,73 +473,25 @@ impl Pool {
                     continue;
                 };
                 if !reservation.matches(&state.worktrees[idx]) {
-                    continue; // re-acquired mid-hook; never remove
-                }
-                let path = state.worktrees[idx].path.clone();
-
-                if self.final_gc_safety_check(&state.worktrees[idx], context, opts) {
-                    reservation.restore_original(&mut state.worktrees[idx]);
                     continue;
                 }
-
-                let repo = crate::git::GitRepo {
-                    // The repository that OWNS this worktree, not whatever
-                    // repository the pool happens to have been opened against.
-                    common_dir: context.repo_root.clone(),
-                    worktree: None,
-                };
-
-                // A: git worktree remove. An orphan has no live repository to
-                // deregister from, so it takes the filesystem route alone.
-                let mut cleanup_ok = true;
-                if w.tag != GC_TAG_ORPHANED
-                    && let Err(e) = self.git.worktree_remove(&repo, Path::new(&path))
-                {
-                    errors.push(CleanupError {
-                        name: w.name.clone(),
-                        path: path.clone(),
-                        phase: "git_worktree_remove".into(),
-                        detail: e.to_string(),
-                    });
-                    cleanup_ok = false;
-                }
-
-                // B: filesystem removal (skip if git remove already failed).
-                if cleanup_ok {
-                    match std::fs::remove_dir_all(Path::new(&path)) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            // Path already gone (git removed it) — not an error.
-                        }
-                        Err(e) => {
-                            errors.push(CleanupError {
-                                name: w.name.clone(),
-                                path: path.clone(),
-                                phase: "filesystem_remove".into(),
-                                detail: e.to_string(),
-                            });
-                            cleanup_ok = false;
-                        }
-                    }
-                }
-
-                if cleanup_ok {
-                    removed.insert(path.clone());
-                    reclaimed.push(w.clone());
+                if remove {
+                    removed.insert(reservation.worktree.clone());
                 } else {
                     reservation.restore_original(&mut state.worktrees[idx]);
                 }
             }
-
             state.worktrees.retain(|e| !removed.contains(&e.path));
             state_file::write_state(&self.dir, &state)
                 .map_err(|e| PoolError::Io("writing state".into(), e))?;
-            Ok::<_, PoolError>((reclaimed, errors))
-        })
+            Ok::<_, PoolError>(())
+        })?;
+
+        Ok((reclaimed, errors))
     }
 
-    /// The last word on disposability, run inside the deleting lock. `true`
-    /// means the slot must be left alone.
+    /// The last word on disposability, run against the post-hook snapshot.
+    /// `true` means the slot must be left alone.
     ///
     /// Every condition the plan checked is checked again against the state
     /// just read: a valid lease taken during the unlocked hook window, a
@@ -484,6 +531,15 @@ impl Pool {
             Ok(true)
         )
     }
+}
+
+/// A deferred state mutation from gc's outside-lock phase, applied under the
+/// single phase-2c lock once all physical work is done.
+enum GcCommit {
+    /// The worktree was physically removed: drop its state entry.
+    Remove(Reservation),
+    /// The slot was skipped or cleanup failed: restore the pre-destroy owner.
+    Restore(Reservation),
 }
 
 /// Recursively measures a directory's size.
@@ -636,6 +692,7 @@ mod tests {
             .gc(&GcOptions {
                 dry_run: false,
                 prune_orphans: false,
+                ..Default::default()
             })
             .unwrap();
 
@@ -670,6 +727,7 @@ mod tests {
             .gc(&GcOptions {
                 dry_run: false,
                 prune_orphans: false,
+                ..Default::default()
             })
             .unwrap();
         assert!(!first.errors.is_empty(), "first gc must record an error");
@@ -689,6 +747,7 @@ mod tests {
             .gc(&GcOptions {
                 dry_run: false,
                 prune_orphans: false,
+                ..Default::default()
             })
             .unwrap();
         // After fixing the underlying error, retry must succeed.
@@ -707,6 +766,7 @@ mod tests {
             .gc(&GcOptions {
                 dry_run: false,
                 prune_orphans: false,
+                ..Default::default()
             })
             .unwrap();
 
@@ -734,6 +794,7 @@ mod tests {
             .gc(&GcOptions {
                 dry_run: false,
                 prune_orphans: false,
+                ..Default::default()
             })
             .unwrap();
 
@@ -802,6 +863,7 @@ mod tests {
             .gc(&GcOptions {
                 dry_run: false,
                 prune_orphans: false,
+                ..Default::default()
             })
             .unwrap();
 
