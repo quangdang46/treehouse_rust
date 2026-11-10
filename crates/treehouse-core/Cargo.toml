@@ -39,7 +39,9 @@ nix = { version = "0.31.3", features = ["signal", "process"] }
 libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win32_System_Threading"] }
+# Win32_System_Console: SetConsoleCtrlHandler + GenerateConsoleCtrlEvent, the
+# `treehouse run` signal forwarding (src/run.rs).
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_Console"] }
 
 # The `toon` feature enables the TOON encoder (git dependency, off by default).
 [features]

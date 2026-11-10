@@ -2195,12 +2195,25 @@ fn cmd_run(cli: &Cli, args: &cli::RunArgs) -> Result<()> {
     };
     let result = treehouse_core::run::run(&pool, &opts)?;
 
+    // A cleanup failure must not pass silently: the slot may still be leased
+    // and dirty, and the operator's only other signal is `status`. Warn on
+    // stderr and force a nonzero exit — unless the child already failed, in
+    // which case its code/signal stays the primary result (already nonzero).
+    let mut cleanup_failed = false;
+    if let treehouse_core::run::CleanupOutcome::CleanupFailed(ref why) = result.cleanup {
+        eprintln!("treehouse: warning: cleanup failed, worktree may still be leased: {why}");
+        cleanup_failed = true;
+    }
+
     // Exit with the child's code (or 128+signum on unix signal).
     if let Some(code) = result.child_exit_code {
-        std::process::exit(code);
+        std::process::exit(if cleanup_failed && code == 0 { 1 } else { code });
     }
     if let Some(sig) = result.child_signal {
         std::process::exit(128 + sig);
+    }
+    if cleanup_failed {
+        std::process::exit(1);
     }
     Ok(())
 }

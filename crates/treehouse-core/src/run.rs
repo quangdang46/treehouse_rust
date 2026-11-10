@@ -84,12 +84,33 @@ pub fn run(pool: &Pool, opts: &RunOptions) -> Result<RunResult, PoolError> {
         lease_id: &lease_id,
     };
 
+    // Signal forwarding goes in BEFORE the spawn: between `spawn` and
+    // handler installation a SIGINT/SIGTERM would kill treehouse outright,
+    // orphaning the child in its own process group and leaking the lease for
+    // the whole TTL — the exact failure this fixes. `install` is idempotent,
+    // and a failure to install is a hard error taken while the guard is
+    // already armed, so the slot is still released.
+    forwarding::install().map_err(|e| {
+        PoolError::Io(
+            "installing run signal handler".to_string(),
+            std::io::Error::other(e),
+        )
+    })?;
+
     // Spawn the child in the worktree with the lease env.
     let child = spawn_child(&worktree_path, &lease_id, opts)?;
 
-    // Wait for the child, forwarding signals (unix only; Windows uses
-    // GenerateConsoleCtrlEvent in the signal handler below).
-    let status = wait_child(child)?;
+    // Wait for the child. The handler installed above forwards
+    // SIGINT/SIGTERM/SIGHUP to the child's process group, so a signal that
+    // used to kill treehouse mid-`wait` now kills the child too — `wait`
+    // returns, the guard runs, and the lease is released instead of leaking.
+    forwarding::set_child(child.id());
+    let waited = wait_child(child);
+    // The child is reaped: later signals take the default disposition again
+    // (see `forwarding`), so a second Ctrl-C during cleanup still kills
+    // promptly rather than being swallowed by a dead process group.
+    forwarding::clear_child();
+    let status = waited?;
     let (exit_code, signal) = match status {
         ChildStatus::Exited(code) => (Some(code), None),
         #[cfg(unix)]
@@ -213,6 +234,164 @@ impl Drop for CleanupGuard<'_> {
         // ever reaches `reset_worktree`. So the repeat can tighten the pool
         // but can never reset a slot somebody else has since taken.
         let _ = self.run();
+    }
+}
+
+/// Forwards SIGINT/SIGTERM/SIGHUP (unix) / console Ctrl events (Windows) to
+/// the child's process group while `run` waits on it.
+///
+/// Without this, a signal killed treehouse outright: `Child::wait` never
+/// returned, the `CleanupGuard` never ran, the child — spawned in its OWN
+/// process group — kept running orphaned, and the durable lease sat held for
+/// its whole TTL. With it, the signal reaches the whole child group, `wait`
+/// returns, and the normal cleanup path releases the slot.
+///
+/// The handler is process-global state (signals have no per-call context), so
+/// the live child is tracked in statics. `run` is the only caller and a
+/// process runs it at most once in practice; the statics are still reset on
+/// every call so sequential `run`s in tests cannot inherit a stale pgid.
+mod forwarding {
+    /// Marks the child reaped so later signals take the default path.
+    /// No-op where there is nothing to forward to.
+    pub fn clear_child() {
+        imp::clear_child();
+    }
+
+    /// Installs the forwarding handler. Idempotent — safe to call per `run`.
+    pub fn install() -> Result<(), String> {
+        imp::install()
+    }
+
+    /// Records the child's pid (its process-group id on both platforms:
+    /// `process_group(0)` on unix, `CREATE_NEW_PROCESS_GROUP` on Windows).
+    pub fn set_child(pid: u32) {
+        imp::set_child(pid);
+    }
+
+    #[cfg(unix)]
+    mod imp {
+        use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
+        use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
+        use nix::unistd::Pid;
+
+        /// The child's process-group id while `run` waits on it; 0 = none.
+        static CHILD_PGID: AtomicI32 = AtomicI32::new(0);
+        /// Set once a signal has been forwarded: a repeat escalates to
+        /// SIGKILL so a child that traps the first signal cannot hang `run`.
+        static FORWARDED: AtomicBool = AtomicBool::new(false);
+
+        extern "C" fn handle_signal(sig: i32) {
+            let pgid = CHILD_PGID.load(Ordering::SeqCst);
+            let Ok(signal) = Signal::try_from(sig) else {
+                return;
+            };
+            if pgid <= 0 {
+                // No live child — before the spawn, or after it was reaped
+                // (cleanup). Restore the default disposition and re-raise so
+                // the process dies exactly as it would have with no handler.
+                let dfl = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+                // sigaction + kill are the async-signal-safe calls this needs.
+                unsafe {
+                    let _ = signal::sigaction(signal, &dfl);
+                }
+                let _ = signal::kill(Pid::from_raw(std::process::id() as i32), signal);
+                return;
+            }
+            if FORWARDED.swap(true, Ordering::SeqCst) {
+                // Second signal: the child ignored or trapped the first —
+                // finish it rather than wait forever.
+                let _ = signal::killpg(Pid::from_raw(pgid), Signal::SIGKILL);
+            } else {
+                let _ = signal::killpg(Pid::from_raw(pgid), signal);
+            }
+        }
+
+        pub fn install() -> Result<(), String> {
+            let action = SigAction::new(
+                SigHandler::Handler(handle_signal),
+                // SA_RESTART keeps `wait` and cleanup I/O from returning
+                // EINTR; the child still dies because the signal is forwarded.
+                SaFlags::SA_RESTART,
+                SigSet::empty(),
+            );
+            for sig in [Signal::SIGINT, Signal::SIGTERM, Signal::SIGHUP] {
+                // SAFETY: `action` outlives the call and points at a plain
+                // `extern "C"` fn; re-installing an identical handler is safe.
+                unsafe { signal::sigaction(sig, &action) }
+                    .map_err(|e| format!("sigaction({sig:?}): {e}"))?;
+            }
+            Ok(())
+        }
+
+        pub fn set_child(pid: u32) {
+            FORWARDED.store(false, Ordering::SeqCst);
+            CHILD_PGID.store(pid as i32, Ordering::SeqCst);
+        }
+
+        pub fn clear_child() {
+            CHILD_PGID.store(0, Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(windows)]
+    mod imp {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        use windows_sys::Win32::System::Console::{
+            CTRL_BREAK_EVENT, CTRL_C_EVENT, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler,
+        };
+
+        /// The child's process-group id while `run` waits on it; 0 = none.
+        static CHILD_PGID: AtomicU32 = AtomicU32::new(0);
+
+        /// Console control handler. Returning nonzero marks the event handled;
+        /// returning zero lets the default handler run — which is what we want
+        /// whenever no child is live, so a later Ctrl-C still kills us.
+        unsafe extern "system" fn handle_console_event(event: u32) -> i32 {
+            if event != CTRL_C_EVENT && event != CTRL_BREAK_EVENT {
+                return 0;
+            }
+            let pgid = CHILD_PGID.load(Ordering::SeqCst);
+            if pgid == 0 {
+                return 0;
+            }
+            // The child was created with CREATE_NEW_PROCESS_GROUP, so its pid
+            // IS its group id and CTRL_BREAK_EVENT reaches the whole group
+            // (CTRL_C_EVENT cannot be aimed at another group).
+            unsafe {
+                GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pgid);
+            }
+            1
+        }
+
+        pub fn install() -> Result<(), String> {
+            // SAFETY: `handle_console_event` is a valid handler for the
+            // process lifetime; installing it once per `run` is harmless.
+            let ok = unsafe { SetConsoleCtrlHandler(Some(handle_console_event), 1) };
+            if ok == 0 {
+                Err("SetConsoleCtrlHandler failed".to_string())
+            } else {
+                Ok(())
+            }
+        }
+
+        pub fn set_child(pid: u32) {
+            CHILD_PGID.store(pid, Ordering::SeqCst);
+        }
+
+        pub fn clear_child() {
+            CHILD_PGID.store(0, Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    mod imp {
+        pub fn install() -> Result<(), String> {
+            Ok(())
+        }
+        pub fn set_child(_pid: u32) {}
+        pub fn clear_child() {}
     }
 }
 
