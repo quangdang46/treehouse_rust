@@ -150,32 +150,72 @@ impl Pool {
         // Classify + gate. Each target carries the context resolved FROM ITS
         // OWN PATH, and `execute_destroy` reuses that per-slot root for
         // `worktree_remove` rather than re-deriving one pool-wide value.
-        let mut removable = Vec::new();
-        for wt in &targets {
-            // A markerless slot (Go `resolveDestroyContext`, destroy.go:252-258)
-            // has no context at all: dispatching git on it would resolve the
-            // repository ENCLOSING the pool. An empty default ref makes it
-            // classify as Unverified, which is a skip, never a deletion.
-            let context = if crate::pool::slot_backend_name(Path::new(&wt.path)).is_empty() {
-                crate::prune::PruneContext {
-                    repo_root: PathBuf::new(),
-                    default_ref: None,
-                    context_error: None,
+        //
+        // Phase A (serial): per-slot repository contexts — the resolver
+        // memoizes fetch/default-ref per root, so this stays cheap.
+        let contexts: Vec<crate::prune::PruneContext> = targets
+            .iter()
+            .map(|wt| {
+                // A markerless slot (Go `resolveDestroyContext`,
+                // destroy.go:252-258) has no context at all: dispatching git
+                // on it would resolve the repository ENCLOSING the pool. An
+                // empty default ref makes it classify as Unverified, which
+                // is a skip, never a deletion.
+                if crate::pool::slot_backend_name(Path::new(&wt.path)).is_empty() {
+                    crate::prune::PruneContext {
+                        repo_root: PathBuf::new(),
+                        default_ref: None,
+                        context_error: None,
+                    }
+                } else {
+                    // A resolution failure leaves the default ref empty,
+                    // which `classify_for_destroy` reports as Unverified
+                    // rather than disposable (Go destroy.go:255-256).
+                    resolver.context(wt).unwrap_or(crate::prune::PruneContext {
+                        repo_root: PathBuf::new(),
+                        default_ref: None,
+                        context_error: Some("could not resolve the worktree's repository".into()),
+                    })
                 }
-            } else {
-                // A resolution failure leaves the default ref empty, which
-                // `classify_for_destroy` reports as Unverified rather than
-                // disposable (Go destroy.go:255-256).
-                resolver.context(wt).unwrap_or(crate::prune::PruneContext {
-                    repo_root: PathBuf::new(),
-                    default_ref: None,
-                    context_error: Some("could not resolve the worktree's repository".into()),
+            })
+            .collect();
+
+        // Phase B: ONE batched process-table scan for every target — the
+        // plan loop previously paid a full sysinfo re-enumeration per slot.
+        let scan_paths: Vec<&Path> = targets.iter().map(|wt| Path::new(&wt.path)).collect();
+        let scans = self.process.scan_worktrees(&scan_paths);
+
+        // Phase C (parallel): classification is a bundle of independent
+        // read-only probes (`is_dirty`, `is_head_merged`, `dir_size`) plus
+        // the supplied process scan. Scoped threads, results in target
+        // order. Nothing here mutates state or touches the filesystem
+        // destructively.
+        let classified: Vec<DestroyTarget> = std::thread::scope(|scope| {
+            let handles: Vec<_> = targets
+                .iter()
+                .zip(contexts.iter())
+                .zip(scans)
+                .map(|((wt, context), scan)| {
+                    scope.spawn(move || {
+                        let mut t = self.classify_for_destroy_scanned(
+                            wt,
+                            context.default_ref.as_deref().unwrap_or(""),
+                            scan,
+                        );
+                        t.bytes = self.measure_size(&t.path);
+                        t
+                    })
                 })
-            };
-            let target =
-                self.classify_for_destroy(wt, context.default_ref.as_deref().unwrap_or(""));
-            let mut t = target;
-            t.bytes = self.measure_size(&t.path);
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("destroy classify thread panicked"))
+                .collect()
+        });
+
+        // Phase D (serial): gate in target order.
+        let mut removable = Vec::new();
+        for (t, context) in classified.into_iter().zip(contexts) {
             match self.allows(&t, allow_leased, opts) {
                 Ok(()) => removable.push((t, context)),
                 Err(skip) => result.skipped.push(skip),
@@ -203,6 +243,21 @@ impl Pool {
         // the two sweeps (each `find_in_worktree` re-enumerates), and it would
         // pay for two full refreshes per classification.
         let scan = self.process.find_in_worktree(Path::new(&wt.path));
+        self.classify_for_destroy_scanned(wt, default_ref, scan)
+    }
+
+    /// [`Self::classify_for_destroy`] with the process scan supplied by the
+    /// caller — the plan phase batches one `scan_worktrees` over every target
+    /// instead of re-enumerating sysinfo per slot. The recheck phases keep
+    /// calling [`Self::classify_for_destroy`], which scans fresh per slot:
+    /// those verdicts gate the actual deletion and must see the table as it
+    /// is at decision time, not at plan time.
+    fn classify_for_destroy_scanned(
+        &self,
+        wt: &WorktreeEntry,
+        default_ref: &str,
+        scan: Result<Vec<ProcessInfo>, crate::process::ProcessError>,
+    ) -> DestroyTarget {
         let proc_scan_error = scan.is_err();
         let procs = scan.unwrap_or_default();
         let backing_missing = self.backing_repository_missing(&wt.path);
@@ -263,7 +318,7 @@ impl Pool {
     /// The on-disk size of a worktree's numbered container.
     fn measure_size(&self, path: &str) -> u64 {
         let container = Path::new(path).parent().unwrap_or(Path::new(path));
-        dir_size(container)
+        crate::pool::dir_size_lenient(container)
     }
 
     /// Whether `opts` authorize removing `target`. Returns a skip on failure.
@@ -375,7 +430,7 @@ impl Pool {
         // destroyed under its new owner.
         let (reserved, phase1b_skips) = with_pool_lock(&self.dir, self.lock_timeout, || {
             let mut state = State::read_state(&self.dir).map_err(PoolError::State)?;
-            heal_state(&mut state, |pid| self.process.started_at(pid));
+            heal_state(&mut state, |pids| self.process.started_at_many(pids));
             let mut reserved = Vec::new();
             let mut phase1_skips = Vec::new();
             for (snap_wt, current, context) in &phase1 {
@@ -604,7 +659,7 @@ impl Pool {
         // already gone.
         with_pool_lock(&self.dir, self.lock_timeout, || {
             let mut state = State::read_state(&self.dir).map_err(PoolError::State)?;
-            heal_state(&mut state, |pid| self.process.started_at(pid));
+            heal_state(&mut state, |pids| self.process.started_at_many(pids));
             let mut removed_paths = std::collections::HashSet::new();
             for action in &commits {
                 let (reservation, remove) = match action {
@@ -665,24 +720,6 @@ fn remove_dir_all_guarded(path: &Path) -> bool {
     }
 }
 
-/// Recursively measures a directory's total size in bytes.
-fn dir_size(path: &Path) -> u64 {
-    let mut total = 0u64;
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Ok(meta) = entry.metadata() {
-                if meta.is_dir() {
-                    total += dir_size(&path);
-                } else {
-                    total += meta.len();
-                }
-            }
-        }
-    }
-    total
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -712,7 +749,7 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), vec![1u8; 100]).unwrap();
         std::fs::create_dir_all(dir.path().join("sub")).unwrap();
         std::fs::write(dir.path().join("sub/b.txt"), vec![2u8; 50]).unwrap();
-        assert_eq!(dir_size(dir.path()), 150);
+        assert_eq!(crate::pool::dir_size_lenient(dir.path()), 150);
     }
 
     #[test]

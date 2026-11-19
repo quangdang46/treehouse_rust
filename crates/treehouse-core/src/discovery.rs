@@ -84,14 +84,20 @@ pub fn discover_pools_with_env(root: &std::path::Path, env: &dyn TreehouseEnv) -
                 .insert(dir.clone(), "no treehouse-state.json".to_string());
             continue;
         }
-        if env.read_file(&state_path).is_err() {
-            result
-                .skipped
-                .insert(dir.clone(), "cannot read state".to_string());
-            continue;
-        }
+        // One read feeds both checks: `state_from_bytes` runs the same
+        // parse + recovery pipeline `read_state` does, minus a second file
+        // read per pool dir.
+        let contents = match env.read_file(&state_path) {
+            Ok(c) => c,
+            Err(_) => {
+                result
+                    .skipped
+                    .insert(dir.clone(), "cannot read state".to_string());
+                continue;
+            }
+        };
         // A parse check guarantees a real managed pool
-        if crate::state::State::read_state(&dir).is_err() {
+        if crate::state::State::state_from_bytes(&dir, &state_path, contents.as_bytes()).is_err() {
             result
                 .skipped
                 .insert(dir.clone(), "state file does not parse".to_string());
@@ -152,15 +158,19 @@ pub fn discover_pools(root: &Path) -> DiscoverResult {
                 .insert(dir.clone(), "no treehouse-state.json".to_string());
             continue;
         }
-        if let Err(e) = fs::read_to_string(&state_path) {
-            result
-                .skipped
-                .insert(dir.clone(), format!("cannot read state: {e}"));
-            continue;
-        }
+        // One read feeds both checks — see `discover_pools_with_env`.
+        let contents = match fs::read_to_string(&state_path) {
+            Ok(c) => c,
+            Err(e) => {
+                result
+                    .skipped
+                    .insert(dir.clone(), format!("cannot read state: {e}"));
+                continue;
+            }
+        };
         // A parse check guarantees a real managed pool (the state file parser
         // is the same one `gc`/`prune` use).
-        if crate::state::State::read_state(&dir).is_err() {
+        if crate::state::State::state_from_bytes(&dir, &state_path, contents.as_bytes()).is_err() {
             result
                 .skipped
                 .insert(dir.clone(), "state file does not parse".to_string());

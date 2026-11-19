@@ -127,16 +127,18 @@ impl ShellGitBackend {
     /// use used to read as "clean worktree, merged HEAD", green-lighting
     /// `remove_dir_all` on trees nobody verified.
     fn run(&self, cwd: Option<&Path>, args: &[&str]) -> Result<Output, GitError> {
-        self.run_os(cwd, args.iter().map(|s| OsString::from(*s)).collect())
+        self.run_os(
+            cwd,
+            &args.iter().map(|s| OsString::from(*s)).collect::<Vec<_>>(),
+        )
     }
 
-    /// The spawn itself, with arguments already converted to the OS form.
-    fn run_os(&self, cwd: Option<&Path>, args: Vec<OsString>) -> Result<Output, GitError> {
-        let command = args
-            .iter()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join(" ");
+    /// The spawn itself, with arguments already in OS form.
+    ///
+    /// The joined display string is built ONLY on the spawn-error path: it
+    /// exists solely to label the [`GitError`], and every successful git call
+    /// used to pay for it anyway.
+    fn run_os(&self, cwd: Option<&Path>, args: &[OsString]) -> Result<Output, GitError> {
         let mut cmd = Command::new(&self.git_bin);
         // `-c submodule.recurse=false` (upstream #177): the pooled operations
         // must not walk into submodules just because the operator's global
@@ -145,7 +147,7 @@ impl ShellGitBackend {
         if first.trim() != "fetch" {
             cmd.args(crate::git::GIT_CONFIG_OVERRIDES);
         }
-        cmd.args(args);
+        cmd.args(args.iter());
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
@@ -154,7 +156,7 @@ impl ShellGitBackend {
             // the spawn error so callers see a hard failure, not a silent
             // empty success.
             GitError::new(
-                command,
+                os_args_label(args),
                 format!("git binary failed to spawn: {e}"),
                 GitErrorKind::Other,
             )
@@ -170,7 +172,7 @@ impl ShellGitBackend {
         kind: GitErrorKind,
     ) -> Result<(), GitError> {
         let output = self.run(cwd, args)?;
-        checked(output, crate::vcs::git_label(args), kind)
+        checked(output, || crate::vcs::git_label(args), kind)
     }
 
     /// [`Self::run_checked`] for argument lists that carry a caller-supplied
@@ -184,13 +186,18 @@ impl ShellGitBackend {
         args: &[Arg<'_>],
         kind: GitErrorKind,
     ) -> Result<(), GitError> {
-        let command = args
-            .iter()
-            .map(|a| a.to_os_string().to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let output = self.run_os(cwd, args.iter().map(Arg::to_os_string).collect())?;
-        checked(output, command, kind)
+        let os_args: Vec<OsString> = args.iter().map(Arg::to_os_string).collect();
+        let output = self.run_os(cwd, &os_args)?;
+        checked(
+            output,
+            || {
+                args.iter()
+                    .map(|a| a.to_os_string().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            },
+            kind,
+        )
     }
 
     /// Runs git and returns trimmed, UTF-8-lossy stdout, failing on nonzero
@@ -235,22 +242,24 @@ impl ShellGitBackend {
     /// then cannot open — or worse, one that names a DIFFERENT file than the
     /// one git selected.
     fn run_bytes(&self, cwd: Option<&Path>, args: &[&str]) -> Result<Vec<u8>, GitError> {
-        self.run_bytes_os(cwd, args.iter().map(|s| OsString::from(*s)).collect())
+        self.run_bytes_os(
+            cwd,
+            &args.iter().map(|s| OsString::from(*s)).collect::<Vec<_>>(),
+        )
     }
 
     /// [`Self::run_bytes`] for an argument list carrying a caller-supplied path
     /// (the temporary `--exclude-from` file is written from a manifest, so its
     /// path is not a compile-time literal).
-    fn run_bytes_os(&self, cwd: Option<&Path>, args: Vec<OsString>) -> Result<Vec<u8>, GitError> {
-        let command = args
-            .iter()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join(" ");
+    fn run_bytes_os(&self, cwd: Option<&Path>, args: &[OsString]) -> Result<Vec<u8>, GitError> {
         let output = self.run_os(cwd, args)?;
         if !output.status.success() {
             let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Err(GitError::new(command, message, GitErrorKind::Other));
+            return Err(GitError::new(
+                os_args_label(args),
+                message,
+                GitErrorKind::Other,
+            ));
         }
         Ok(output.stdout)
     }
@@ -275,13 +284,27 @@ fn split_nul(bytes: &[u8]) -> Vec<String> {
 
 /// Shared exit-code check: success is `Ok`, anything else is the stderr text
 /// wrapped with the command line that produced it (the `command` half of a
-/// [`GitError`], so operators can see what actually ran).
-fn checked(output: Output, command: String, kind: GitErrorKind) -> Result<(), GitError> {
+/// [`GitError`], so operators can see what actually ran). The label is built
+/// lazily — it is only needed on the failure path.
+fn checked(
+    output: Output,
+    command: impl FnOnce() -> String,
+    kind: GitErrorKind,
+) -> Result<(), GitError> {
     if output.status.success() {
         return Ok(());
     }
     let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    Err(GitError::new(command, message, kind))
+    Err(GitError::new(command(), message, kind))
+}
+
+/// The joined display form of an OS argument list, built only where an error
+/// message needs it (the [`GitError::command`] label).
+fn os_args_label(args: &[OsString]) -> String {
+    args.iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Finds the git binary: `GIT_BIN` env → `PATH` → Windows Program Files.
@@ -330,6 +353,13 @@ fn which_in_path(name: &str) -> Option<PathBuf> {
 /// The main repo root for a worktree: `rev-parse --git-common-dir` with
 /// `--path-format=absolute`, resolving `<main>/.git` → `<main>`.
 fn main_repo_root_from(start: &Path, git_bin: &Path) -> Result<PathBuf, GitError> {
+    // Fast path: a linked worktree's `.git` FILE already names its gitdir —
+    // `<common>/worktrees/<name>` — so the common dir (and the main root) is
+    // pure path math. This runs once per slot on every sweep, where the
+    // rev-parse pair below cost two subprocesses each.
+    if let Some(root) = main_repo_root_from_gitfile(start) {
+        return Ok(root);
+    }
     let repo_root = repo_root_from(start, git_bin)?;
     // Try --git-common-dir absolute first.
     let common = run_one(
@@ -346,6 +376,41 @@ fn main_repo_root_from(start: &Path, git_bin: &Path) -> Result<PathBuf, GitError
         }
     }
     Ok(repo_root)
+}
+
+/// The main repo root implied by a linked worktree's `.git` pointer file, or
+/// `None` when the file is absent, unreadable, names a gitdir that does not
+/// exist (an orphan — git must report that itself), or is not the standard
+/// `<common>/worktrees/<name>` layout.
+///
+/// Only the standard layout is trusted: `git worktree add` always writes
+/// `<commondir>/worktrees/<name>`, and anything else (a hand-edited pointer,
+/// a separated git dir) falls through to the `rev-parse` pair so git stays
+/// the authority on unusual repositories.
+fn main_repo_root_from_gitfile(start: &Path) -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(start.join(".git")).ok()?;
+    let gitdir = contents.strip_prefix("gitdir:")?.trim();
+    if gitdir.is_empty() {
+        return None;
+    }
+    let gitdir = Path::new(gitdir);
+    let gitdir = if gitdir.is_absolute() {
+        gitdir.to_path_buf()
+    } else {
+        start.join(gitdir)
+    };
+    // A dead pointer must NOT resolve: callers distinguish "no repository"
+    // (Err -> unverified/skip) from "repository at X", and an orphaned slot
+    // has to keep reporting the former.
+    if !gitdir.exists() {
+        return None;
+    }
+    // gitdir = <common>/worktrees/<name>: the common dir is two levels up.
+    let common = gitdir.parent()?.parent()?;
+    if common.file_name() != Some(OsStr::new(".git")) {
+        return None;
+    }
+    common.parent().map(|p| p.to_path_buf())
 }
 
 fn repo_root_from(start: &Path, git_bin: &Path) -> Result<PathBuf, GitError> {
@@ -807,12 +872,24 @@ impl GitBackend for ShellGitBackend {
     }
 
     fn is_dirty(&self, worktree: &Path) -> Result<bool, GitError> {
-        let out = self.run_stdout(
+        // Byte-level probe: `status --porcelain --untracked-files=all` can
+        // emit megabytes on a tree full of untracked files, and the only
+        // question asked here is whether ANY output exists — decoding and
+        // trimming the whole blob to answer `is_empty` was pure waste on the
+        // per-worktree sweep path.
+        let out = self.run(
             Some(worktree),
             &["status", "--porcelain", "--untracked-files=all"],
-            GitErrorKind::Other,
         )?;
-        Ok(!out.is_empty())
+        if !out.status.success() {
+            let message = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(GitError::new(
+                crate::vcs::git_label(&["status", "--porcelain", "--untracked-files=all"]),
+                message,
+                GitErrorKind::Other,
+            ));
+        }
+        Ok(out.stdout.iter().any(|b| !b.is_ascii_whitespace()))
     }
 
     fn reset_worktree(&self, worktree: &Path, branch: &str) -> Result<(), GitError> {

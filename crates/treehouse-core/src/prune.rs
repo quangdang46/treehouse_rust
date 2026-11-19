@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::pool::{Pool, PoolError};
+use crate::pool::{Pool, PoolError, dir_size};
 use crate::reservation::Reservation;
 use crate::state::{State, WorktreeEntry, heal_state};
 use crate::state_file;
@@ -192,17 +192,45 @@ impl Pool {
             dry_run: opts.dry_run,
             ..Default::default()
         };
-        let mut planned: Vec<(PruneWorktree, PruneContext)> = Vec::new();
 
-        for wt in &entries {
-            if wt.destroying || wt.leased || crate::reservation::owner_alive(wt, &self.process) {
-                continue; // leased / in-use silently skipped (never candidates)
-            }
-            let in_use = self
-                .process
-                .is_worktree_in_use(Path::new(&wt.path))
-                .unwrap_or(true);
+        // Phase A (serial, cheap): the lease/destroying/owner gates, then ONE
+        // batched process-table scan for every surviving slot — previously a
+        // full sysinfo re-enumeration per entry.
+        let active: Vec<&WorktreeEntry> = entries
+            .iter()
+            .filter(|wt| {
+                !(wt.destroying || wt.leased || crate::reservation::owner_alive(wt, &self.process))
+            })
+            .collect();
+        let scan_paths: Vec<&Path> = active.iter().map(|wt| Path::new(&wt.path)).collect();
+        let scans = self.process.scan_worktrees(&scan_paths);
+        let in_use: Vec<bool> = scans
+            .into_iter()
+            .map(|s| match s {
+                Ok(procs) => !procs.is_empty(),
+                Err(_) => true, // unproven => treat as in use (fail closed)
+            })
+            .collect();
+
+        // Phase B (serial): per-slot repository context. `main_repo_root` is
+        // now resolved from the `.git` pointer file where possible, and the
+        // fetch/default-ref lookup stays memoized per resolved root, so this
+        // pass is cheap; it must stay serial because the resolver memoizes.
+        enum SlotPlan<'a> {
+            /// In use — silently skipped, exactly like the old `continue`.
+            InUse,
+            /// Context resolution failed — recorded skip.
+            Skip(PruneSkipped),
+            /// Ready for the (parallel) per-slot analysis.
+            Analyze {
+                wt: &'a WorktreeEntry,
+                context: PruneContext,
+            },
+        }
+        let mut plans: Vec<SlotPlan<'_>> = Vec::with_capacity(active.len());
+        for (wt, &in_use) in active.iter().zip(in_use.iter()) {
             if in_use {
+                plans.push(SlotPlan::InUse);
                 continue;
             }
             // An orphan has no live repository behind it to resolve a ref in,
@@ -220,23 +248,61 @@ impl Pool {
                 match resolver.context(wt) {
                     Ok(c) => c,
                     Err(reason) => {
-                        result.skipped.push(PruneSkipped {
+                        plans.push(SlotPlan::Skip(PruneSkipped {
                             name: wt.name.clone(),
                             path: wt.path.clone(),
                             category: PRUNE_SKIP_CANNOT_VERIFY.to_string(),
                             reason: "cannot verify worktree".to_string(),
                             detail: reason,
-                        });
+                        }));
                         continue;
                     }
                 }
             };
-            let (worktree, skipped, stale) = self.analyze_idle_worktree(
-                wt,
-                context.default_ref.as_deref(),
-                opts,
-                context.context_error.as_deref(),
-            );
+            plans.push(SlotPlan::Analyze { wt, context });
+        }
+
+        // Phase C (parallel): the per-slot analysis is a bundle of
+        // independent read-only probes — `is_dirty`, `is_head_merged`,
+        // `dir_size` — one subprocess/directory-walk each. Scoped threads
+        // run them concurrently; results are collected in slot order so the
+        // reported candidate/skip order is unchanged.
+        let analyses: Vec<Option<(PruneWorktree, PruneSkipped, bool)>> =
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = plans
+                    .iter()
+                    .map(|plan| match plan {
+                        SlotPlan::Analyze { wt, context } => Some(scope.spawn(move || {
+                            self.analyze_idle_worktree(
+                                wt,
+                                context.default_ref.as_deref(),
+                                opts,
+                                context.context_error.as_deref(),
+                            )
+                        })),
+                        _ => None,
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.map(|h| h.join().expect("prune probe thread panicked")))
+                    .collect()
+            });
+
+        // Phase D (serial): fold the verdicts back in state order.
+        let mut planned: Vec<(PruneWorktree, PruneContext)> = Vec::new();
+        for (plan, analysis) in plans.iter().zip(analyses) {
+            match plan {
+                SlotPlan::InUse => continue,
+                SlotPlan::Skip(skipped) => {
+                    result.skipped.push(skipped.clone());
+                    continue;
+                }
+                SlotPlan::Analyze { .. } => {}
+            }
+            let Some((worktree, skipped, stale)) = analysis else {
+                continue;
+            };
             if !stale {
                 continue;
             }
@@ -246,7 +312,10 @@ impl Pool {
             }
             result.candidates.push(worktree.clone());
             result.reclaimable_bytes += worktree.bytes;
-            planned.push((worktree, context));
+            // Recover the context for the plan tuple.
+            if let SlotPlan::Analyze { context, .. } = plan {
+                planned.push((worktree, context.clone()));
+            }
         }
 
         if opts.dry_run || planned.is_empty() {
@@ -423,7 +492,7 @@ impl Pool {
         let reserved: Vec<(Reservation, PruneWorktree, PruneContext)> =
             crate::pool::with_pool_lock(&self.dir, self.lock_timeout, || {
                 let mut state = State::read_state(&self.dir).map_err(PoolError::State)?;
-                heal_state(&mut state, |pid| self.process.started_at(pid));
+                heal_state(&mut state, |pids| self.process.started_at_many(pids));
                 let mut reserved = Vec::new();
                 for (worktree, context) in planned {
                     let Some(idx) = state.worktrees.iter().position(|w| w.path == worktree.path)
@@ -562,7 +631,7 @@ impl Pool {
         // Phase 2c (LOCK, short): apply every deferred state commit.
         crate::pool::with_pool_lock(&self.dir, self.lock_timeout, || {
             let mut state = State::read_state(&self.dir).map_err(PoolError::State)?;
-            heal_state(&mut state, |pid| self.process.started_at(pid));
+            heal_state(&mut state, |pids| self.process.started_at_many(pids));
             let mut removed = std::collections::HashSet::new();
             for commit in &commits {
                 let (reservation, remove) = match commit {
@@ -698,21 +767,6 @@ pub(crate) fn with_pool_snapshot(pool: &Pool) -> Result<Vec<WorktreeEntry>, Pool
     crate::pool::healed_state_snapshot(&pool.dir, pool.lock_timeout, &pool.process)
 }
 
-/// Recursively measures a directory's size (Go `dirSize`).
-fn dir_size(path: &Path) -> std::io::Result<u64> {
-    let mut total = 0u64;
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        let p = entry.path();
-        if entry.file_type()?.is_dir() {
-            total += dir_size(&p)?;
-        } else {
-            total += entry.metadata()?.len();
-        }
-    }
-    Ok(total)
-}
-
 /// Formats bytes the Go way (Go `formatBytes`): `N B`, else one-decimal
 /// KiB/MiB/GiB/TiB with trailing zeros/dot trimmed.
 pub fn format_bytes(bytes: u64) -> String {
@@ -771,7 +825,7 @@ mod tests {
         std::fs::write(dir.path().join("a"), vec![1; 100]).unwrap();
         std::fs::create_dir_all(dir.path().join("sub")).unwrap();
         std::fs::write(dir.path().join("sub/b"), vec![2; 50]).unwrap();
-        assert_eq!(dir_size(dir.path()).unwrap(), 150);
+        assert_eq!(crate::pool::dir_size(dir.path()).unwrap(), 150);
     }
 
     #[test]

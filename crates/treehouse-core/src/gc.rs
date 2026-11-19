@@ -16,7 +16,7 @@
 
 use std::path::Path;
 
-use crate::pool::{Pool, PoolError};
+use crate::pool::{Pool, PoolError, dir_size};
 use crate::prune::PRUNE_SKIP_IN_USE;
 use crate::reservation::Reservation;
 use crate::state::{State, WorktreeEntry, heal_state};
@@ -120,9 +120,21 @@ impl Pool {
             dry_run: opts.dry_run,
             ..Default::default()
         };
-        let mut planned: Vec<(GcWorktree, crate::prune::PruneContext)> = Vec::new();
         let now = chrono::Utc::now();
 
+        // Phase A (serial): per-slot repository context, exactly as before —
+        // the fetch + default-ref lookup stays memoized per resolved root.
+        // Context errors are recorded skips in slot order.
+        enum SlotPlan<'a> {
+            /// Context resolution failed — recorded skip.
+            Skip(GcSkipped),
+            /// Ready for the (parallel) per-slot analysis.
+            Analyze {
+                wt: &'a WorktreeEntry,
+                context: crate::prune::PruneContext,
+            },
+        }
+        let mut plans: Vec<SlotPlan<'_>> = Vec::with_capacity(entries.len());
         for wt in &entries {
             // An orphan has no live repository to resolve a ref in, and
             // `analyze_gc_candidate` answers from the orphan branch before it
@@ -137,26 +149,91 @@ impl Pool {
                 match resolver.context(wt) {
                     Ok(c) => c,
                     Err(reason) => {
-                        result.skipped.push(GcSkipped {
+                        plans.push(SlotPlan::Skip(GcSkipped {
                             name: wt.name.clone(),
                             path: wt.path.clone(),
                             category: crate::prune::PRUNE_SKIP_CANNOT_VERIFY.to_string(),
                             reason: format!("cannot verify worktree: {reason}"),
-                        });
+                        }));
                         continue;
                     }
                 }
             };
-            let (candidate, skipped) =
-                self.analyze_gc_candidate(wt, context.default_ref.as_deref(), opts, now);
-            if let Some(skip) = skipped {
-                result.skipped.push(skip);
-                continue;
-            }
-            if let Some(c) = candidate {
-                result.reclaimable_bytes += c.bytes;
-                result.candidates.push(c.clone());
-                planned.push((c, context));
+            plans.push(SlotPlan::Analyze { wt, context });
+        }
+
+        // Phase B: ONE batched process-table scan for every slot — the old
+        // loop paid a full sysinfo re-enumeration per entry. An Err entry
+        // fails closed as "in use", matching `unwrap_or(true)`.
+        let scan_paths: Vec<&Path> = plans
+            .iter()
+            .filter_map(|p| match p {
+                SlotPlan::Analyze { wt, .. } => Some(Path::new(&wt.path)),
+                _ => None,
+            })
+            .collect();
+        let scans = self.process.scan_worktrees(&scan_paths);
+        let mut scan_iter = scans.into_iter();
+        let in_use: Vec<bool> = plans
+            .iter()
+            .map(|p| match p {
+                SlotPlan::Analyze { .. } => match scan_iter.next() {
+                    Some(Ok(procs)) => !procs.is_empty(),
+                    _ => true,
+                },
+                SlotPlan::Skip(_) => false,
+            })
+            .collect();
+
+        // Phase C (parallel): per-slot analysis is independent read-only
+        // probes (`is_dirty`, `is_head_merged`, `dir_size`). Scoped threads,
+        // results collected in slot order.
+        let analyses: Vec<Option<(Option<GcWorktree>, Option<GcSkipped>)>> =
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = plans
+                    .iter()
+                    .zip(in_use.iter())
+                    .map(|(plan, &in_use)| match plan {
+                        SlotPlan::Analyze { wt, context } => Some(scope.spawn(move || {
+                            self.analyze_gc_candidate(
+                                wt,
+                                context.default_ref.as_deref(),
+                                opts,
+                                now,
+                                in_use,
+                            )
+                        })),
+                        _ => None,
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.map(|h| h.join().expect("gc probe thread panicked")))
+                    .collect()
+            });
+
+        // Phase D (serial): fold verdicts in state order.
+        let mut planned: Vec<(GcWorktree, crate::prune::PruneContext)> = Vec::new();
+        for (plan, analysis) in plans.iter().zip(analyses) {
+            match plan {
+                SlotPlan::Skip(skip) => {
+                    result.skipped.push(skip.clone());
+                    continue;
+                }
+                SlotPlan::Analyze { context, .. } => {
+                    let Some((candidate, skipped)) = analysis else {
+                        continue;
+                    };
+                    if let Some(skip) = skipped {
+                        result.skipped.push(skip);
+                        continue;
+                    }
+                    if let Some(c) = candidate {
+                        result.reclaimable_bytes += c.bytes;
+                        result.candidates.push(c.clone());
+                        planned.push((c, context.clone()));
+                    }
+                }
             }
         }
 
@@ -173,12 +250,18 @@ impl Pool {
 
     /// Classifies one worktree for gc: stale-lease, ordinary idle, orphan, or
     /// skip (valid lease / in use / not disposable).
+    ///
+    /// `in_use` is the batched process-scan verdict for this slot's path —
+    /// `gc` scans the whole table once up front instead of re-enumerating
+    /// sysinfo per entry. It fails closed: `true` whenever the scan could
+    /// not prove the slot idle.
     fn analyze_gc_candidate(
         &self,
         wt: &WorktreeEntry,
         default_ref: Option<&str>,
         opts: &GcOptions,
         now: chrono::DateTime<chrono::Utc>,
+        in_use: bool,
     ) -> (Option<GcWorktree>, Option<GcSkipped>) {
         let name = wt.name.clone();
         let path = wt.path.clone();
@@ -202,11 +285,7 @@ impl Pool {
         }
 
         // In-use: a live process (incl. an agent past its TTL) is never evicted.
-        if self
-            .process
-            .is_worktree_in_use(Path::new(&path))
-            .unwrap_or(true)
-        {
+        if in_use {
             return (
                 None,
                 Some(GcSkipped {
@@ -330,7 +409,7 @@ impl Pool {
         let reserved: Vec<(Reservation, GcWorktree, crate::prune::PruneContext)> =
             crate::pool::with_pool_lock(&self.dir, self.lock_timeout, || {
                 let mut state = State::read_state(&self.dir).map_err(PoolError::State)?;
-                heal_state(&mut state, |pid| self.process.started_at(pid));
+                heal_state(&mut state, |pids| self.process.started_at_many(pids));
                 let mut reserved = Vec::new();
                 for (w, context) in planned {
                     let Some(idx) = state.worktrees.iter().position(|e| e.path == w.path) else {
@@ -458,7 +537,7 @@ impl Pool {
         // Phase 2c (LOCK, short): apply every deferred state commit.
         crate::pool::with_pool_lock(&self.dir, self.lock_timeout, || {
             let mut state = State::read_state(&self.dir).map_err(PoolError::State)?;
-            heal_state(&mut state, |pid| self.process.started_at(pid));
+            heal_state(&mut state, |pids| self.process.started_at_many(pids));
             let mut removed = std::collections::HashSet::new();
             for commit in &commits {
                 let (reservation, remove) = match commit {
@@ -540,21 +619,6 @@ enum GcCommit {
     Remove(Reservation),
     /// The slot was skipped or cleanup failed: restore the pre-destroy owner.
     Restore(Reservation),
-}
-
-/// Recursively measures a directory's size.
-fn dir_size(path: &Path) -> std::io::Result<u64> {
-    let mut total = 0u64;
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        let p = entry.path();
-        if entry.file_type()?.is_dir() {
-            total += dir_size(&p)?;
-        } else {
-            total += entry.metadata()?.len();
-        }
-    }
-    Ok(total)
 }
 
 #[cfg(test)]

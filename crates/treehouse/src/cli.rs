@@ -4,6 +4,7 @@
 //! formatter. The Go CLI contract (plan Appendix B) is reproduced: exit codes,
 //! stdout/stderr routing, and human message strings (byte-exact where Go-tested).
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -185,8 +186,14 @@ pub struct RunArgs {
     /// The command to run inside the worktree. Everything from the first
     /// non-flag token on is the command, so its own flags are never eaten by
     /// treehouse's own parser.
+    ///
+    /// `OsString`, not `String`: the core's `RunOptions::command` is
+    /// `Vec<OsString>` on purpose — a command line is bytes, and a non-UTF8
+    /// argument (a path with arbitrary bytes, a filename that is not valid
+    /// Unicode) must reach `spawn` verbatim rather than be rejected by the
+    /// parser before the command ever runs.
     #[arg(last = true, required = true, value_name = "CMD")]
-    pub cmd: Vec<String>,
+    pub cmd: Vec<OsString>,
 }
 
 #[derive(Debug, Args)]

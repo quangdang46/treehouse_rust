@@ -103,9 +103,12 @@ fn main() {
     // above stayed unreachable. Non-recursion is guaranteed structurally
     // instead: this handler exits before `Cli::parse` and before
     // `should_spawn_update_check` ever runs.
-    let args: Vec<String> = std::env::args().collect();
+    // `args_os`, not `args`: `args()` PANICS on any non-UTF8 argument, and
+    // `run -- <cmd>` is exactly where arbitrary bytes legitimately appear.
+    // Only the `--update-check` verb check runs this early; clap's own parse
+    // already takes OsStrings.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     if args.len() >= 2 && args[1] == "--update-check" {
-        let version = args.get(2).cloned().unwrap_or_default();
         // Only a version this platform can INSTALL is cached. Caching a
         // release with no archive for this OS/arch would advertise an update
         // that `treehouse update` can never apply — a notice the user can do
@@ -116,7 +119,6 @@ fn main() {
             true,
         ) {
             treehouse_core::updater::write_cache(&latest);
-            let _ = version;
             std::process::exit(0);
         }
         std::process::exit(1);
@@ -306,12 +308,29 @@ fn outside_enclosing_worktree(dir: &Path, cwd: &Path) -> bool {
 /// A marker that cannot be read is an error, not a miss — `slot_backend_name`
 /// answers `""` for a damaged marker, which would make this walk PAST a real
 /// worktree and pick an ancestor the child is actually inside.
+///
+/// `.jj` counts too: a pooled jj workspace is `.jj`-only and has no `.git`
+/// entry, so a caller standing in one used to read as "in no worktree" and
+/// the detached update-check child was allowed a cwd inside the slot.
 fn enclosing_worktree_root(dir: &Path) -> Option<PathBuf> {
     for candidate in dir.ancestors() {
         match std::fs::symlink_metadata(candidate.join(".git")) {
             Ok(_) => return Some(candidate.to_path_buf()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             // Unreadable: stop here rather than climb into an ancestor.
+            Err(_) => return None,
+        }
+        // `.jj` must be a DIRECTORY to mark a workspace (a `.jj` file is
+        // not one — the `vcs::worktree_backend_name` rule); anything else
+        // keeps the walk going, exactly like a missing `.git`. An unreadable
+        // `.jj` stops the walk for the same fail-closed reason `.git` does.
+        match std::fs::symlink_metadata(candidate.join(".jj")) {
+            Ok(_) => match std::fs::metadata(candidate.join(".jj")) {
+                Ok(m) if m.is_dir() => return Some(candidate.to_path_buf()),
+                Ok(_) => {}
+                Err(_) => return None,
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return None,
         }
     }
@@ -1613,7 +1632,7 @@ fn cmd_watch(cli: &Cli, args: &cli::WatchArgs) -> Result<()> {
     ctrlc::set_handler(move || {
         s.store(true, std::sync::atomic::Ordering::Relaxed);
     })
-    .expect("failed to set Ctrl-C handler");
+    .map_err(|e| anyhow!("failed to install Ctrl-C handler: {e}"))?;
 
     eprintln!(
         "🌳 treehouse watch: sweeping every {}. Press Ctrl-C to stop.",
@@ -2215,8 +2234,9 @@ fn lingering_error(message: impl std::fmt::Display) -> treehouse_core::pool::Poo
 fn cmd_run(cli: &Cli, args: &cli::RunArgs) -> Result<()> {
     // `last = true` starts the command at the first non-flag token, so the
     // command's own flags reach it verbatim and are never eaten here. A
-    // leading `--` the shell passed through is still stripped.
-    let mut command: Vec<String> = args.cmd.clone();
+    // leading `--` the shell passed through is still stripped. The command is
+    // `Vec<OsString>` end to end — non-UTF8 arguments reach `spawn` as bytes.
+    let mut command: Vec<std::ffi::OsString> = args.cmd.clone();
     if command.first().map(|a| a == "--").unwrap_or(false) {
         command.remove(0);
     }
@@ -2235,7 +2255,7 @@ fn cmd_run(cli: &Cli, args: &cli::RunArgs) -> Result<()> {
 
     let pool = open_pool_for_cli(cli)?;
     let opts = treehouse_core::run::RunOptions {
-        command: command.iter().map(std::ffi::OsString::from).collect(),
+        command,
         ttl,
         holder,
     };
@@ -2482,7 +2502,13 @@ mod tests {
         assert_eq!(args.lease_holder.as_deref(), Some("agent-7"));
         assert_eq!(
             args.cmd,
-            vec!["npm", "test", "--watch", "--lease-holder", "not-ours"],
+            vec![
+                std::ffi::OsString::from("npm"),
+                std::ffi::OsString::from("test"),
+                std::ffi::OsString::from("--watch"),
+                std::ffi::OsString::from("--lease-holder"),
+                std::ffi::OsString::from("not-ours"),
+            ],
             "the command's own flags must survive: treehouse stops parsing at the first non-flag token"
         );
     }

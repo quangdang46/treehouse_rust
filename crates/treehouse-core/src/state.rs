@@ -19,7 +19,7 @@
 //! [`recover_one_worktree`] helper, so the same on-disk condition can never be
 //! classified one way by one path and the other way by the other.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use rand::Rng;
@@ -410,13 +410,25 @@ impl State {
         let data = match std::fs::read(&path) {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return recover_missing_state_entries(pool_dir, State::default(), &path);
+                return recover_missing_state_entries(pool_dir, State::default(), &path, None);
             }
             Err(e) => return Err(StateError::Read(path, e)),
         };
-        match serde_json::from_slice(&data) {
-            Ok(s) => recover_missing_state_entries(pool_dir, s, &path),
-            Err(parse_err) => recover_corrupt_state(pool_dir, path, parse_err),
+        Self::state_from_bytes(pool_dir, &path, &data)
+    }
+
+    /// Parses already-read state bytes — the same parse + recovery pipeline
+    /// [`Self::read_state`] runs, minus the file read. Pool discovery reads
+    /// the file once for its own checks and hands the bytes here instead of
+    /// making `read_state` read it a second time.
+    pub(crate) fn state_from_bytes(
+        pool_dir: &Path,
+        state_path: &Path,
+        data: &[u8],
+    ) -> Result<State, StateError> {
+        match serde_json::from_slice(data) {
+            Ok(s) => recover_missing_state_entries(pool_dir, s, state_path, Some(data)),
+            Err(parse_err) => recover_corrupt_state(pool_dir, state_path.to_path_buf(), parse_err),
         }
     }
 
@@ -434,15 +446,130 @@ impl State {
         let data = match env.read_bytes(&path) {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return recover_missing_state_entries(pool_dir, State::default(), &path);
+                return recover_missing_state_entries(pool_dir, State::default(), &path, None);
             }
             Err(e) => return Err(StateError::Read(path, e)),
         };
-        match serde_json::from_slice(&data) {
-            Ok(s) => recover_missing_state_entries(pool_dir, s, &path),
-            Err(parse_err) => recover_corrupt_state(pool_dir, path, parse_err),
-        }
+        Self::state_from_bytes(pool_dir, &path, &data)
     }
+}
+
+/// Memo for the successful-parse recovery scan.
+///
+/// `read_state` runs on EVERY pool command — often several times per command
+/// under the state lock — and the missing-entries scan walks every
+/// `<pool>/<slot>/<wt>` directory each time. The scan exists for one narrow
+/// window (a `git worktree add` that committed while its state write did
+/// not), so once a pool is quiescent the walk almost always finds nothing
+/// new. This memo lets a repeated read skip the nested `read_dir` per slot
+/// when it can PROVE the two-level listing is unchanged.
+///
+/// Proof, not trust: a hit requires (a) byte-identical state input, (b) the
+/// pool directory's own mtime unchanged (covers slot dirs appearing or
+/// disappearing), and (c) every slot directory's mtime unchanged (covers
+/// `<slot>/<wt>` appearing or disappearing — creating or removing a dir
+/// entry inside a directory always bumps that directory's mtime). Any
+/// mutation invalidates; the fallback is the full scan, so a false negative
+/// is impossible and a false positive only costs one redundant walk.
+///
+/// Residual, documented: a permission change on a slot dir bumps ctime, not
+/// mtime, so a chmod between reads could let a memo hit mask the
+/// `RecoverScan` error the full walk would have raised. The adoption result
+/// itself is unaffected — the cached listing still names the same dirs.
+struct RecoveryScanMemo {
+    /// Hash of the raw state bytes the listing was computed against.
+    state_sig: u64,
+    /// `pool_dir`'s mtime when the listing was taken.
+    pool_mtime: std::time::SystemTime,
+    /// `(slot dir name, mtime)` pairs, sorted by name.
+    slot_sig: Vec<(std::ffi::OsString, std::time::SystemTime)>,
+    /// The `(slot_name, wt_path)` listing `scan_worktree_dirs` produced.
+    dirs: Vec<(String, std::path::PathBuf)>,
+}
+
+fn recovery_memo()
+-> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, RecoveryScanMemo>> {
+    static MEMO: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, RecoveryScanMemo>>,
+    > = std::sync::OnceLock::new();
+    MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn state_bytes_sig(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
+}
+
+/// Returns the cached `(slot, worktree)` listing when the memo proves the
+/// on-disk two-level structure is byte-for-byte what the last full scan saw;
+/// `None` on any doubt, which sends the caller to the real scan.
+fn recovery_dirs_memo(pool_dir: &Path, state_bytes: &[u8]) -> Option<Vec<(String, PathBuf)>> {
+    let sig = state_bytes_sig(state_bytes);
+    let memo = recovery_memo().lock().ok()?;
+    let entry = memo.get(pool_dir)?;
+    if entry.state_sig != sig {
+        return None;
+    }
+    // Revalidate the change signal at read time — same freshness the full
+    // scan had, minus the nested walks.
+    let pool_meta = std::fs::metadata(pool_dir).ok()?;
+    if pool_meta.modified().ok()? != entry.pool_mtime {
+        return None;
+    }
+    let mut slot_sig: Vec<(std::ffi::OsString, std::time::SystemTime)> = Vec::new();
+    for dirent in std::fs::read_dir(pool_dir).ok()? {
+        let dirent = dirent.ok()?;
+        if !dirent.file_type().ok()?.is_dir() {
+            continue;
+        }
+        slot_sig.push((dirent.file_name(), dirent.metadata().ok()?.modified().ok()?));
+    }
+    slot_sig.sort();
+    if slot_sig != entry.slot_sig {
+        return None;
+    }
+    Some(entry.dirs.clone())
+}
+
+/// Stores a fresh listing in the memo. Called only after a real
+/// `scan_worktree_dirs` succeeded, so the cached listing is exactly what a
+/// repeat read would have produced.
+fn recovery_memo_store(
+    pool_dir: &Path,
+    state_bytes: &[u8],
+    dirs: &[(String, PathBuf)],
+) -> Option<()> {
+    let pool_mtime = std::fs::metadata(pool_dir)
+        .and_then(|m| m.modified())
+        .ok()?;
+    let slot_sig = (|| {
+        let mut sig = Vec::new();
+        for dirent in std::fs::read_dir(pool_dir).ok()? {
+            let dirent = dirent.ok()?;
+            if dirent.file_type().ok()?.is_dir() {
+                sig.push((dirent.file_name(), dirent.metadata().ok()?.modified().ok()?));
+            }
+        }
+        sig.sort();
+        Some(sig)
+    })()?;
+    let memo = RecoveryScanMemo {
+        state_sig: state_bytes_sig(state_bytes),
+        pool_mtime,
+        slot_sig,
+        dirs: dirs.to_vec(),
+    };
+    if let Ok(mut map) = recovery_memo().lock() {
+        // Bound the map: pools are few, but a long-lived process walking
+        // many pool dirs must not grow it without limit.
+        if map.len() > 128 {
+            map.clear();
+        }
+        map.insert(pool_dir.to_path_buf(), memo);
+    }
+    Some(())
 }
 
 /// Marker placed on every entry either recovery scan reconstructs —
@@ -504,6 +631,7 @@ fn recover_missing_state_entries(
     pool_dir: &Path,
     mut state: State,
     state_path: &Path,
+    state_bytes: Option<&[u8]>,
 ) -> Result<State, StateError> {
     // Go stats the pool directory before scanning: a pool that does not exist
     // has no worktrees to adopt and is a genuinely fresh, empty pool. A
@@ -530,8 +658,23 @@ fn recover_missing_state_entries(
         .map(|wt| clean_path(Path::new(&wt.path)))
         .collect();
 
+    // The successful-parse path may reuse the memoized listing when the
+    // state bytes AND the on-disk directory mtimes prove nothing changed —
+    // see [`RecoveryScanMemo`]. Missing/corrupt state (`state_bytes: None`)
+    // always takes the full scan: recovery is the whole point there.
+    let dirs = match state_bytes.and_then(|b| recovery_dirs_memo(pool_dir, b)) {
+        Some(dirs) => dirs,
+        None => {
+            let dirs = scan_worktree_dirs(pool_dir, state_path)?;
+            if let Some(bytes) = state_bytes {
+                let _ = recovery_memo_store(pool_dir, bytes, &dirs);
+            }
+            dirs
+        }
+    };
+
     let mut adopted = 0usize;
-    for (slot_name, wt_path) in scan_worktree_dirs(pool_dir, state_path)? {
+    for (slot_name, wt_path) in dirs {
         if known.contains(&clean_path(&wt_path)) {
             continue;
         }
@@ -649,8 +792,9 @@ fn quarantine_entry(slot_name: &str, wt_path: &Path, recovery_error: &str) -> Wo
     }
 }
 
-/// Reports whether `<wt_path>/.git` marks a pooled worktree, or fails with the
-/// reason it could not be resolved (Go `WorktreeBackendNameChecked`).
+/// Reports whether `<wt_path>` carries a VCS marker — `.git` OR a `.jj`
+/// directory — or fails with the reason it could not be resolved (Go
+/// `WorktreeBackendNameChecked`, mirrored by `vcs::worktree_backend_name`).
 ///
 /// The two-step lstat-then-stat is what makes a broken marker reportable.
 /// `symlink_metadata` does not follow the link, so a dangling or
@@ -660,11 +804,18 @@ fn quarantine_entry(slot_name: &str, wt_path: &Path, recovery_error: &str) -> Wo
 /// plain `stat` would report `ENOENT` and silently skip the worktree, hiding a
 /// slot that is still occupying its name. Only a genuinely absent entry is
 /// `Ok(false)`.
+///
+/// `.jj` gets the same treatment because a pooled jj workspace is `.jj`-ONLY
+/// — it has no `.git` entry at all (vcs/jj.rs). Checking only `.git` here let
+/// a crashed jj acquisition leave an on-disk worktree the recovery scans
+/// could not see: invisible to `status`, unclaimable by `next_name`, the same
+/// wedge the scans exist to prevent. A `.jj` FILE is not a workspace marker
+/// (same rule as `worktree_backend_name`) and falls through to `Ok(false)`.
 fn marker_backend(wt_path: &Path) -> std::io::Result<bool> {
     let git = wt_path.join(".git");
     match std::fs::symlink_metadata(&git) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
         Ok(_) => {
             std::fs::metadata(&git).map_err(|e| {
                 std::io::Error::new(
@@ -672,7 +823,21 @@ fn marker_backend(wt_path: &Path) -> std::io::Result<bool> {
                     format!("resolving .git marker in {}: {e}", wt_path.display()),
                 )
             })?;
-            Ok(true)
+            return Ok(true);
+        }
+    }
+    let jj = wt_path.join(".jj");
+    match std::fs::symlink_metadata(&jj) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+        Ok(_) => {
+            let meta = std::fs::metadata(&jj).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("resolving .jj marker in {}: {e}", wt_path.display()),
+                )
+            })?;
+            Ok(meta.is_dir())
         }
     }
 }
@@ -716,18 +881,35 @@ fn clean_path(path: &Path) -> std::path::PathBuf {
 /// `None` if the process no longer exists / can't be determined). It is a
 /// parameter so `state.rs` stays decoupled from the process module; the pool
 /// wires it to the real process table.
-pub fn heal_state(state: &mut State, process_started_at: impl Fn(i32) -> Option<i64>) {
-    let mut healed = Vec::with_capacity(state.worktrees.len());
-    for mut wt in std::mem::take(&mut state.worktrees) {
+pub fn heal_state(
+    state: &mut State,
+    process_started_at: impl Fn(&[i32]) -> std::collections::HashMap<i32, Option<i64>>,
+) {
+    // Drop entries whose path is gone (mirrors Go healState), keeping only
+    // live paths for the owner check below.
+    let mut kept: Vec<WorktreeEntry> = Vec::with_capacity(state.worktrees.len());
+    for wt in std::mem::take(&mut state.worktrees) {
         if std::path::Path::new(&wt.path).exists() {
-            if wt.owner_pid != 0 && !owner_alive(&wt, &process_started_at) {
-                wt.owner_pid = 0;
-                wt.owner_started_at = 0;
-                wt.destroying = false;
-            }
-            healed.push(wt);
+            kept.push(wt);
         }
-        // Path gone => entry dropped entirely (mirrors Go healState).
+    }
+    // ONE batched liveness probe for every owner pid. The per-pid form cost
+    // a targeted sysinfo refresh per reserved entry, per lock hold.
+    let pids: Vec<i32> = kept
+        .iter()
+        .filter(|wt| wt.owner_pid != 0 && wt.owner_started_at != 0)
+        .map(|wt| wt.owner_pid)
+        .collect();
+    let starts = process_started_at(&pids);
+    let lookup = |pid: i32| starts.get(&pid).copied().flatten();
+    let mut healed = Vec::with_capacity(kept.len());
+    for mut wt in kept {
+        if wt.owner_pid != 0 && !owner_alive(&wt, &lookup) {
+            wt.owner_pid = 0;
+            wt.owner_started_at = 0;
+            wt.destroying = false;
+        }
+        healed.push(wt);
     }
     state.worktrees = healed;
 }
@@ -951,7 +1133,11 @@ mod tests {
             ..Default::default()
         };
 
-        let resolver = |pid: i32| -> Option<i64> { if pid == 100 { Some(111) } else { None } };
+        let resolver = |pids: &[i32]| -> std::collections::HashMap<i32, Option<i64>> {
+            pids.iter()
+                .map(|&pid| (pid, if pid == 100 { Some(111) } else { None }))
+                .collect()
+        };
         heal_state(&mut state, resolver);
 
         assert_eq!(state.worktrees.len(), 2, "path-gone entry must be dropped");
@@ -981,7 +1167,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        heal_state(&mut state, |_| None);
+        heal_state(&mut state, |_| Default::default());
         let wt = &state.worktrees[0];
         assert!(wt.leased, "heal must not clear a lease");
         assert_eq!(wt.lease_id, "abc");
@@ -1219,6 +1405,37 @@ mod tests {
         let s = State::read_state(dir.path()).unwrap();
         assert_eq!(s.worktrees.len(), 1);
         assert_eq!(s.worktrees[0].name, "1");
+    }
+
+    #[test]
+    fn jj_only_worktree_is_adopted() {
+        // A pooled jj workspace carries NO `.git` entry — only a `.jj`
+        // directory (vcs/jj.rs). Before `marker_backend` learned the second
+        // marker, a crashed jj acquisition left an on-disk worktree the
+        // recovery scan could not see: invisible to `status`, and its slot
+        // number handed out again by `next_name`.
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("1/myrepo");
+        std::fs::create_dir_all(wt.join(".jj")).unwrap();
+
+        let s = State::read_state(dir.path()).unwrap();
+        assert_eq!(s.worktrees.len(), 1, "a .jj-only worktree must be adopted");
+        assert_eq!(s.worktrees[0].name, "1");
+        assert!(s.worktrees[0].leased, "adopted entry stays quarantined");
+    }
+
+    #[test]
+    fn jj_file_is_not_a_workspace_marker() {
+        // `.jj` must be a DIRECTORY to mark a workspace — a `.jj` file is
+        // not one (the same rule `vcs::worktree_backend_name` applies), so
+        // the directory is not adopted.
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("1/myrepo");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".jj"), "not a workspace").unwrap();
+
+        let s = State::read_state(dir.path()).unwrap();
+        assert!(s.worktrees.is_empty());
     }
 
     #[test]

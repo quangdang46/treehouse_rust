@@ -190,7 +190,7 @@ mod tests {
             ..Default::default()
         };
         // Even with zero matching processes, heal must not clear the lease.
-        heal_state(&mut state, |_| None);
+        heal_state(&mut state, |_| Default::default());
         assert!(state.worktrees[0].leased, "lease must survive heal_state");
         assert_eq!(state.worktrees[0].lease_id, "abc");
     }

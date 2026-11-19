@@ -535,7 +535,9 @@ impl Pool {
     }
 
     /// Whether a pool SLOT is dirty, answered by the backend that slot's own
-    /// marker names (Go `vcs.IsDirty`, vcs.go:648-650).
+    /// marker names (Go `vcs.IsDirty`, vcs.go:648-650) — with the marker name
+    /// the caller already resolved, so sweep loops stat `.git`/`.jj` once per
+    /// slot instead of twice (the damaged check reads the same markers).
     ///
     /// Go's `IsDirty` is exactly `backendForWorktree(path).IsDirty(path)` — it
     /// dispatches on the SLOT, never on whichever backend the pool happened to be
@@ -549,11 +551,11 @@ impl Pool {
     /// back to the default backend for reads, because reading a status is
     /// harmless where rewriting a checkout is not. A slot the seam cannot
     /// resolve at all reads as CLEAN, preserving the `.unwrap_or(false)` this
-    /// call site already applied — and `status` only reaches here after
-    /// [`slot_backend_name`] has refused anything that is not a git slot as
-    /// damaged.
-    pub(crate) fn slot_is_dirty(&self, slot: &Path) -> bool {
-        match vcs::backend_for_worktree(slot) {
+    /// call site already applied — and callers only reach here after
+    /// [`slot_backend_name`] / [`vcs::worktree_backend_name`] has refused
+    /// anything that is not a git slot as damaged.
+    pub(crate) fn slot_is_dirty_named(&self, slot: &Path, name: Option<&'static str>) -> bool {
+        match vcs::backend_for_resolved_name(name) {
             Ok(backend) => backend.is_dirty(slot).unwrap_or(false),
             Err(_) => false,
         }
@@ -635,7 +637,7 @@ impl Pool {
             // still "registered" and gets the actionable stale-entry message
             // rather than the misleading "no worktree named X".
             let registered = state.worktrees.iter().any(|w| w.name == name);
-            heal_state(&mut state, |pid| self.process.started_at(pid));
+            heal_state(&mut state, |pids| self.process.started_at_many(pids));
 
             for wt in &mut state.worktrees {
                 if wt.name != name {
@@ -726,7 +728,10 @@ impl Pool {
             Some(b) => b.clone(),
             None => self.git.default_branch(&repo).map_err(PoolError::Git)?,
         };
-        if !opts.skip_fetch && self.git.has_remote(&repo, "origin") {
+        // `fetch` already no-ops when the repo has no `origin` remote, so the
+        // old `has_remote` pre-check here only cost a redundant `git remote`
+        // spawn per acquisition.
+        if !opts.skip_fetch {
             self.git.fetch(&repo).map_err(PoolError::Git)?;
         }
 
@@ -861,7 +866,7 @@ impl Pool {
         // inventory and base branch; heal changed nothing else that matters.
         with_pool_lock(&self.dir, self.lock_timeout, || {
             let mut state = State::read_state(&self.dir).map_err(PoolError::State)?;
-            heal_state(&mut state, |pid| self.process.started_at(pid));
+            heal_state(&mut state, |pids| self.process.started_at_many(pids));
             let Some(idx) = state.worktrees.iter().position(|w| w.name == name) else {
                 return Err(PoolError::Io(
                     format!("worktree {name:?} vanished from pool state during acquisition"),
@@ -1053,18 +1058,50 @@ impl Pool {
         // it after the unlock would race a concurrent acquisition that has
         // already reserved the slot and re-seeded it: the reset would then
         // delete files belonging to the NEW occupant.
-        let prior_inventory = with_pool_lock(&self.dir, self.lock_timeout, || {
-            let mut state = State::read_state(&self.dir).map_err(PoolError::State)?;
-            let wt = releasable_worktree(&mut state, worktree_path, preconditions, &self.process)?;
-            let inventory = wt.seed_inventory();
-            if let Some(cb) = before_reset {
-                cb()?;
-            }
-            Ok(inventory)
-        })?;
+        //
+        // A per-release reservation (`destroying` + fresh owner pair, the same
+        // stamp `destroy` uses) is persisted in THIS lock. Without it two
+        // concurrent `release_conditional` calls both passed validation and
+        // then ran `reset_worktree` — detach + `reset --hard` + `clean -fd` —
+        // CONCURRENTLY on the same slot outside the lock, where git's
+        // `index.lock` makes the loser fail spuriously (and two simultaneous
+        // cleans in one worktree is exactly the race class the reservation
+        // protocol exists to prevent). With the stamp, the second caller fails
+        // `releasable_worktree` with `BeingDestroyed` before it ever reaches
+        // the reset; acquire, prune, gc, and destroy all already skip a live
+        // `destroying` entry, and `heal_state` keeps the stamp while this
+        // process lives.
+        let (prior_inventory, release_reservation) =
+            with_pool_lock(&self.dir, self.lock_timeout, || {
+                let mut state = State::read_state(&self.dir).map_err(PoolError::State)?;
+                let wt =
+                    releasable_worktree(&mut state, worktree_path, preconditions, &self.process)?;
+                let inventory = wt.seed_inventory();
+                let reservation =
+                    reservation::Reservation::reserve_destroy(worktree_path, wt, &self.process)
+                        .map_err(|e| {
+                            PoolError::Git(GitError::new(
+                                "reserve release",
+                                e.to_string(),
+                                GitErrorKind::Other,
+                            ))
+                        })?;
+                if let Some(cb) = before_reset
+                    && let Err(e) = cb()
+                {
+                    // The stamp was never written (the state write is
+                    // below), so restoring in memory is the whole
+                    // rollback — the on-disk entry never saw it.
+                    reservation.restore_original(wt);
+                    return Err(e);
+                }
+                state_file::write_state(&self.dir, &state)
+                    .map_err(|e| PoolError::Io("writing state".to_string(), e))?;
+                Ok((inventory, reservation))
+            })?;
 
-        // OUTSIDE the lock: reset the worktree. The reservation is still held,
-        // so no acquire/destroy can take it mid-reset.
+        // OUTSIDE the lock: reset the worktree. The reservation stamped above
+        // is still held, so no acquire/destroy can take it mid-reset.
         //
         // A slot whose seed inventory is KNOWN is reset through
         // `reset_worktree_with_seeded_paths`, which removes exactly those files
@@ -1076,27 +1113,58 @@ impl Pool {
         // resets plainly instead: the tracked tree is restored and nothing the
         // pool cannot account for is removed.
         let slot = Path::new(worktree_path);
-        match prior_inventory.authorized_paths() {
-            Some(seeded) => {
-                vcs::destructive_backend_for_worktree(slot)
-                    .map_err(PoolError::Git)?
-                    .reset_worktree_with_seeded_paths(slot, &branch, seeded)
-                    .map_err(PoolError::Git)?;
-            }
-            None => {
-                self.git
-                    .reset_worktree(slot, &branch)
-                    .map_err(PoolError::Git)?;
-            }
+        let reset_result = match prior_inventory.authorized_paths() {
+            Some(seeded) => vcs::destructive_backend_for_worktree(slot)
+                .map_err(PoolError::Git)
+                .and_then(|backend| {
+                    backend
+                        .reset_worktree_with_seeded_paths(slot, &branch, seeded)
+                        .map_err(PoolError::Git)
+                }),
+            None => self
+                .git
+                .reset_worktree(slot, &branch)
+                .map_err(PoolError::Git),
+        };
+        if let Err(e) = reset_result {
+            // The stamp IS persisted now: leaving it would park the slot
+            // behind `destroying` until this process exits. Take it back off
+            // so the lease/owner state reads exactly as it did before the
+            // release was attempted.
+            rollback_release_reservation(
+                &self.dir,
+                self.lock_timeout,
+                worktree_path,
+                &release_reservation,
+            );
+            return Err(e);
         }
 
-        // LOCK #2: RE-VALIDATE the preconditions AND clear in ONE atomic lock.
-        // This is what makes release exactly-once (ABA-safe): a concurrent
-        // caller that passed LOCK #1 will find the lease already cleared here
-        // and fail its precondition, so only one release ever succeeds.
-        with_pool_lock(&self.dir, self.lock_timeout, || {
+        // LOCK #2: re-validate AND clear in ONE atomic lock. The entry must
+        // still carry OUR release reservation — anything else means the slot
+        // was taken over while the reset ran outside the lock.
+        let cleared = with_pool_lock(&self.dir, self.lock_timeout, || {
             let mut state = State::read_state(&self.dir).map_err(PoolError::State)?;
-            let wt = releasable_worktree(&mut state, worktree_path, preconditions, &self.process)?;
+            let Some(idx) = state.worktrees.iter().position(|w| w.path == worktree_path) else {
+                return Err(PoolError::NotFound(worktree_path.to_string()));
+            };
+            if !release_reservation.matches(&state.worktrees[idx]) {
+                return Err(PoolError::OwnerPrecondition {
+                    path: worktree_path.to_string(),
+                    reason: "the release reservation stamped for this release no longer matches; the slot was taken over mid-release".to_string(),
+                });
+            }
+            // Preconditions are re-checked against the still-leased entry,
+            // exactly as LOCK #1 saw it: nothing can mutate lease fields while
+            // `destroying` is set, so this can only fail on a state that was
+            // already wrong.
+            validate_release_preconditions_inner(
+                &state.worktrees[idx],
+                preconditions,
+                &self.process,
+            )?;
+            let wt = &mut state.worktrees[idx];
+            wt.destroying = false;
             wt.owner_pid = 0;
             wt.owner_started_at = 0;
             crate::state::clear_lease(wt);
@@ -1109,7 +1177,20 @@ impl Pool {
             state_file::write_state(&self.dir, &state)
                 .map_err(|e| PoolError::Io("writing state".to_string(), e))?;
             Ok(())
-        })?;
+        });
+        if cleared.is_err() {
+            // Same reasoning as the reset failure above: a LOCK #2 that never
+            // committed must not leave the slot parked behind `destroying`.
+            // If the failure WAS the reservation check, the rollback's own
+            // `matches` fails too and this is a no-op.
+            rollback_release_reservation(
+                &self.dir,
+                self.lock_timeout,
+                worktree_path,
+                &release_reservation,
+            );
+        }
+        cleared?;
 
         Ok(())
     }
@@ -1140,14 +1221,26 @@ impl Pool {
     pub fn status(&self) -> Result<Vec<WorktreeStatus>, PoolError> {
         let cwd = std::env::current_dir().unwrap_or_default();
         let entries = healed_state_snapshot(&self.dir, self.lock_timeout, &self.process)?;
+        // ONE process-table refresh + canonicalize pass for every slot, instead
+        // of a full sysinfo re-enumeration per entry (`scan_worktrees` is
+        // semantically identical to per-path `find_in_worktree`, just batched).
+        // The scan still happens fresh, immediately before the probes below.
+        let live: Vec<&WorktreeEntry> = entries.iter().filter(|wt| !wt.destroying).collect();
+        let paths: Vec<&Path> = live.iter().map(|wt| Path::new(&wt.path)).collect();
+        let scans = self.process.scan_worktrees(&paths);
+        let scan_by_path: std::collections::HashMap<&str, Vec<ProcessInfo>> = live
+            .iter()
+            .zip(scans)
+            .map(|(wt, s)| (wt.path.as_str(), s.unwrap_or_default()))
+            .collect();
         let mut result = Vec::new();
         for wt in &entries {
             if wt.destroying {
                 continue;
             }
-            let procs = self
-                .process
-                .find_in_worktree(Path::new(&wt.path))
+            let procs = scan_by_path
+                .get(wt.path.as_str())
+                .cloned()
                 .unwrap_or_default();
             let mut ws = WorktreeStatus {
                 name: wt.name.clone(),
@@ -1171,15 +1264,26 @@ impl Pool {
                 if cwd_in_worktree(&cwd, Path::new(&wt.path)) {
                     ws.status = STATUS_HERE.to_string();
                 }
-            } else if slot_backend_name(Path::new(&wt.path)).is_empty() {
-                // Damaged. Checked before `is_dirty` because that call
-                // would resolve the repository ENCLOSING the pool and
-                // report on it, and reported separately from "dirty" so a
-                // slot whose contents cannot be read is never mistaken for
-                // one that was read and found changed.
-                ws.status = STATUS_DAMAGED.to_string();
-            } else if self.slot_is_dirty(Path::new(&wt.path)) {
-                ws.status = STATUS_DIRTY.to_string();
+            } else {
+                // Damaged check + dirty probe share ONE marker read: the
+                // previous `slot_backend_name` + `slot_is_dirty` pair stat'd
+                // `.git`/`.jj` twice per slot.
+                let slot_path = Path::new(&wt.path);
+                match vcs::worktree_backend_name(slot_path) {
+                    // Only a git slot is manageable; anything else (jj,
+                    // markerless, unreadable marker) is damaged. Checked
+                    // before `is_dirty` because that call would resolve the
+                    // repository ENCLOSING the pool and report on it, and
+                    // reported separately from "dirty" so a slot whose
+                    // contents cannot be read is never mistaken for one that
+                    // was read and found changed.
+                    Ok(Some(vcs::BACKEND_GIT)) => {
+                        if self.slot_is_dirty_named(slot_path, Some(vcs::BACKEND_GIT)) {
+                            ws.status = STATUS_DIRTY.to_string();
+                        }
+                    }
+                    _ => ws.status = STATUS_DAMAGED.to_string(),
+                }
             }
             // A slot the recovery scan adopted but could not read is
             // reported damaged rather than leased, so the read failure is
@@ -1206,7 +1310,7 @@ pub(crate) fn healed_state_snapshot(
     with_pool_lock(dir, lock_timeout, || {
         let mut state = State::read_state(dir).map_err(PoolError::State)?;
         let before = state.worktrees.clone();
-        heal_state(&mut state, |pid| process.started_at(pid));
+        heal_state(&mut state, |pids| process.started_at_many(pids));
         if state.worktrees != before {
             state_file::write_state(dir, &state)
                 .map_err(|e| PoolError::Io("writing state".to_string(), e))?;
@@ -1269,8 +1373,11 @@ fn reuse_candidates(
     let mut skips = SkipCounts::default();
     let mut candidates = Vec::new();
 
-    // Find available worktrees (clean, not in-use, not leased, this
-    // clone's, and holding no unlanded work).
+    // Phase 1 (serial, cheap): state/lease filter + marker check. Everything
+    // below this point is a probe — one batched process scan plus per-slot
+    // git subprocesses — so the slots that survive the cheap gates are
+    // collected first and probed together.
+    let mut eligible: Vec<&WorktreeEntry> = Vec::new();
     for wt in snapshot {
         if wt.destroying || wt.leased || reservation::owner_alive(wt, process) {
             continue;
@@ -1285,14 +1392,75 @@ fn reuse_candidates(
         if slot_backend_name(path).is_empty() {
             continue;
         }
+        eligible.push(wt);
+    }
 
-        // Clone identity, then availability. Pools are keyed by origin
-        // URL, so two clones of the same origin share one pool dir, but
-        // a linked worktree still belongs to ONE physical clone. Never
-        // reset another clone's slot — even when both clones hold
-        // identical refs — and never one whose owner, or our own,
-        // cannot be proven.
-        match requester.matches_slot(git, path) {
+    // Phase 2: ONE process-table refresh buckets every eligible slot,
+    // instead of a full sysinfo re-enumeration per candidate.
+    let probe_paths: Vec<&Path> = eligible.iter().map(|wt| Path::new(&wt.path)).collect();
+    let scans = process.scan_worktrees(&probe_paths);
+    let in_use: Vec<bool> = scans
+        .into_iter()
+        .map(|s| match s {
+            Ok(procs) => !procs.is_empty(),
+            Err(_) => true, // unproven => treat as in use (fail closed)
+        })
+        .collect();
+
+    // Phase 3: the remaining probes are independent read-only git
+    // subprocesses (`rev-parse` for clone identity, `status`, `merge-base`).
+    // Run them on scoped threads — one per slot — and collect in slot order
+    // so skip accounting and candidate order stay byte-identical to the
+    // serial loop. All inputs are `&` borrows; nothing here mutates state.
+    struct SlotProbe {
+        identity: IdentityMatch,
+        dirty: Option<bool>, // None = is_dirty errored (skip, like Ok(true)|Err)
+        safe: bool,
+    }
+    let probes: Vec<SlotProbe> = std::thread::scope(|scope| {
+        let handles: Vec<_> = eligible
+            .iter()
+            .zip(in_use.iter())
+            .map(|(wt, &in_use)| {
+                let path = Path::new(&wt.path);
+                scope.spawn(move || {
+                    // Preserve the serial gate order: identity first (it
+                    // feeds skip counts), then in-use, then dirty, then the
+                    // merge check — later probes are skipped once an earlier
+                    // one disqualifies the slot.
+                    let identity = requester.matches_slot(git, path);
+                    if identity != IdentityMatch::Yes || in_use {
+                        return SlotProbe {
+                            identity,
+                            dirty: None,
+                            safe: false,
+                        };
+                    }
+                    let dirty = git.is_dirty(path).ok();
+                    if dirty != Some(false) {
+                        return SlotProbe {
+                            identity,
+                            dirty,
+                            safe: false,
+                        };
+                    }
+                    SlotProbe {
+                        identity,
+                        dirty,
+                        safe: requester.safe_to_reset(git, path, branch),
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("reuse probe thread panicked"))
+            .collect()
+    });
+
+    // Phase 4 (serial): apply the verdicts in state order.
+    for (wt, probe) in eligible.iter().zip(probes.iter()) {
+        match probe.identity {
             IdentityMatch::Yes => {}
             IdentityMatch::OtherClone => {
                 skips.other_clone += 1;
@@ -1303,25 +1471,16 @@ fn reuse_candidates(
                 continue;
             }
         }
-
-        if process.is_worktree_in_use(path).unwrap_or(true) {
+        // `in_use` slots already returned early inside the probe; the
+        // dirty/safe verdicts are only meaningful for the rest.
+        if probe.dirty.is_none() && probe.identity == IdentityMatch::Yes {
+            // Either in-use (probes skipped the git calls) or is_dirty
+            // errored — both are plain skips with no counter.
             continue;
         }
-
-        // A crashed or rebooted owner leaves the reservation empty
-        // while its worktree still holds committed work: a clean tree
-        // passes `is_dirty`, so availability alone must not authorize a
-        // reset. Fail closed — if the merge state cannot be proven,
-        // leave the slot untouched rather than let the reset discard
-        // the work (Go pool.go:500-522, fix #104).
-        match git.is_dirty(path) {
-            Ok(true) | Err(_) => continue,
-            Ok(false) => {}
-        }
-        if !requester.safe_to_reset(git, path, branch) {
+        if probe.dirty != Some(false) || !probe.safe {
             continue;
         }
-
         candidates.push((wt.name.clone(), wt.path.clone()));
     }
     (candidates, skips)
@@ -1349,7 +1508,7 @@ fn acquire_stamp(
 ) -> Result<AcquiredSlot, PoolError> {
     with_pool_lock(dir, lock_timeout, || {
         let mut state = State::read_state(dir).map_err(PoolError::State)?;
-        heal_state(&mut state, |pid| process.started_at(pid));
+        heal_state(&mut state, |pids| process.started_at_many(pids));
 
         // Stamp the first candidate that is STILL unreserved. The scan's
         // verdict is a hint: between the snapshot and this lock another
@@ -2063,6 +2222,37 @@ pub struct ReleasePreconditions {
     pub refuse_recovered: bool,
 }
 
+/// Best-effort rollback of a PERSISTED release reservation: restores the
+/// pre-release owner pair and clears `destroying`, but only while the stamp is
+/// still ours (`reservation.matches`).
+///
+/// `release_conditional` stamps `destroying` + a fresh owner pair in LOCK #1
+/// so a concurrent release cannot run the same reset. Every exit path after
+/// that write — a failed `reset_worktree`, a LOCK #2 that never committed —
+/// must take the stamp back off, or the slot reads as `destroying` (skipped
+/// by acquire, prune, gc, and destroy) until this process exits and
+/// owner-death healing finally clears it. Failures here are swallowed: the
+/// caller is already returning the release's own error, and a slot left
+/// stamped is healed on owner death rather than wedged forever.
+fn rollback_release_reservation(
+    dir: &Path,
+    lock_timeout: std::time::Duration,
+    worktree_path: &str,
+    reservation: &reservation::Reservation,
+) {
+    let _ = with_pool_lock(dir, lock_timeout, || {
+        let mut state = State::read_state(dir).map_err(PoolError::State)?;
+        if let Some(wt) = state.worktrees.iter_mut().find(|w| w.path == worktree_path)
+            && reservation.matches(wt)
+        {
+            reservation.restore_original(wt);
+            state_file::write_state(dir, &state)
+                .map_err(|e| PoolError::Io("writing state".to_string(), e))?;
+        }
+        Ok(())
+    });
+}
+
 /// Finds a managed, releasable worktree by path, validating preconditions
 /// (Go `releasableWorktree` + `validateReleasePreconditions`).
 fn releasable_worktree<'a>(
@@ -2327,6 +2517,68 @@ pub(crate) fn slot_backend_name(worktree: &Path) -> String {
         Ok(Some(name @ vcs::BACKEND_GIT)) => name.to_string(),
         _ => String::new(),
     }
+}
+
+/// Recursively measures a directory's total size in bytes (Go `dirSize`).
+///
+/// The strict variant: the first `read_dir`/`metadata` failure propagates.
+/// Top-level subdirectories are walked on scoped threads — a slot container
+/// typically holds a handful of large trees, so this turns N serial walks
+/// into one wall-clock walk; deeper levels stay serial to bound thread count.
+pub(crate) fn dir_size(path: &Path) -> std::io::Result<u64> {
+    dir_size_level(path, true)
+}
+
+fn dir_size_level(path: &Path, parallel: bool) -> std::io::Result<u64> {
+    let mut total = 0u64;
+    let mut subdirs = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let p = entry.path();
+        if entry.file_type()?.is_dir() {
+            subdirs.push(p);
+        } else {
+            total += entry.metadata()?.len();
+        }
+    }
+    if parallel && subdirs.len() > 1 {
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = subdirs
+                .iter()
+                .map(|d| scope.spawn(move || dir_size_level(d, false)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("dir_size thread panicked"))
+                .collect::<Vec<_>>()
+        });
+        for r in results {
+            total += r?;
+        }
+    } else {
+        for d in &subdirs {
+            total += dir_size_level(d, false)?;
+        }
+    }
+    Ok(total)
+}
+
+/// Best-effort [`dir_size`]: unreadable entries and failed sub-walks are
+/// skipped rather than propagated, matching the destroy path's historical
+/// "report what we could measure" semantics.
+pub(crate) fn dir_size_lenient(path: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            match entry.metadata() {
+                Ok(meta) if meta.is_dir() => total += dir_size_level(&p, false).unwrap_or(0),
+                Ok(meta) => total += meta.len(),
+                Err(_) => {}
+            }
+        }
+    }
+    total
 }
 
 /// Whether two paths name the same filesystem object (Go `os.SameFile`).

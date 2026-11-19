@@ -180,9 +180,13 @@ impl BackendRegistry {
     /// registry will resolve markers to a backend that calls itself something
     /// else.
     pub fn register(&self, name: &'static str, backend: Arc<dyn GitBackend>) {
+        // A poisoned lock means a previous holder panicked mid-write; the map
+        // itself is still consistent (RwLock poisoning is conservative), so
+        // recover the guard rather than take the whole process down — the
+        // fail-closed posture applies to MARKER reads, not to lock hygiene.
         self.backends
             .write()
-            .expect("backend registry lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(name, backend);
     }
 
@@ -190,7 +194,7 @@ impl BackendRegistry {
     pub fn get(&self, name: &str) -> Option<Arc<dyn GitBackend>> {
         self.backends
             .read()
-            .expect("backend registry lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .get(name)
             .cloned()
     }
@@ -199,7 +203,7 @@ impl BackendRegistry {
     pub fn names(&self) -> Vec<&'static str> {
         self.backends
             .read()
-            .expect("backend registry lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .keys()
             .copied()
             .collect()
@@ -225,10 +229,7 @@ impl BackendRegistry {
         // Re-check under the write lock: a concurrent first lookup may have
         // won the race, and clobbering its handle would swap the backend
         // mid-dispatch. Whoever got here second keeps theirs.
-        let mut backends = self
-            .backends
-            .write()
-            .expect("backend registry lock poisoned");
+        let mut backends = self.backends.write().unwrap_or_else(|e| e.into_inner());
         match backends.get(BACKEND_GIT) {
             Some(existing) => Some(existing.clone()),
             None => {
@@ -449,6 +450,16 @@ fn override_name_is_jj_at(root: &Path, override_name: Option<&str>) -> bool {
 /// non-git tree and report the failure in terms that hide the real cause.
 pub fn backend_for_worktree(path: &Path) -> Result<Arc<dyn GitBackend>, GitError> {
     global_registry().resolve_or_default(worktree_backend_name(path)?)
+}
+
+/// [`backend_for_worktree`] with the marker name the caller ALREADY resolved
+/// via [`worktree_backend_name`] — the sweep paths probe the same slot's
+/// marker for the damaged check and then again inside `backend_for_worktree`,
+/// paying two stat rounds per slot for one answer.
+pub(crate) fn backend_for_resolved_name(
+    name: Option<&'static str>,
+) -> Result<Arc<dyn GitBackend>, GitError> {
+    global_registry().resolve_or_default(name)
 }
 
 /// The backend that owns `path` for operations that REWRITE its checkout

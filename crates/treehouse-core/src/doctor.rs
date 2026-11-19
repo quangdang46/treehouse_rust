@@ -9,8 +9,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::pool::{Pool, PoolError};
+use crate::pool::{Pool, PoolError, dir_size};
 use crate::state::{State, WorktreeEntry};
+use crate::vcs;
 
 /// Severity of a doctor check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +84,26 @@ pub fn run_doctor(pool: &Pool) -> Result<DoctorReport, PoolError> {
 }
 
 fn check_git_binary() -> DoctorCheck {
-    let out = std::process::Command::new("git").arg("--version").output();
+    // Resolve through the same `GIT_BIN` → `PATH` discovery every other git
+    // call uses (`ShellGitBackend::discover`): probing bare `"git"` reported
+    // Error for a user whose git lives only at `$GIT_BIN` with no `git` on
+    // PATH — a binary treehouse itself would happily drive.
+    let git_bin = match crate::git::ShellGitBackend::discover() {
+        Ok(git) => git.git_bin().to_path_buf(),
+        Err(_) => {
+            return DoctorCheck {
+                name: "git_binary",
+                status: Severity::Error,
+                detail: "git binary not found (set GIT_BIN or install git on PATH)".into(),
+                count: 0,
+                bytes: None,
+                affected: vec![],
+            };
+        }
+    };
+    let out = std::process::Command::new(&git_bin)
+        .arg("--version")
+        .output();
     match out {
         Ok(o) if o.status.success() => DoctorCheck {
             name: "git_binary",
@@ -96,7 +116,7 @@ fn check_git_binary() -> DoctorCheck {
         _ => DoctorCheck {
             name: "git_binary",
             status: Severity::Error,
-            detail: "git binary not found on PATH".into(),
+            detail: format!("git binary {} --version failed", git_bin.display()),
             count: 0,
             bytes: None,
             affected: vec![],
@@ -226,6 +246,19 @@ fn inspect_worktrees(pool: &Pool) -> Result<Vec<DoctorCheck>, PoolError> {
     let mut in_use = Vec::new();
     let mut head_locks = Vec::new();
 
+    // ONE batched process-table scan for every live slot — the loop below
+    // used to pay a full sysinfo re-enumeration per worktree. An Err entry
+    // maps to "not in use", matching the old `unwrap_or(false)`.
+    let live: Vec<&crate::state::WorktreeEntry> =
+        state.worktrees.iter().filter(|wt| !wt.destroying).collect();
+    let scan_paths: Vec<&Path> = live.iter().map(|wt| Path::new(&wt.path)).collect();
+    let scans = pool.process.scan_worktrees(&scan_paths);
+    let procs_by_path: std::collections::HashMap<&str, Vec<crate::process::ProcessInfo>> = live
+        .iter()
+        .zip(scans)
+        .map(|(wt, s)| (wt.path.as_str(), s.unwrap_or_default()))
+        .collect();
+
     for wt in &state.worktrees {
         if wt.destroying {
             continue;
@@ -255,7 +288,10 @@ fn inspect_worktrees(pool: &Pool) -> Result<Vec<DoctorCheck>, PoolError> {
         // answered by whatever repository encloses the pool. Markerless
         // slots are skipped here (they surface as orphans/damaged instead).
         let slot = Path::new(&wt.path);
-        if !crate::pool::slot_backend_name(slot).is_empty() && pool.slot_is_dirty(slot) {
+        // One marker read feeds both the damaged gate and the dirty probe.
+        if let Ok(Some(vcs::BACKEND_GIT)) = vcs::worktree_backend_name(slot)
+            && pool.slot_is_dirty_named(slot, Some(vcs::BACKEND_GIT))
+        {
             dirty.push(PathBuf::from(&wt.path));
         }
         // A leftover HEAD.lock means a git process died mid-ref-update; every
@@ -266,10 +302,10 @@ fn inspect_worktrees(pool: &Pool) -> Result<Vec<DoctorCheck>, PoolError> {
             head_locks.push(PathBuf::from(&wt.path));
         }
         // In-use (live process or live owner).
-        let proc_in_use = pool
-            .process
-            .is_worktree_in_use(Path::new(&wt.path))
-            .unwrap_or(false);
+        let proc_in_use = !procs_by_path
+            .get(wt.path.as_str())
+            .map(|p| p.is_empty())
+            .unwrap_or(true);
         if proc_in_use || crate::reservation::owner_alive(wt, &pool.process) {
             in_use.push(PathBuf::from(&wt.path));
         }
@@ -467,21 +503,6 @@ fn disk_total(p: &Path) -> u64 {
         );
         total
     }
-}
-
-/// Recursively measures a directory's size.
-fn dir_size(path: &Path) -> std::io::Result<u64> {
-    let mut total = 0u64;
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        let p = entry.path();
-        if entry.file_type()?.is_dir() {
-            total += dir_size(&p)?;
-        } else {
-            total += entry.metadata()?.len();
-        }
-    }
-    Ok(total)
 }
 
 /// Helper for the CLI to render the report as JSON.

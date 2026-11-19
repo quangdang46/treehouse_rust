@@ -108,78 +108,101 @@ impl ProcessTable {
     /// after absolute-path + symlink resolution. Matches Go's
     /// `FindProcessesInWorktree` including the `..`-prefixed-dirname rule.
     pub fn find_in_worktree(&self, worktree_path: &Path) -> Result<Vec<ProcessInfo>, ProcessError> {
-        let abs_worktree = absolute_and_resolve(worktree_path)
-            .ok_or_else(|| ProcessError::Scan("resolving worktree path".into()))?;
+        self.scan_worktrees(&[worktree_path])
+            .pop()
+            .unwrap_or_else(|| Err(ProcessError::Scan("empty scan result".into())))
+    }
+
+    /// Scans the process table ONCE and buckets every in-worktree process
+    /// against ALL of `paths`, returning one entry per input path in order.
+    ///
+    /// Semantically identical to calling [`Self::find_in_worktree`] per path —
+    /// same refresh-first freshness, same per-process cwd resolution and
+    /// `..`-rule — but the table is re-enumerated and each process cwd is
+    /// canonicalized exactly once instead of once per (process × worktree).
+    /// Sweeps that probe every slot (`status`, `prune`, `gc`, `destroy`,
+    /// reuse) go from N full refreshes + N×M canonicalize calls to one of
+    /// each.
+    ///
+    /// The refresh still happens immediately before the scan, preserving the
+    /// safety property `find_in_worktree` documents: a snapshot taken earlier
+    /// must never gate a destructive decision.
+    pub fn scan_worktrees(&self, paths: &[&Path]) -> Vec<Result<Vec<ProcessInfo>, ProcessError>> {
+        if paths.is_empty() {
+            return Vec::new();
+        }
+        // Resolve every root up front; a root that cannot be resolved is an
+        // `Err` entry, exactly like `find_in_worktree`'s per-call error.
+        let roots: Vec<Result<PathBuf, ProcessError>> = paths
+            .iter()
+            .map(|p| {
+                absolute_and_resolve(p)
+                    .ok_or_else(|| ProcessError::Scan("resolving worktree path".into()))
+            })
+            .collect();
 
         // Re-enumerate FIRST: a worktree whose process started after this
         // table was built would otherwise scan as empty and be classified
-        // Disposable. This is the same fresh `process.Processes()` Go does per
-        // call, so the post-kill survivor re-scan in `destroy` actually sees
-        // that the killed PIDs are gone instead of reading them back out of a
-        // frozen snapshot.
+        // Disposable — the same fresh `process.Processes()` Go does per call.
         self.refresh();
 
-        let mut result = Vec::new();
-        let system = self.system.lock().unwrap();
-        for (pid, process) in system.processes() {
-            // A zombie has already terminated — it holds no cwd, runs no
-            // instructions, and cannot block `git worktree remove`. It must
-            // never read as "a process is still using this worktree".
-            //
-            // This check is load-bearing, not defensive. sysinfo refreshes
-            // `cwd` as `UpdateKind::OnlyIfNotSet` (system.rs:2478), so once a
-            // pid's cwd is cached it is NEVER re-read: `needs_update` returns
-            // `p.cwd.is_none()` (system.rs:2336). When Linux SIGKILLs a child
-            // the pid survives as a zombie, `/proc/<pid>/cwd` disappears — and
-            // sysinfo keeps the stale cached path. Without this filter the
-            // post-kill survivor scan in `destroy` sees the dead pid, and
-            // `--include-in-use` skipped with "worktree processes still
-            // running after termination" even though nothing was running.
-            // `status` IS re-read on every refresh, so it is the fresh signal.
-            //
-            // That is true on unix and FALSE on Windows: sysinfo's Windows
-            // backend assigns `status` exactly once, as
-            // `ProcessStatus::Run` in `ProcessInner::new`, and `update()`
-            // never reassigns it — so this comparison alone can never be true
-            // there. A Windows process killed by `TerminateProcess` also
-            // lingers in the `CreateToolhelp32Snapshot` listing until the
-            // last handle to it closes, and because cwd is
-            // `UpdateKind::OnlyIfNotSet` it is read back with its stale
-            // worktree path. Same symptom as the unix case: the post-kill
-            // survivor scan in `destroy` saw the dead pid and `--include-in-use`
-            // skipped with "worktree processes still running after
-            // termination" even though nothing was running.
-            if process.status() == ProcessStatus::Zombie || has_terminated(pid.as_u32()) {
-                continue;
-            }
-            let cwd = match process.cwd() {
-                Some(c) => c.to_path_buf(),
-                None => continue, // exited or permission-restricted: skip
-            };
-            let Some(abs_cwd) = absolute_and_resolve(&cwd) else {
-                continue;
-            };
-            let rel = match pathdiff_rel(&abs_worktree, &abs_cwd) {
-                Some(r) => r,
-                None => continue,
-            };
-            // Go matcher: include when rel == "." (or empty — our pathdiff
-            // yields "" for base==cwd, Go yields "."), OR when rel is a
-            // descendant that isn't exactly ".." and doesn't start with
-            // "../" (platform separator). A child dir literally named "..x"
-            // (e.g. "..cache") IS included.
-            let rel_str = rel.to_string_lossy();
-            let is_self = rel_str == "." || rel_str.is_empty();
-            let is_up =
-                rel_str == ".." || rel_str.starts_with("../") || rel_str.starts_with("..\\");
-            if is_self || !is_up {
-                result.push(ProcessInfo {
-                    pid: pid.as_u32() as i32,
-                    name: process.name().to_string_lossy().into_owned(),
-                });
+        // Collect every live process's resolved cwd ONCE, under the lock.
+        let mut cwds: Vec<(i32, String, PathBuf)> = Vec::new();
+        {
+            let system = self.system.lock().unwrap();
+            for (pid, process) in system.processes() {
+                // Zombie / already-terminated filtering — see `find_in_worktree`'s
+                // history for why this is load-bearing (sysinfo's
+                // `UpdateKind::OnlyIfNotSet` cwd cache).
+                if process.status() == ProcessStatus::Zombie || has_terminated(pid.as_u32()) {
+                    continue;
+                }
+                let cwd = match process.cwd() {
+                    Some(c) => c.to_path_buf(),
+                    None => continue, // exited or permission-restricted: skip
+                };
+                let Some(abs_cwd) = absolute_and_resolve(&cwd) else {
+                    continue;
+                };
+                cwds.push((
+                    pid.as_u32() as i32,
+                    process.name().to_string_lossy().into_owned(),
+                    abs_cwd,
+                ));
             }
         }
-        Ok(result)
+
+        roots
+            .iter()
+            .map(|root| {
+                let abs_worktree = match root {
+                    Ok(p) => p,
+                    Err(e) => return Err(ProcessError::Scan(e.to_string())),
+                };
+                let mut result = Vec::new();
+                for (pid, name, abs_cwd) in &cwds {
+                    let rel = match pathdiff_rel(abs_worktree, abs_cwd) {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    // Go matcher: include when rel == "." (or empty), OR when
+                    // rel is a descendant that isn't exactly ".." and doesn't
+                    // start with "../" (platform separator).
+                    let rel_str = rel.to_string_lossy();
+                    let is_self = rel_str == "." || rel_str.is_empty();
+                    let is_up = rel_str == ".."
+                        || rel_str.starts_with("../")
+                        || rel_str.starts_with("..\\");
+                    if is_self || !is_up {
+                        result.push(ProcessInfo {
+                            pid: *pid,
+                            name: name.clone(),
+                        });
+                    }
+                }
+                Ok(result)
+            })
+            .collect()
     }
 
     /// Whether any process is running in the worktree.
@@ -202,6 +225,47 @@ impl ProcessTable {
         system
             .process(Pid::from_u32(pid as u32))
             .map(|p| p.start_time() as i64 * 1000)
+    }
+
+    /// [`Self::started_at`] for a whole batch of pids: ONE
+    /// `refresh_processes_specifics` covering every requested pid instead of
+    /// one refresh per pid. `heal_state` calls this once per state entry
+    /// carrying an owner reservation, so a pool with N reserved slots paid N
+    /// table refreshes per lock hold; now it pays one.
+    ///
+    /// Same freshness guarantee as the per-pid path: every named pid is
+    /// re-read (or dropped when gone) before the lookups below, so a pid
+    /// started after the table was built still resolves correctly.
+    pub fn started_at_many(&self, pids: &[i32]) -> std::collections::HashMap<i32, Option<i64>> {
+        let unique: Vec<Pid> = {
+            let mut seen = std::collections::HashSet::new();
+            pids.iter()
+                .filter(|&&p| seen.insert(p))
+                .map(|&p| Pid::from_u32(p as u32))
+                .collect()
+        };
+        if unique.is_empty() {
+            return std::collections::HashMap::new();
+        }
+        {
+            let mut system = self.system.lock().unwrap();
+            system.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&unique),
+                true,
+                ProcessRefreshKind::everything(),
+            );
+        }
+        let system = self.system.lock().unwrap();
+        pids.iter()
+            .map(|&pid| {
+                (
+                    pid,
+                    system
+                        .process(Pid::from_u32(pid as u32))
+                        .map(|p| p.start_time() as i64 * 1000),
+                )
+            })
+            .collect()
     }
 
     /// Whether a pid currently exists.

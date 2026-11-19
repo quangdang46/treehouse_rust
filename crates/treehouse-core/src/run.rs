@@ -76,7 +76,24 @@ pub fn run(pool: &Pool, opts: &RunOptions) -> Result<RunResult, PoolError> {
         lease: Some(lease_opts),
         ..Default::default()
     })?;
-    let lease = acquired.lease.as_ref().expect("run acquires a lease");
+    // `get` was invoked with `lease: Some`, so a `None` here would mean the
+    // slot was stamped WITHOUT the lease identity `run` releases against —
+    // an internal-invariant break, not user error. `mark_acquired_entry`
+    // (pool.rs) upholds the invariant today, but panicking on it would fire
+    // BEFORE the `CleanupGuard` below exists, leaking the stamped reservation
+    // until owner-death healing. Fail loudly instead, and roll the slot back
+    // first: `release` resets and clears whatever stamp `get` did write, so
+    // the pool does not keep a slot nobody can name.
+    let Some(lease) = acquired.lease.as_ref() else {
+        let _ = pool.release(&acquired.path.to_string_lossy());
+        return Err(PoolError::Io(
+            "run acquires a lease".to_string(),
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "pool.get returned no lease for a leased acquire",
+            ),
+        ));
+    };
     let worktree_path = acquired.path.clone();
     let lease_id = lease.id.clone();
     let lease_holder = lease.holder.clone();
